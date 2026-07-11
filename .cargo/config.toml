@@ -1,0 +1,17 @@
+# Build for the nRF52840 (Cortex-M4F) by default so a bare `cargo build`
+# targets the T114 without extra flags.
+[build]
+target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+rustflags = [
+    # cortex-m-rt's linker script; it INCLUDEs our memory.x (see build.rs).
+    "-C", "link-arg=-Tlink.x",
+    # Keep flash/RAM sections tightly packed — required by cortex-m-rt on
+    # nRF52840 so sections don't get page-aligned into wasted space.
+    "-C", "link-arg=--nmagic",
+]
+
+# The nRF52840 has an FPU; use the hardfloat ABI target.
+[env]
+DEFMT_LOG = "off"

@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: MIT
+[package]
+name    = "teslamic"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Heltec T114 (nRF52840) firmware that emulates Tesla's cabin microphone over USB (VID 1235:0002, USB Audio Class 1.0, 48 kHz / 16-bit / stereo) to make the car show the MIC overlay icon.  Experimental."
+
+[[bin]]
+name = "teslamic"
+path = "src/main.rs"
+
+# Versions pinned to exactly what is already in the local cargo cache so the
+# project builds fully offline.  Do not loosen these without a network to
+# fetch fresh transitive deps.
+[dependencies]
+embassy-nrf = { version = "=0.10.0", features = [
+    "nrf52840",
+    "time-driver-rtc1",
+    "gpiote",
+    "nfc-pins-as-gpio",
+    # Exposes `embassy_nrf::pac` so the silence pump can drive the USBD ISOIN
+    # registers directly (the high-level driver can't write iso endpoints).
+    "unstable-pac",
+] }
+embassy-usb      = { version = "=0.6.0", default-features = false }
+embassy-executor = { version = "=0.10.0", features = ["platform-cortex-m", "executor-thread"] }
+embassy-time     = { version = "=0.5.1" }
+
+cortex-m    = { version = "=0.7.7", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "=0.7.5"
+
+# Size-optimised even in dev: the app must fit the 0x26000-based flash window
+# and there is no reason to ship a fat debug build for a USB descriptor blob.
+[profile.dev]
+opt-level       = "s"
+overflow-checks = true
+
+[profile.release]
+opt-level     = "s"
+lto           = "fat"
+codegen-units = 1
