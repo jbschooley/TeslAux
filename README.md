@@ -20,12 +20,13 @@ Presents the full identity and a spec-correct UAC1 **microphone** (AudioControl
 + AudioStreaming interfaces, stereo 48 k/16-bit), verified: macOS enrolls it as
 a 2-channel / 48 kHz USB input device named `TeslaMic`.
 
-Two flashable builds:
+Three flashable builds:
 
 | File | Behaviour |
 |------|-----------|
 | **`teslamic.uf2`** | Enumerates **and streams silence** — 192 B of zeros per USB frame out the iso endpoint, so it looks like a mic that's actively capturing. Try this in the car. |
-| `teslamic-enum-only.uf2` | Enumerates only (no iso data). Fallback if the streaming build misbehaves. Already tested to enumerate on macOS. |
+| **`teslamic-sine.uf2`** | Same, but emits a **1 kHz sine while the USER button (P1_10) is held**, silence when released. Each new press **alternates the channel**: press 1 = LEFT, press 2 = RIGHT, press 3 = LEFT, … (other channel silent). Good for confirming the audio path and checking L/R routing. |
+| `teslamic-enum-only.uf2` | Enumerates only (no iso data). Fallback if a streaming build misbehaves. Tested to enumerate on macOS. |
 
 The two HID interfaces the real device exposes (status telemetry + settings) are
 **not** included yet. If the audio device alone doesn't trigger the icon, they're
@@ -36,17 +37,22 @@ the next thing to add.
 Requires the Rust toolchain (pinned in `rust-toolchain.toml`) and
 `arm-none-eabi-objcopy` (from `arm-none-eabi-gcc` / `brew install arm-none-eabi-gcc`).
 
-```sh
-# 1. Compile (targets thumbv7em-none-eabihf via .cargo/config.toml)
-cargo build --release
+Each build is a Cargo feature of the same source. Compile, then wrap the ELF
+into a UF2 at the app offset `0x26000`:
 
-# 2. ELF -> raw binary -> UF2 (wrapped at the app offset 0x26000)
+```sh
+# pick ONE build:
+cargo build --release                          # -> silence  (teslamic.uf2)
+cargo build --release --features sine-button   # -> sine/button (teslamic-sine.uf2)
+cargo build --release --no-default-features     # -> enumerate only (teslamic-enum-only.uf2)
+
+# then package the resulting ELF:
 arm-none-eabi-objcopy -O binary \
     target/thumbv7em-none-eabihf/release/teslamic teslamic.bin
 python3 tools/uf2conv.py teslamic.bin -c -b 0x26000 -f 0xADA52840 -o teslamic.uf2
 ```
 
-`teslamic.uf2` is the flashable artifact. (A prebuilt one is checked in.)
+All three prebuilt `*.uf2` files are checked in.
 
 ## Flash it (no debug probe needed)
 
@@ -85,8 +91,12 @@ registers directly (via `embassy_nrf::pac`, behind the `unstable-pac` feature):
 
 - Waits until the host selects AudioStreaming alt-1 (embassy sets `EPINEN` bit 8).
 - Arms `ISOIN.PTR`/`ISOIN.MAXCNT` with a 192-byte buffer and triggers
-  `TASKS_STARTISOIN`, then re-arms after each `EVENTS_ENDISOIN` — self-clocked to
-  the host's 1 ms polling, no drift. embassy's USB driver never touches these
+  `TASKS_STARTISOIN` **exactly once per frame, right after `EVENTS_SOF`**.
+  This timing is critical: a full-speed 192-byte packet takes ~128 µs to clock
+  out, and firing `STARTISOIN` (which DMAs into the single ISO buffer) while
+  that transmission is in flight corrupts the packet — audible as scratchiness.
+  Arming just after SOF guarantees the DMA finishes before the host's IN token
+  and never during a transmission. embassy's USB driver never touches these
   registers, so there's no conflict with its interrupt handler.
 
 **To carry real audio** instead of silence: capture stereo 48 kHz/16-bit into a

@@ -10,6 +10,16 @@ description = "Heltec T114 (nRF52840) firmware that emulates Tesla's cabin micro
 name = "teslamic"
 path = "src/main.rs"
 
+[features]
+# Default: enumerate as the mic AND stream silence out the iso endpoint.
+default = ["stream"]
+# Run the register-level iso pump (feed the endpoint). Without it the device
+# only enumerates (teslamic-enum-only.uf2).
+stream = []
+# Emit a 1 kHz sine while the user button (P1_10) is held, silence otherwise
+# (teslamic-sine.uf2). Implies `stream`.
+sine-button = ["stream"]
+
 # Versions pinned to exactly what is already in the local cargo cache so the
 # project builds fully offline.  Do not loosen these without a network to
 # fetch fresh transitive deps.
@@ -26,6 +36,7 @@ embassy-nrf = { version = "=0.10.0", features = [
 embassy-usb      = { version = "=0.6.0", default-features = false }
 embassy-executor = { version = "=0.10.0", features = ["platform-cortex-m", "executor-thread"] }
 embassy-time     = { version = "=0.5.1" }
+embassy-futures  = { version = "=0.1.2" }
 
 cortex-m    = { version = "=0.7.7", features = ["inline-asm", "critical-section-single-core"] }
 cortex-m-rt = "=0.7.5"

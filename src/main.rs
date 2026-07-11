@@ -52,14 +52,22 @@
 //! the 48 MHz reference derived from it; the internal RC is out of spec for USB.
 
 use embassy_executor::Spawner;
-use embassy_nrf::pac;
-use embassy_nrf::pac::usbd::vals::Response;
 use embassy_nrf::usb::vbus_detect::HardwareVbusDetect;
 use embassy_nrf::usb::Driver;
 use embassy_nrf::{bind_interrupts, peripherals, usb};
-use embassy_time::Timer;
 use embassy_usb::descriptor::{SynchronizationType, UsageType};
 use embassy_usb::{Builder, Config, UsbVersion};
+
+#[cfg(feature = "stream")]
+use embassy_futures::yield_now;
+#[cfg(feature = "stream")]
+use embassy_nrf::gpio::{Input, Pull};
+#[cfg(feature = "stream")]
+use embassy_nrf::pac;
+#[cfg(feature = "stream")]
+use embassy_nrf::pac::usbd::vals::Response;
+#[cfg(feature = "stream")]
+use embassy_time::Timer;
 
 // Minimal panic handler: no probe is attached in the car, so there is nothing
 // to print to — just idle the core.  (Avoids pulling in defmt / panic-probe.)
@@ -238,21 +246,48 @@ async fn main(spawner: Spawner) {
 
     let mut usb = builder.build();
 
-    // Feed the isochronous IN endpoint with silence at the register level.
-    // embassy-nrf's driver can't write the iso endpoint (see module docs), so
-    // this task drives USBD.ISOIN directly.  Started before usb.run() but it
-    // simply waits until the host activates AudioStreaming alt-1.
-    // (This embassy-executor's task macro returns a Result; the token is only
-    // Err if the pool is already occupied, which can't happen on first spawn.)
-    spawner.spawn(iso_silence_pump().unwrap());
+    // Feed the isochronous IN endpoint at the register level.  embassy-nrf's
+    // driver can't write the iso endpoint (see module docs), so this task
+    // drives USBD.ISOIN directly.  It waits until the host activates
+    // AudioStreaming alt-1 before sending anything.
+    //
+    // The user button (P1_10, active-low) only matters in the `sine-button`
+    // build; we configure it unconditionally (harmless) so one task serves all
+    // stream variants.  Task macro returns a Result; Err only if the pool is
+    // already occupied, impossible on first spawn.
+    #[cfg(feature = "stream")]
+    {
+        let button = Input::new(p.P1_10, Pull::Up);
+        spawner.spawn(iso_pump(button).unwrap());
+    }
+    #[cfg(not(feature = "stream"))]
+    let _ = &spawner;
 
     // Run the device: handles enumeration + control transfers forever.
     usb.run().await;
 }
 
+// One cycle of a 1 kHz sine at 48 kHz = 48 samples, 16-bit, ~0.49 full-scale.
+// A 192-byte iso packet holds exactly these 48 stereo frames, so a packet is
+// exactly one cycle (starts/ends at the zero crossing) — packets are
+// phase-continuous and switching buffers at a packet boundary is glitch-free.
+// At task start this mono table is expanded into left-only / right-only stereo
+// RAM buffers for EasyDMA. Generated; see README.
+#[cfg(feature = "sine-button")]
+#[rustfmt::skip]
+const SINE_MONO: [i16; 48] = [
+    0, 2088, 4141, 6123, 8000, 9740, 11314, 12694,
+    13856, 14782, 15455, 15863, 16000, 15863, 15455, 14782,
+    13856, 12694, 11314, 9740, 8000, 6123, 4141, 2088,
+    0, -2088, -4141, -6123, -8000, -9740, -11314, -12694,
+    -13856, -14782, -15455, -15863, -16000, -15863, -15455, -14782,
+    -13856, -12694, -11314, -9740, -8000, -6123, -4141, -2088,
+];
+
 /// Arm the ISO IN endpoint's EasyDMA with a 192-byte packet at `ptr` and kick
 /// the transfer.  The hardware sends it on the next IN token, then raises
 /// EVENTS_ENDISOIN.
+#[cfg(feature = "stream")]
 #[inline]
 fn arm_iso(usbd: pac::usbd::Usbd, ptr: u32) {
     usbd.isoin().ptr().write_value(ptr);
@@ -263,31 +298,60 @@ fn arm_iso(usbd: pac::usbd::Usbd, ptr: u32) {
     usbd.tasks_startisoin().write_value(1);
 }
 
-/// Stream 192 bytes of silence per USB frame out the isochronous IN endpoint,
-/// making this behave like a mic that is actively capturing (48 kHz * 2ch *
-/// 16-bit = 192 B/ms of zeros).
+/// Stream one 192-byte packet per USB frame out the isochronous IN endpoint,
+/// making this behave like a mic that is actively capturing.
+///
+/// - Default (`stream`): the packet is silence.
+/// - `sine-button`: a 1 kHz sine plays while the user button (P1_10, active-low)
+///   is held, and silence the instant it's released.  Each new press alternates
+///   the channel it plays on — press 1 = LEFT, press 2 = RIGHT, press 3 = LEFT,
+///   ... (the other channel stays silent).
 ///
 /// We own the ISO registers outright: embassy-nrf's USB driver never touches
 /// ISOIN / ISOINCONFIG / STARTISOIN / ENDISOIN, so there is no race with its
 /// interrupt handler.  Pacing is self-clocked off EVENTS_ENDISOIN — one packet
 /// armed per packet sent — which naturally tracks the host's 1 ms polling with
-/// no drift.
+/// no drift.  The buffer choice is re-evaluated at every re-arm, so button
+/// changes take effect within one frame.
 ///
-/// To carry *real* audio instead of silence, replace the `silence` buffer with
-/// a ring buffer filled by an I2S / PDM / SAADC DMA capture and arm from its
-/// read cursor here.
+/// To carry *real* audio, fill a RAM ring buffer from an I2S / PDM / SAADC DMA
+/// capture and point `arm_iso` at its read cursor instead of these buffers.
+#[cfg(feature = "stream")]
 #[embassy_executor::task]
-async fn iso_silence_pump() {
+async fn iso_pump(button: Input<'static>) {
     let usbd = pac::USBD;
 
-    // 192 zero bytes.  Lives in the task's future storage (RAM, in the embassy
-    // arena) for the whole program — a stable RAM address EasyDMA can read.
+    // 192-byte packet buffers live in the task's future storage (RAM, embassy
+    // arena) for the whole program — stable addresses EasyDMA can read.
     let silence = [0u8; 192];
-    let ptr = silence.as_ptr() as u32;
 
-    // If a frame's buffer isn't ready in time, answer the IN token with a
-    // zero-length packet (a valid "no samples this frame" for isochronous)
-    // rather than not responding at all.
+    // Sine-button build only: left-only and right-only stereo buffers (the
+    // opposite channel stays zero), plus the debounced button state and the
+    // channel toggle.  Each fresh press flips the channel: press 1 -> LEFT,
+    // press 2 -> RIGHT, press 3 -> LEFT, ...
+    #[cfg(feature = "sine-button")]
+    let mut left = [0u8; 192];
+    #[cfg(feature = "sine-button")]
+    let mut right = [0u8; 192];
+    #[cfg(feature = "sine-button")]
+    for (i, &s) in SINE_MONO.iter().enumerate() {
+        let b = s.to_le_bytes(); // frame i = [L_lo, L_hi, R_lo, R_hi]
+        left[4 * i] = b[0];
+        left[4 * i + 1] = b[1];
+        right[4 * i + 2] = b[0];
+        right[4 * i + 3] = b[1];
+    }
+    #[cfg(feature = "sine-button")]
+    let mut stable_pressed = false;
+    #[cfg(feature = "sine-button")]
+    let mut debounce: u8 = 0;
+    #[cfg(feature = "sine-button")]
+    let mut use_right = true; // first press flips this to false => LEFT
+    #[cfg(not(feature = "sine-button"))]
+    let _ = &button; // silence/default build never reads the button
+
+    // Late frames answer the IN token with a zero-length packet (valid "no
+    // samples this frame" for isochronous) instead of not responding.
     usbd.isoinconfig().write(|w| w.set_response(Response::ZERO_DATA));
 
     loop {
@@ -297,16 +361,52 @@ async fn iso_silence_pump() {
             Timer::after_millis(4).await;
         }
 
-        // Prime the first packet, then re-arm as each one completes.
-        arm_iso(usbd, ptr);
+        // Stream: arm exactly ONE packet per USB frame, immediately after the
+        // Start-of-Frame, and never re-arm mid-frame.  This is the critical
+        // timing rule for iso IN on the nRF: a full-speed 192-byte packet takes
+        // ~128 us to clock out, and firing STARTISOIN (which DMAs into the
+        // single ISO buffer) while that transmission is in flight corrupts the
+        // packet — audible as scratchiness.  Arming right after SOF guarantees
+        // the DMA (a few us) completes before the host's IN token and long
+        // before the next frame.
+        usbd.events_sof().write_value(0);
         while usbd.epinen().read().isoin() {
-            if usbd.events_endisoin().read() != 0 {
-                usbd.events_endisoin().write_value(0);
+            if usbd.events_sof().read() != 0 {
+                usbd.events_sof().write_value(0);
+
+                // Pick this frame's packet.  Button is sampled once per frame
+                // and debounced over ~12 ms so a single physical press toggles
+                // the channel exactly once.
+                #[cfg(feature = "sine-button")]
+                let ptr = {
+                    let raw = button.is_low(); // active-low
+                    if raw == stable_pressed {
+                        debounce = 0;
+                    } else {
+                        debounce += 1;
+                        if debounce >= 12 {
+                            stable_pressed = raw;
+                            debounce = 0;
+                            if stable_pressed {
+                                use_right = !use_right; // new press => switch channel
+                            }
+                        }
+                    }
+                    if stable_pressed {
+                        if use_right { right.as_ptr() } else { left.as_ptr() }
+                    } else {
+                        silence.as_ptr()
+                    }
+                } as u32;
+                #[cfg(not(feature = "sine-button"))]
+                let ptr = silence.as_ptr() as u32;
+
                 arm_iso(usbd, ptr);
             }
-            // Poll comfortably inside the 1 ms frame; the CPU has nothing else
-            // to do.  (SOF-locked timing is a later refinement.)
-            Timer::after_micros(150).await;
+            // Tight poll so we catch SOF within microseconds (before the frame's
+            // IN token). The device has nothing else to do; usb.run() still runs
+            // between yields.
+            yield_now().await;
         }
     }
 }
