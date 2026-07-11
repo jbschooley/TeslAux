@@ -20,17 +20,34 @@ Presents the full identity and a spec-correct UAC1 **microphone** (AudioControl
 + AudioStreaming interfaces, stereo 48 k/16-bit), verified: macOS enrolls it as
 a 2-channel / 48 kHz USB input device named `TeslaMic`.
 
-Three flashable builds:
+Four flashable builds:
 
 | File | Behaviour |
 |------|-----------|
 | **`teslamic.uf2`** | Enumerates **and streams silence** — 192 B of zeros per USB frame out the iso endpoint, so it looks like a mic that's actively capturing. Try this in the car. |
 | **`teslamic-sine.uf2`** | Same, but emits a **1 kHz sine while the USER button (P1_10) is held**, silence when released. Each new press **alternates the channel**: press 1 = LEFT, press 2 = RIGHT, press 3 = LEFT, … (other channel silent). Good for confirming the audio path and checking L/R routing. |
+| **`teslamic-hid.uf2`** | Everything: the button-triggered L/R sine **plus a HID interface (IF2) streaming an 8-byte heartbeat** — an attempt to defeat the ~60 s "unsupported USB microphone" popup (see [The popup](#the-popup-hid-heartbeat)). Built with `--features hid-heartbeat,sine-button`. |
 | `teslamic-enum-only.uf2` | Enumerates only (no iso data). Fallback if a streaming build misbehaves. Tested to enumerate on macOS. |
 
-The two HID interfaces the real device exposes (status telemetry + settings) are
-**not** included yet. If the audio device alone doesn't trigger the icon, they're
-the next thing to add.
+## The popup (HID heartbeat)
+
+The genuine TeslaMic exposes two HID interfaces (an 8-byte interrupt-IN status
+stream + a control/feature "settings" interface) that this project's audio-only
+builds don't. The car shows the mic icon and plays audio, but after ~60 s pops
+"unsupported USB microphone" — most likely a **keepalive/telemetry watchdog**
+timing out (a static descriptor check would fail instantly, not after a minute).
+
+`teslamic-hid.uf2` adds **IF2** (8-byte interrupt IN, `poll_ms = 1`, matching the
+dump) and streams a report continuously, with a rolling counter in byte 0 so a
+liveness watchdog sees changing data.
+
+**This is a blind guess.** The dump doesn't include the HID report descriptors or
+the report *contents*, so if the car validates specific values (rather than just
+"is something reporting"), this won't be enough — it would need a `usbhid-dump` +
+USB trace from a real or clone TeslaMic. The IF3 "settings" interface is also not
+implemented yet. Combine with the tone build via
+`--features hid-heartbeat,sine-button` if you want to test audio and the popup
+together.
 
 Tesla: Sees the device as a microphone input and shows the mic icon. The sine wave plays through the car's audio system.
 
@@ -50,6 +67,7 @@ into a UF2 at the app offset `0x26000`:
 # pick ONE build:
 cargo build --release                          # -> silence  (teslamic.uf2)
 cargo build --release --features sine-button   # -> sine/button (teslamic-sine.uf2)
+cargo build --release --features hid-heartbeat,sine-button # -> button sine + HID heartbeat (teslamic-hid.uf2)
 cargo build --release --no-default-features     # -> enumerate only (teslamic-enum-only.uf2)
 
 # then package the resulting ELF:
@@ -58,7 +76,7 @@ arm-none-eabi-objcopy -O binary \
 python3 tools/uf2conv.py teslamic.bin -c -b 0x26000 -f 0xADA52840 -o teslamic.uf2
 ```
 
-All three prebuilt `*.uf2` files are checked in.
+All four prebuilt `*.uf2` files are checked in.
 
 ## Flash it (no debug probe needed)
 

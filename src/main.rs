@@ -69,6 +69,11 @@ use embassy_nrf::pac::usbd::vals::Response;
 #[cfg(feature = "stream")]
 use embassy_time::Timer;
 
+#[cfg(feature = "hid-heartbeat")]
+use embassy_futures::join::join;
+#[cfg(feature = "hid-heartbeat")]
+use embassy_usb::class::hid::{Config as HidConfig, HidBootProtocol, HidSubclass, HidWriter, State as HidState};
+
 // Minimal panic handler: no probe is attached in the car, so there is nothing
 // to print to — just idle the core.  (Avoids pulling in defmt / panic-probe.)
 #[panic_handler]
@@ -162,6 +167,25 @@ const AS_ISO_ENDPOINT: [u8; 5] = [
     0x00, 0x00, // wLockDelay
 ];
 
+// Minimal vendor-defined HID report descriptor: one 8-byte input report.
+// The genuine TeslaMic's real report layout is unknown (not in the dump), so
+// this just makes IF2 a valid HID device that can push 8-byte reports; the
+// heartbeat content is a separate guess (see the heartbeat loop in `main`).
+#[cfg(feature = "hid-heartbeat")]
+#[rustfmt::skip]
+const HID_REPORT_DESCRIPTOR: [u8; 21] = [
+    0x06, 0x00, 0xFF, // Usage Page (Vendor-Defined 0xFF00)
+    0x09, 0x01,       // Usage (0x01)
+    0xA1, 0x01,       // Collection (Application)
+    0x15, 0x00,       //   Logical Minimum (0)
+    0x26, 0xFF, 0x00, //   Logical Maximum (255)
+    0x75, 0x08,       //   Report Size (8 bits)
+    0x95, 0x08,       //   Report Count (8 fields)
+    0x09, 0x01,       //   Usage (0x01)
+    0x81, 0x02,       //   Input (Data, Var, Abs)
+    0xC0,             // End Collection
+];
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     // Force HFXO: USB needs the crystal-derived 48 MHz reference.  Legal to set
@@ -187,6 +211,11 @@ async fn main(spawner: Spawner) {
     config.device_sub_class = 0x00;
     config.device_protocol = 0x00;
     config.max_packet_size_0 = 64;
+
+    // HID class state — declared before the builder/buffers so it outlives
+    // `usb` (which holds a handler that borrows it).
+    #[cfg(feature = "hid-heartbeat")]
+    let mut hid_state = HidState::new();
 
     // Descriptor / control buffers.  Live on main's stack; main never returns
     // (usb.run() loops forever) so they outlive every use.
@@ -244,6 +273,24 @@ async fn main(spawner: Spawner) {
 
     drop(func);
 
+    // HID interface (IF2): 8-byte interrupt IN, matching the genuine TeslaMic's
+    // telemetry endpoint.  Added under `hid-heartbeat`; the heartbeat loop below
+    // streams reports the car's status watchdog may be waiting for.  (`hid_state`
+    // is declared up top so it outlives `usb`, which holds a handler borrowing it.)
+    #[cfg(feature = "hid-heartbeat")]
+    let mut hid_writer: HidWriter<'_, _, 8> = HidWriter::new(
+        &mut builder,
+        &mut hid_state,
+        HidConfig {
+            report_descriptor: &HID_REPORT_DESCRIPTOR,
+            request_handler: None,
+            poll_ms: 1,
+            max_packet_size: 8,
+            hid_subclass: HidSubclass::No,
+            hid_boot_protocol: HidBootProtocol::None,
+        },
+    );
+
     let mut usb = builder.build();
 
     // Feed the isochronous IN endpoint at the register level.  embassy-nrf's
@@ -263,7 +310,31 @@ async fn main(spawner: Spawner) {
     #[cfg(not(feature = "stream"))]
     let _ = &spawner;
 
-    // Run the device: handles enumeration + control transfers forever.
+    // Run the device: handles enumeration + control transfers forever.  With
+    // the HID heartbeat enabled, run it concurrently with the report stream.
+    #[cfg(feature = "hid-heartbeat")]
+    {
+        let heartbeat = async {
+            let mut report = [0u8; 8];
+            let mut n: u8 = 0;
+            loop {
+                // Blocks until the host has the interface configured/open.
+                hid_writer.ready().await;
+                // Content is a GUESS — the real 8-byte layout isn't in the dump.
+                // A rolling counter in byte 0 makes the stream visibly "alive"
+                // so a liveness/keepalive watchdog sees changing data.  Revisit
+                // once a genuine mic's HID reports are captured.
+                report[0] = n;
+                n = n.wrapping_add(1);
+                if hid_writer.write(&report).await.is_err() {
+                    // Endpoint not ready (host closed it); back off and re-arm.
+                    Timer::after_millis(2).await;
+                }
+            }
+        };
+        join(usb.run(), heartbeat).await;
+    }
+    #[cfg(not(feature = "hid-heartbeat"))]
     usb.run().await;
 }
 

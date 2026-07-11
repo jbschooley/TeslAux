@@ -19,6 +19,11 @@ stream = []
 # Emit a 1 kHz sine while the user button (P1_10) is held, silence otherwise
 # (teslamic-sine.uf2). Implies `stream`.
 sine-button = ["stream"]
+# Add the TeslaMic HID interface (IF2, 8-byte interrupt IN) and stream a
+# heartbeat, attempting to defeat the car's ~60 s "unsupported USB microphone"
+# popup (teslamic-hid.uf2). Implies `stream`. Content is a guess pending a real
+# mic capture — see README.
+hid-heartbeat = ["stream"]
 
 # Versions pinned to exactly what is already in the local cargo cache so the
 # project builds fully offline.  Do not loosen these without a network to
