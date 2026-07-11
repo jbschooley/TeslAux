@@ -3,8 +3,8 @@
 Firmware that makes a **Heltec Mesh Node T114** enumerate over USB as Tesla's
 cabin microphone, to test whether the car will show its **MIC overlay icon**.
 
-Identity + descriptors are cloned from the TeslaMic dump in the r/hardwarehacking
-thread:
+Identity + descriptors are cloned from the TeslaMic dump in the [r/hardwarehacking
+thread](https://www.reddit.com/r/hardwarehacking/comments/1ok256p/going_down_a_rabbit_hole_wondering_where_to_start/):
 
 | Field | Value |
 |-------|-------|
@@ -31,6 +31,12 @@ Three flashable builds:
 The two HID interfaces the real device exposes (status telemetry + settings) are
 **not** included yet. If the audio device alone doesn't trigger the icon, they're
 the next thing to add.
+
+Tesla: Sees the device as a microphone input and shows the mic icon. The sine wave plays through the car's audio system.
+
+However, there is a noticeable delay (estimating around 100ms) between pressing the button and hearing the sine wave. This is much better than Bluetooth, but not instantaneous enough for real-time audio (like playing an instrument). The only way to fix this would be to get Tesla's engineers to reduce the buffering. I'm surprised they haven't done this already because the delay is noticeable when using the official Tesla Caraoke Mic.
+
+After a minute, it disconnects and the car shows an unsupported USB microphone popup. I assume this is because the TeslaMic firmware is sending some telemetry over the HID interface that this firmware does not implement. I don't have an official or clone mic to use to reverse engineer this interface yet.
 
 ## Build
 
