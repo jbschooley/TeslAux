@@ -24,6 +24,10 @@ sine-button = ["stream"]
 # popup (teslamic-hid.uf2). Implies `stream`. Content is a guess pending a real
 # mic capture — see README.
 hid-heartbeat = ["stream"]
+# While the button is held, step a tone through a log-spaced frequency table
+# (50 Hz .. 20 kHz) on ALL channels, to map the car's mic-processing passband
+# (teslamic-sweep.uf2). Implies `stream`.
+sweep = ["stream"]
 
 # Versions pinned to exactly what is already in the local cargo cache so the
 # project builds fully offline.  Do not loosen these without a network to

@@ -55,6 +55,56 @@ However, there is a noticeable delay (estimating around 100ms) between pressing 
 
 After a minute, it disconnects and the car shows an unsupported USB microphone popup. I assume this is because the TeslaMic firmware is sending some telemetry over the HID interface that this firmware does not implement. I don't have an official or clone mic to use to reverse engineer this interface yet.
 
+## Format test builds
+
+The audio format is a **build-time parameter** (`build.rs` reads env vars), so any
+feasible rate / channel count / bit depth is one build away. All these use
+`sine-button`, so the tone plays while the USER button is held; each press steps
+the tone to the **next channel** (at 2ch = L/R; at 4ch = cycles all four), which
+is how you check the car's channel mapping.
+
+| File | Format | Car result | Env |
+|------|--------|-----------|-----|
+| `teslamic-48k-24bit.uf2` | 48 kHz / 2ch / 24   | ✅ clean | `TESLAMIC_BITS=24` |
+| `teslamic-96k.uf2`     | 96 kHz / 2ch / 16   | ✅ clean | `TESLAMIC_RATE=96000` |
+| `teslamic-96k-24bit.uf2` | 96 kHz / 2ch / 24   | ✅ clean | `TESLAMIC_RATE=96000 TESLAMIC_BITS=24` |
+| `teslamic-mono.uf2`    | 48 kHz / 1ch / 16   | ✅ works | `TESLAMIC_CHANNELS=1` |
+| `teslamic-sweep.uf2`   | 48 kHz / 2ch / 24, **freq sweep** | ✅ full range, no obvious band-limiting | `--features sweep TESLAMIC_BITS=24` |
+| `teslamic-44k.uf2`     | 44.1 kHz / 2ch / 16 | ⚠️ plays but **buzzes** | `TESLAMIC_RATE=44100` |
+| `teslamic-44k-24bit.uf2` | 44.1 kHz / 2ch / 24 | ⚠️ plays but **buzzes** | `TESLAMIC_RATE=44100 TESLAMIC_BITS=24` |
+| `teslamic-4ch.uf2`     | 48 kHz / 4ch / 16   | ⚠️ only ch 1–2 play | `TESLAMIC_CHANNELS=4` |
+| `teslamic-96k-4ch.uf2` | 96 kHz / 4ch / 16   | ⚠️ only ch 1–2 play | `TESLAMIC_RATE=96000 TESLAMIC_CHANNELS=4` |
+| `teslamic-5ch.uf2`     | 48 kHz / **5.0 surround** / 16 | ⚠️ only ch 1–2 play | `TESLAMIC_CHANNELS=5 TESLAMIC_CHMASK=0x37` |
+| `teslamic-192k.uf2`    | 192 kHz / 2ch / 16  | ❌ no output | `TESLAMIC_RATE=192000` |
+
+Column key: ✅ works cleanly · ⚠️ works with a caveat · ❌ no audio.
+
+### What the results tell us
+
+- **Tesla is stereo-max.** Every multichannel build (4ch / 5ch) plays only the
+  first two channels — the car ignores channels 3+. No reason to go above stereo.
+- **48 kHz family only.** 48 k and 96 k are clean at 16- **and** 24-bit. **192 kHz
+  produces no output** (beyond the car's max rate) and **44.1 kHz buzzes** (the
+  one rate outside the 48 k family — likely the car resampling it poorly; not yet
+  confirmed whether it's the car or our fractional-packet handling).
+- **Not heavily processed.** The 50 Hz–20 kHz sweep comes through full-range with
+  no obvious roll-off, so the car isn't aggressively band-limiting the mic input —
+  promising for piping real/music audio, not just voice.
+- **Recommended format: 48 kHz or 96 kHz, stereo, 16- or 24-bit.**
+
+`TESLAMIC_CHMASK` overrides the `wChannelConfig` spatial-position bitmap (default =
+low `channels` bits). The **sweep** build ignores per-channel stepping: while the
+button is held it steps a tone through 50 Hz → 20 kHz on all channels (~0.35 s
+each, restarting each hold), so you can hear where the car's processing rolls off.
+
+Build any format: `TESLAMIC_RATE=… TESLAMIC_CHANNELS=… TESLAMIC_BITS=… cargo build --release --features sine-button` (defaults 48000 / 2 / 16).
+
+**Hardware limit:** the nRF52840 USB is full-speed, so one isochronous packet is
+≤ 1023 bytes/frame — i.e. `(rate/1000) × channels × (bits/8) ≤ 1023`. `build.rs`
+rejects anything over that at compile time. Consequences: 192 kHz caps at 2ch/16-bit,
+4ch caps at 96 kHz, and 24-bit caps at 96 kHz/2ch. (192 kHz/4ch, 96 kHz/8ch, and
+192 kHz/24-bit are impossible on this chip.)
+
 ## Build
 
 Requires the Rust toolchain (pinned in `rust-toolchain.toml`) and

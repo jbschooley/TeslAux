@@ -74,6 +74,12 @@ use embassy_futures::join::join;
 #[cfg(feature = "hid-heartbeat")]
 use embassy_usb::class::hid::{Config as HidConfig, HidBootProtocol, HidSubclass, HidWriter, State as HidState};
 
+// Audio format, parameterized at build time by build.rs from
+// TESLAMIC_RATE / TESLAMIC_CHANNELS / TESLAMIC_BITS (defaults 48000 / 2 / 16).
+// Brings in: SAMPLE_RATE, CHANNELS, BITS, BYTES_PER_SAMPLE,
+//            MAX_SAMPLES_PER_FRAME, MAX_BYTES_PER_FRAME.
+include!(concat!(env!("OUT_DIR"), "/format.rs"));
+
 // Minimal panic handler: no probe is attached in the car, so there is nothing
 // to print to — just idle the core.  (Avoids pulling in defmt / panic-probe.)
 #[panic_handler]
@@ -115,15 +121,16 @@ const AC_HEADER: [u8; 7] = [
     0x01, // baInterfaceNr(1) = interface 1 (AudioStreaming)
 ];
 
-// Input Terminal: ID 1, type 0x0201 (Microphone), 2 channels, L+R.
+// Input Terminal: ID 1, type 0x0201 (Microphone), CHANNELS channels.
 // 12 bytes total once embassy prepends bLength (0x0C) + bDescriptorType.
 const AC_INPUT_TERMINAL: [u8; 10] = [
     0x02, // INPUT_TERMINAL
     0x01, // bTerminalID = 1
     0x01, 0x02, // wTerminalType = 0x0201 (Microphone)
     0x00, // bAssocTerminal
-    0x02, // bNrChannels = 2
-    0x03, 0x00, // wChannelConfig = 0x0003 (Left + Right Front)
+    CHANNELS as u8, // bNrChannels
+    (CHANNEL_MASK & 0xff) as u8,
+    (CHANNEL_MASK >> 8) as u8, // wChannelConfig
     0x00, // iChannelNames
     0x00, // iTerminal
 ];
@@ -147,16 +154,18 @@ const AS_GENERAL: [u8; 5] = [
     0x01, 0x00, // wFormatTag = 0x0001 (PCM)
 ];
 
-// Format Type I: 2 channels, 2 bytes/subframe, 16-bit, one discrete sample
-// rate = 48000 Hz (0x00BB80, little-endian 3-byte).
+// Format Type I: CHANNELS channels, BYTES_PER_SAMPLE bytes/subframe, BITS
+// resolution, one discrete sample rate = SAMPLE_RATE (little-endian 3-byte).
 const AS_FORMAT_TYPE_I: [u8; 9] = [
     0x02, // FORMAT_TYPE
     0x01, // bFormatType = FORMAT_TYPE_I
-    0x02, // bNrChannels = 2
-    0x02, // bSubframeSize = 2 bytes
-    0x10, // bBitResolution = 16
-    0x01, // bSamFreqType = 1 discrete frequency
-    0x80, 0xBB, 0x00, // tSamFreq[1] = 48000
+    CHANNELS as u8,         // bNrChannels
+    BYTES_PER_SAMPLE as u8, // bSubframeSize
+    BITS,                   // bBitResolution
+    0x01,                   // bSamFreqType = 1 discrete frequency
+    (SAMPLE_RATE & 0xff) as u8,
+    ((SAMPLE_RATE >> 8) & 0xff) as u8,
+    ((SAMPLE_RATE >> 16) & 0xff) as u8,
 ];
 
 // Class-specific AS isochronous audio-data endpoint descriptor.
@@ -255,13 +264,14 @@ async fn main(spawner: Spawner) {
             stream.alt_setting(AUDIO_CLASS, SUBCLASS_AUDIOSTREAMING, PROTO_UNDEFINED, None);
         alt1.descriptor(CS_INTERFACE, &AS_GENERAL);
         alt1.descriptor(CS_INTERFACE, &AS_FORMAT_TYPE_I);
-        // 192-byte iso IN, 1 ms interval.  On the nRF this lands on EP8 (0x88);
-        // the exact number doesn't match the genuine 0x84 but hosts key on the
-        // class/format, not the address.  extra_fields = [bRefresh, bSynchAddress]
-        // makes this the 9-byte UAC audio-endpoint form.
+        // Iso IN, 1 ms interval, wMaxPacketSize = the largest frame this format
+        // needs (ceil(rate/1000) * channels * bytes).  On the nRF this lands on
+        // EP8 (0x88); the exact number doesn't match the genuine 0x84 but hosts
+        // key on the class/format, not the address.  extra_fields = [bRefresh,
+        // bSynchAddress] makes this the 9-byte UAC audio-endpoint form.
         let _iso_in = alt1.endpoint_isochronous_in(
             None,
-            192,
+            MAX_BYTES_PER_FRAME as u16,
             1,
             SynchronizationType::Asynchronous,
             UsageType::DataEndpoint,
@@ -338,88 +348,113 @@ async fn main(spawner: Spawner) {
     usb.run().await;
 }
 
-// One cycle of a 1 kHz sine at 48 kHz = 48 samples, 16-bit, ~0.49 full-scale.
-// A 192-byte iso packet holds exactly these 48 stereo frames, so a packet is
-// exactly one cycle (starts/ends at the zero crossing) — packets are
-// phase-continuous and switching buffers at a packet boundary is glitch-free.
-// At task start this mono table is expanded into left-only / right-only stereo
-// RAM buffers for EasyDMA. Generated; see README.
-#[cfg(feature = "sine-button")]
+// 256-point 1-cycle sine, i16, ~0.49 full-scale.  Indexed by the top 8 bits of
+// a 32-bit phase accumulator so the tone stays continuous at any sample rate.
+// Generated; see README.
+#[cfg(feature = "stream")]
 #[rustfmt::skip]
-const SINE_MONO: [i16; 48] = [
-    0, 2088, 4141, 6123, 8000, 9740, 11314, 12694,
-    13856, 14782, 15455, 15863, 16000, 15863, 15455, 14782,
-    13856, 12694, 11314, 9740, 8000, 6123, 4141, 2088,
-    0, -2088, -4141, -6123, -8000, -9740, -11314, -12694,
-    -13856, -14782, -15455, -15863, -16000, -15863, -15455, -14782,
-    -13856, -12694, -11314, -9740, -8000, -6123, -4141, -2088,
+const SINE256: [i16; 256] = [
+         0,    393,    785,   1177,   1568,   1959,   2348,   2735,
+      3121,   3506,   3888,   4267,   4645,   5019,   5390,   5758,
+      6123,   6484,   6841,   7194,   7542,   7886,   8226,   8560,
+      8889,   9213,   9531,   9844,  10150,  10451,  10745,  11033,
+     11314,  11588,  11855,  12115,  12368,  12614,  12851,  13081,
+     13304,  13518,  13724,  13921,  14111,  14292,  14464,  14627,
+     14782,  14928,  15065,  15192,  15311,  15420,  15521,  15611,
+     15693,  15764,  15827,  15880,  15923,  15957,  15981,  15995,
+     16000,  15995,  15981,  15957,  15923,  15880,  15827,  15764,
+     15693,  15611,  15521,  15420,  15311,  15192,  15065,  14928,
+     14782,  14627,  14464,  14292,  14111,  13921,  13724,  13518,
+     13304,  13081,  12851,  12614,  12368,  12115,  11855,  11588,
+     11314,  11033,  10745,  10451,  10150,   9844,   9531,   9213,
+      8889,   8560,   8226,   7886,   7542,   7194,   6841,   6484,
+      6123,   5758,   5390,   5019,   4645,   4267,   3888,   3506,
+      3121,   2735,   2348,   1959,   1568,   1177,    785,    393,
+         0,   -393,   -785,  -1177,  -1568,  -1959,  -2348,  -2735,
+     -3121,  -3506,  -3888,  -4267,  -4645,  -5019,  -5390,  -5758,
+     -6123,  -6484,  -6841,  -7194,  -7542,  -7886,  -8226,  -8560,
+     -8889,  -9213,  -9531,  -9844, -10150, -10451, -10745, -11033,
+    -11314, -11588, -11855, -12115, -12368, -12614, -12851, -13081,
+    -13304, -13518, -13724, -13921, -14111, -14292, -14464, -14627,
+    -14782, -14928, -15065, -15192, -15311, -15420, -15521, -15611,
+    -15693, -15764, -15827, -15880, -15923, -15957, -15981, -15995,
+    -16000, -15995, -15981, -15957, -15923, -15880, -15827, -15764,
+    -15693, -15611, -15521, -15420, -15311, -15192, -15065, -14928,
+    -14782, -14627, -14464, -14292, -14111, -13921, -13724, -13518,
+    -13304, -13081, -12851, -12614, -12368, -12115, -11855, -11588,
+    -11314, -11033, -10745, -10451, -10150,  -9844,  -9531,  -9213,
+     -8889,  -8560,  -8226,  -7886,  -7542,  -7194,  -6841,  -6484,
+     -6123,  -5758,  -5390,  -5019,  -4645,  -4267,  -3888,  -3506,
+     -3121,  -2735,  -2348,  -1959,  -1568,  -1177,   -785,   -393,
 ];
 
-/// Arm the ISO IN endpoint's EasyDMA with a 192-byte packet at `ptr` and kick
+// Test-tone frequency and its per-sample phase increment (freq * 2^32 / rate).
+#[cfg(feature = "stream")]
+const TONE_HZ: u32 = 1000;
+#[cfg(feature = "stream")]
+const PHASE_INC: u32 = (((TONE_HZ as u64) << 32) / SAMPLE_RATE as u64) as u32;
+
+// `sweep` build: log-spaced tones, each held SWEEP_STEP_FRAMES USB frames
+// (~1 ms each) before advancing, restarting from the bottom on each button hold.
+#[cfg(feature = "stream")]
+const SWEEP_FREQS: [u32; 10] = [50, 100, 200, 400, 800, 1600, 3150, 6300, 12500, 20000];
+#[cfg(feature = "stream")]
+const SWEEP_STEP_FRAMES: u32 = 350; // ~0.35 s per tone
+
+/// Arm the ISO IN endpoint's EasyDMA with a `len`-byte packet at `ptr` and kick
 /// the transfer.  The hardware sends it on the next IN token, then raises
 /// EVENTS_ENDISOIN.
 #[cfg(feature = "stream")]
 #[inline]
-fn arm_iso(usbd: pac::usbd::Usbd, ptr: u32) {
+fn arm_iso(usbd: pac::usbd::Usbd, ptr: u32, len: u16) {
     usbd.isoin().ptr().write_value(ptr);
-    usbd.isoin().maxcnt().write(|w| w.set_maxcnt(192));
+    usbd.isoin().maxcnt().write(|w| w.set_maxcnt(len));
     usbd.events_endisoin().write_value(0);
     // Ensure PTR/MAXCNT land before STARTISOIN reads them.
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     usbd.tasks_startisoin().write_value(1);
 }
 
-/// Stream one 192-byte packet per USB frame out the isochronous IN endpoint,
-/// making this behave like a mic that is actively capturing.
+/// Stream one PCM packet per USB frame out the isochronous IN endpoint, making
+/// this behave like a mic that is actively capturing at the built-in format
+/// (SAMPLE_RATE / CHANNELS / BITS).
 ///
-/// - Default (`stream`): the packet is silence.
-/// - `sine-button`: a 1 kHz sine plays while the user button (P1_10, active-low)
-///   is held, and silence the instant it's released.  Each new press alternates
-///   the channel it plays on — press 1 = LEFT, press 2 = RIGHT, press 3 = LEFT,
-///   ... (the other channel stays silent).
+/// - Default (`stream`): silence.
+/// - `sine-button`: a 1 kHz tone plays on ONE channel while the user button
+///   (P1_10, active-low) is held, silence when released.  Each new press
+///   advances the channel (0 -> 1 -> ... -> CHANNELS-1 -> 0); at 2ch that's the
+///   left/right alternation, and with more channels it steps through them so you
+///   can check how the car maps each one.
 ///
-/// We own the ISO registers outright: embassy-nrf's USB driver never touches
-/// ISOIN / ISOINCONFIG / STARTISOIN / ENDISOIN, so there is no race with its
-/// interrupt handler.  Pacing is self-clocked off EVENTS_ENDISOIN — one packet
-/// armed per packet sent — which naturally tracks the host's 1 ms polling with
-/// no drift.  The buffer choice is re-evaluated at every re-arm, so button
-/// changes take effect within one frame.
+/// A 32-bit phase accumulator keeps the tone continuous at any sample rate, and
+/// a sample-count accumulator handles fractional rates (e.g. 44/45 samples per
+/// frame for 44.1 kHz).  We own the ISO registers outright — embassy-nrf's USB
+/// driver never touches ISOIN / ISOINCONFIG / STARTISOIN / ENDISOIN — and arm
+/// exactly once per frame right after SOF so a re-arm never corrupts an
+/// in-flight packet.
 ///
-/// To carry *real* audio, fill a RAM ring buffer from an I2S / PDM / SAADC DMA
-/// capture and point `arm_iso` at its read cursor instead of these buffers.
+/// To carry *real* audio, fill `buf` from an I2S / PDM / SAADC DMA capture
+/// instead of the tone generator.
 #[cfg(feature = "stream")]
 #[embassy_executor::task]
 async fn iso_pump(button: Input<'static>) {
     let usbd = pac::USBD;
 
-    // 192-byte packet buffers live in the task's future storage (RAM, embassy
-    // arena) for the whole program — stable addresses EasyDMA can read.
-    let silence = [0u8; 192];
+    // One frame's PCM, sized for the biggest frame this format needs.  Lives in
+    // the task future (RAM) — a stable address EasyDMA can read.
+    let mut buf = [0u8; MAX_BYTES_PER_FRAME];
 
-    // Sine-button build only: left-only and right-only stereo buffers (the
-    // opposite channel stays zero), plus the debounced button state and the
-    // channel toggle.  Each fresh press flips the channel: press 1 -> LEFT,
-    // press 2 -> RIGHT, press 3 -> LEFT, ...
-    #[cfg(feature = "sine-button")]
-    let mut left = [0u8; 192];
-    #[cfg(feature = "sine-button")]
-    let mut right = [0u8; 192];
-    #[cfg(feature = "sine-button")]
-    for (i, &s) in SINE_MONO.iter().enumerate() {
-        let b = s.to_le_bytes(); // frame i = [L_lo, L_hi, R_lo, R_hi]
-        left[4 * i] = b[0];
-        left[4 * i + 1] = b[1];
-        right[4 * i + 2] = b[0];
-        right[4 * i + 3] = b[1];
-    }
-    #[cfg(feature = "sine-button")]
+    let mut phase: u32 = 0; // tone phase accumulator
+    let mut samp_accum: u32 = 0; // fractional-rate sample-count accumulator
+
+    // Debounced button; each fresh press advances the channel the tone plays on.
     let mut stable_pressed = false;
-    #[cfg(feature = "sine-button")]
     let mut debounce: u8 = 0;
-    #[cfg(feature = "sine-button")]
-    let mut use_right = true; // first press flips this to false => LEFT
-    #[cfg(not(feature = "sine-button"))]
-    let _ = &button; // silence/default build never reads the button
+    let mut sel: usize = CHANNELS - 1; // first press advances to channel 0
+
+    // `sweep` build state: current frequency step + frames spent on it.
+    let mut sweep_frame: u32 = 0;
+    let mut sweep_idx: usize = 0;
 
     // Late frames answer the IN token with a zero-length packet (valid "no
     // samples this frame" for isochronous) instead of not responding.
@@ -432,47 +467,93 @@ async fn iso_pump(button: Input<'static>) {
             Timer::after_millis(4).await;
         }
 
-        // Stream: arm exactly ONE packet per USB frame, immediately after the
-        // Start-of-Frame, and never re-arm mid-frame.  This is the critical
-        // timing rule for iso IN on the nRF: a full-speed 192-byte packet takes
-        // ~128 us to clock out, and firing STARTISOIN (which DMAs into the
-        // single ISO buffer) while that transmission is in flight corrupts the
-        // packet — audible as scratchiness.  Arming right after SOF guarantees
-        // the DMA (a few us) completes before the host's IN token and long
-        // before the next frame.
+        // Arm exactly ONE packet per USB frame, immediately after Start-of-Frame,
+        // never mid-frame: a re-arm DMAs into the single ISO buffer, and doing
+        // that while the packet is clocking out (~128 us for a full one) corrupts
+        // it (audible scratchiness).  SOF-arming keeps the DMA before the IN
+        // token and clear of the previous transmission.
         usbd.events_sof().write_value(0);
         while usbd.epinen().read().isoin() {
             if usbd.events_sof().read() != 0 {
                 usbd.events_sof().write_value(0);
 
-                // Pick this frame's packet.  Button is sampled once per frame
-                // and debounced over ~12 ms so a single physical press toggles
-                // the channel exactly once.
-                #[cfg(feature = "sine-button")]
-                let ptr = {
-                    let raw = button.is_low(); // active-low
-                    if raw == stable_pressed {
+                // Debounce the button once per frame; a fresh press steps the
+                // active channel.
+                let raw = button.is_low(); // active-low
+                if raw == stable_pressed {
+                    debounce = 0;
+                } else {
+                    debounce += 1;
+                    if debounce >= 12 {
+                        stable_pressed = raw;
                         debounce = 0;
+                        if stable_pressed {
+                            sel = (sel + 1) % CHANNELS;
+                        }
+                    }
+                }
+                let tone =
+                    (cfg!(feature = "sine-button") || cfg!(feature = "sweep")) && stable_pressed;
+
+                // Per-frame phase increment: fixed 1 kHz, or the current sweep
+                // step (restarting from the bottom each time the button is held).
+                let inc = if cfg!(feature = "sweep") {
+                    if stable_pressed {
+                        sweep_frame += 1;
+                        if sweep_frame >= SWEEP_STEP_FRAMES {
+                            sweep_frame = 0;
+                            sweep_idx = (sweep_idx + 1) % SWEEP_FREQS.len();
+                        }
                     } else {
-                        debounce += 1;
-                        if debounce >= 12 {
-                            stable_pressed = raw;
-                            debounce = 0;
-                            if stable_pressed {
-                                use_right = !use_right; // new press => switch channel
+                        sweep_frame = 0;
+                        sweep_idx = 0;
+                    }
+                    (((SWEEP_FREQS[sweep_idx] as u64) << 32) / SAMPLE_RATE as u64) as u32
+                } else {
+                    PHASE_INC
+                };
+
+                // sweep -> all channels; sine-button -> just the selected channel.
+                let (ch_lo, ch_hi) = if cfg!(feature = "sweep") {
+                    (0, CHANNELS)
+                } else {
+                    (sel, sel + 1)
+                };
+
+                // Audio frames this USB frame (alternates for fractional rates).
+                samp_accum += SAMPLE_RATE;
+                let nsamp = (samp_accum / 1000) as usize;
+                samp_accum %= 1000;
+                let nbytes = nsamp * CHANNELS * BYTES_PER_SAMPLE;
+
+                // Zero the frame, then lay the tone into the active channel(s).
+                // Phase advances every sample (even when silent) so the tone
+                // resumes phase-continuous.
+                for b in buf[..nbytes].iter_mut() {
+                    *b = 0;
+                }
+                for s in 0..nsamp {
+                    let v = SINE256[((phase >> 24) & 0xFF) as usize];
+                    phase = phase.wrapping_add(inc);
+                    if tone {
+                        for ch in ch_lo..ch_hi {
+                            let off = (s * CHANNELS + ch) * BYTES_PER_SAMPLE;
+                            if BYTES_PER_SAMPLE == 2 {
+                                let b = v.to_le_bytes();
+                                buf[off] = b[0];
+                                buf[off + 1] = b[1];
+                            } else {
+                                // 24-bit: scale the 16-bit sample up by 8 bits.
+                                let b = ((v as i32) << 8).to_le_bytes();
+                                buf[off] = b[0];
+                                buf[off + 1] = b[1];
+                                buf[off + 2] = b[2];
                             }
                         }
                     }
-                    if stable_pressed {
-                        if use_right { right.as_ptr() } else { left.as_ptr() }
-                    } else {
-                        silence.as_ptr()
-                    }
-                } as u32;
-                #[cfg(not(feature = "sine-button"))]
-                let ptr = silence.as_ptr() as u32;
+                }
 
-                arm_iso(usbd, ptr);
+                arm_iso(usbd, buf.as_ptr() as u32, nbytes as u16);
             }
             // Tight poll so we catch SOF within microseconds (before the frame's
             // IN token). The device has nothing else to do; usb.run() still runs
