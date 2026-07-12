@@ -55,6 +55,34 @@ However, there is a noticeable delay (estimating around 100ms) between pressing 
 
 After a minute, it disconnects and the car shows an unsupported USB microphone popup. I assume this is because the TeslaMic firmware is sending some telemetry over the HID interface that this firmware does not implement. I don't have an official or clone mic to use to reverse engineer this interface yet.
 
+## USB spy — on-screen request logger (`teslamic-spy.uf2`)
+
+To reverse-engineer the popup without a real mic, this build turns the T114 into
+its own USB analyzer. It's the full mic + HID device (`--features usb-spy`, which
+implies `hid-heartbeat`), plus a spy that **logs every USB control request the car
+sends to the onboard ST7789 TFT in real time**. Flash it, plug into the car, and
+watch the screen (it lights ~1.5 s after boot).
+
+Each line is one control request/event:
+
+```
+CONFIGURED=1            device configured
+SET_IF if1 alt1         host selected AudioStreaming alt-1 (starts audio)
+O 21 r09 v0200 i2 l8 d05   ctrl-OUT bmReqType=0x21 bReq=0x09(SET_REPORT)
+                            wValue=0x0200 iface=2 len=8 firstbyte=0x05
+I a1 r01 v0100 i2 l8       ctrl-IN  bmReqType=0xA1 bReq=0x01(GET_REPORT) ...
+```
+
+`bmReqType` decodes as: `0x21` = host→device, class, interface; `0xA1` = the
+device→host read. Anything the car sends to **interface 2** (our HID) — especially
+`SET_REPORT`/`GET_REPORT` with their `wValue` and data byte — is the handshake
+we're missing. Read those off the screen (or photograph it) right up to the popup,
+and we can implement the HID interface to match instead of guessing.
+
+Notes/limits: the spy observes **class/vendor** requests (the interesting ones) plus
+config + alt-setting changes; it doesn't see plain standard requests. The screen
+shows the most recent ~11 events; the ring buffer holds 32.
+
 ## Format test builds
 
 The audio format is a **build-time parameter** (`build.rs` reads env vars), so any

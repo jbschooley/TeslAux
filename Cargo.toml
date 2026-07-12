@@ -28,6 +28,19 @@ hid-heartbeat = ["stream"]
 # (50 Hz .. 20 kHz) on ALL channels, to map the car's mic-processing passband
 # (teslamic-sweep.uf2). Implies `stream`.
 sweep = ["stream"]
+# Log every USB control request the host (car) sends to the onboard ST7789 TFT,
+# in real time — turns the T114 into its own USB analyzer to reverse-engineer
+# the HID handshake behind the "unsupported mic" popup. Implies `hid-heartbeat`
+# (so the HID interface exists for the car to talk to).
+usb-spy = [
+    "hid-heartbeat",
+    "dep:embedded-graphics",
+    "dep:embedded-graphics-core",
+    "dep:embedded-hal",
+    "dep:embedded-hal-async",
+    "dep:heapless",
+    "dep:critical-section",
+]
 
 # Versions pinned to exactly what is already in the local cargo cache so the
 # project builds fully offline.  Do not loosen these without a network to
@@ -49,6 +62,14 @@ embassy-futures  = { version = "=0.1.2" }
 
 cortex-m    = { version = "=0.7.7", features = ["inline-asm", "critical-section-single-core"] }
 cortex-m-rt = "=0.7.5"
+
+# ── usb-spy feature deps (onboard-TFT USB control-request logger) ────────────
+embedded-graphics      = { version = "=0.8.2", optional = true }
+embedded-graphics-core = { version = "=0.4.1", optional = true }
+embedded-hal           = { version = "=1.0.0", optional = true }
+embedded-hal-async     = { version = "=1.0.0", optional = true }
+heapless               = { version = "=0.8.0", optional = true }
+critical-section       = { version = "=1.2.0", optional = true }
 
 # Size-optimised even in dev: the app must fit the 0x26000-based flash window
 # and there is no reason to ship a fat debug build for a USB descriptor blob.

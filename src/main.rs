@@ -70,9 +70,58 @@ use embassy_nrf::pac::usbd::vals::Response;
 use embassy_time::Timer;
 
 #[cfg(feature = "hid-heartbeat")]
-use embassy_futures::join::join;
+use embassy_futures::join::join3;
 #[cfg(feature = "hid-heartbeat")]
-use embassy_usb::class::hid::{Config as HidConfig, HidBootProtocol, HidSubclass, HidWriter, State as HidState};
+use embassy_usb::class::hid::{
+    Config as HidConfig, HidBootProtocol, HidSubclass, HidWriter, ReportId, RequestHandler,
+    State as HidState,
+};
+#[cfg(feature = "hid-heartbeat")]
+use embassy_usb::control::OutResponse;
+
+// ── usb-spy: onboard-TFT USB control-request logger ─────────────────────────
+#[cfg(feature = "usb-spy")]
+mod st7789;
+#[cfg(feature = "usb-spy")]
+use core::cell::RefCell;
+#[cfg(feature = "usb-spy")]
+use core::fmt::Write as _;
+#[cfg(feature = "usb-spy")]
+use core::sync::atomic::{AtomicU32, Ordering};
+#[cfg(feature = "usb-spy")]
+use critical_section::Mutex as CsMutex;
+#[cfg(feature = "usb-spy")]
+use embassy_nrf::gpio::{Level, Output, OutputDrive};
+#[cfg(feature = "usb-spy")]
+use embassy_nrf::spim::{self, Spim};
+#[cfg(feature = "usb-spy")]
+use embassy_time::Delay;
+#[cfg(feature = "usb-spy")]
+use embassy_usb::control::{InResponse, Recipient, Request, RequestType};
+#[cfg(feature = "usb-spy")]
+use embassy_usb::driver::Direction;
+#[cfg(feature = "usb-spy")]
+use embassy_usb::types::InterfaceNumber;
+#[cfg(feature = "usb-spy")]
+use embassy_usb::Handler;
+#[cfg(feature = "usb-spy")]
+use embedded_graphics::{
+    mono_font::{ascii::FONT_5X8, MonoTextStyle},
+    pixelcolor::Rgb565,
+    prelude::*,
+    text::Text,
+};
+#[cfg(feature = "usb-spy")]
+use heapless::{Deque, String, Vec};
+#[cfg(feature = "usb-spy")]
+use st7789::{Framebuffer, St7789};
+
+// SPIM interrupt for the display bus (TWISPI1). Separate bind so it only exists
+// in the usb-spy build.
+#[cfg(feature = "usb-spy")]
+embassy_nrf::bind_interrupts!(struct SpiIrqs {
+    TWISPI1 => spim::InterruptHandler<embassy_nrf::peripherals::TWISPI1>;
+});
 
 // Audio format, parameterized at build time by build.rs from
 // TESLAMIC_RATE / TESLAMIC_CHANNELS / TESLAMIC_BITS (defaults 48000 / 2 / 16).
@@ -195,6 +244,211 @@ const HID_REPORT_DESCRIPTOR: [u8; 21] = [
     0xC0,             // End Collection
 ];
 
+// HID control-request handler for the IF2 interface.  With no handler embassy
+// STALLs GET_REPORT / SET_REPORT, which likely makes the car reject the device.
+// We answer everything permissively (feature reads return zeros) — still a blind
+// guess at the protocol, but "respond" beats "stall".
+#[cfg(feature = "hid-heartbeat")]
+struct TeslaHidHandler;
+
+#[cfg(feature = "hid-heartbeat")]
+impl RequestHandler for TeslaHidHandler {
+    fn get_report(&mut self, _id: ReportId, buf: &mut [u8]) -> Option<usize> {
+        let n = buf.len().min(8);
+        buf[..n].fill(0);
+        Some(n)
+    }
+    fn set_report(&mut self, _id: ReportId, _data: &[u8]) -> OutResponse {
+        OutResponse::Accepted
+    }
+    fn get_idle_ms(&mut self, _id: Option<ReportId>) -> Option<u32> {
+        Some(0) // indefinite — don't stall GET_IDLE
+    }
+}
+
+// ── usb-spy: shared log + control-request spy + TFT render task ─────────────
+#[cfg(feature = "usb-spy")]
+const LOG_CAP: usize = 40;
+#[cfg(feature = "usb-spy")]
+static LOG: CsMutex<RefCell<Deque<String<64>, LOG_CAP>>> =
+    CsMutex::new(RefCell::new(Deque::new()));
+#[cfg(feature = "usb-spy")]
+static LOG_SEQ: AtomicU32 = AtomicU32::new(0);
+
+// Freeze the log once full: keep the FIRST LOG_CAP events (the connect-time
+// handshake) instead of a rolling window, so the endless audio-alt toggling
+// can't evict the interesting early requests.
+#[cfg(feature = "usb-spy")]
+fn log_push(line: String<64>) {
+    let mut added = false;
+    critical_section::with(|cs| {
+        let mut q = LOG.borrow_ref_mut(cs);
+        if !q.is_full() {
+            let _ = q.push_back(line);
+            added = true;
+        }
+    });
+    if added {
+        LOG_SEQ.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+// The car toggles AudioStreaming alt1/alt0 forever; log only the first few so
+// they don't crowd out the HID handshake.
+#[cfg(feature = "usb-spy")]
+static SET_ALT_COUNT: AtomicU32 = AtomicU32::new(0);
+// The car writes many chunked SET_REPORTs to IF3; log the first few (to see the
+// payload structure) then suppress so we can see what it does AFTER the writes.
+#[cfg(feature = "usb-spy")]
+static SET_REPORT_COUNT: AtomicU32 = AtomicU32::new(0);
+
+// Reconstruct the bmRequestType byte for a compact, readable log line.
+#[cfg(feature = "usb-spy")]
+fn bm_request_type(req: &Request) -> u8 {
+    let dir = match req.direction {
+        Direction::In => 0x80,
+        Direction::Out => 0x00,
+    };
+    let ty = match req.request_type {
+        RequestType::Standard => 0,
+        RequestType::Class => 1,
+        RequestType::Vendor => 2,
+        RequestType::Reserved => 3,
+    } << 5;
+    let rec = match req.recipient {
+        Recipient::Device => 0,
+        Recipient::Interface => 1,
+        Recipient::Endpoint => 2,
+        Recipient::Other => 3,
+        _ => 4,
+    };
+    dir | ty | rec
+}
+
+/// USB spy: observes (never consumes — always returns `None`) every delegated
+/// control request plus config / alt-setting changes, pushing a one-line
+/// summary to the on-screen log.  Registered before the HID handler so it sees
+/// requests the HID class will go on to answer.
+#[cfg(feature = "usb-spy")]
+struct SpyHandler;
+#[cfg(feature = "usb-spy")]
+impl Handler for SpyHandler {
+    fn configured(&mut self, configured: bool) {
+        let mut s = String::new();
+        let _ = write!(s, "CONFIGURED={}", configured as u8);
+        log_push(s);
+    }
+    fn set_alternate_setting(&mut self, iface: InterfaceNumber, alt: u8) {
+        // Only log the first few — the car toggles this forever.
+        if SET_ALT_COUNT.fetch_add(1, Ordering::Relaxed) < 4 {
+            let mut s = String::new();
+            let _ = write!(s, "SET_IF if{} alt{}", iface.0, alt);
+            log_push(s);
+        }
+    }
+    fn control_out(&mut self, req: Request, data: &[u8]) -> Option<OutResponse> {
+        let mut s = String::new();
+        if req.request == 0x09 {
+            // HID SET_REPORT: compact form so the payload fits on screen; log only
+            // the first several so the chunked-write flood doesn't hide what the
+            // car does afterward.
+            if SET_REPORT_COUNT.fetch_add(1, Ordering::Relaxed) < 6 {
+                let _ = write!(s, "S i{} l{} ", req.index, req.length);
+                for b in data.iter().take(20) {
+                    let _ = write!(s, "{:02x}", b);
+                }
+                log_push(s);
+            }
+        } else {
+            let _ = write!(
+                s,
+                "O {:02x} r{:02x} v{:04x} i{} l{} ",
+                bm_request_type(&req),
+                req.request,
+                req.value,
+                req.index,
+                req.length
+            );
+            for b in data.iter().take(9) {
+                let _ = write!(s, "{:02x}", b);
+            }
+            log_push(s);
+        }
+        None
+    }
+    fn control_in<'a>(&'a mut self, req: Request, _buf: &'a mut [u8]) -> Option<InResponse<'a>> {
+        let mut s = String::new();
+        let _ = write!(
+            s,
+            "I {:02x} r{:02x} v{:04x} i{} l{}",
+            bm_request_type(&req),
+            req.request,
+            req.value,
+            req.index,
+            req.length
+        );
+        log_push(s);
+        None
+    }
+}
+
+#[cfg(feature = "usb-spy")]
+type DisplayDriver = St7789<
+    Spim<'static>,
+    Output<'static>,
+    Output<'static>,
+    Output<'static>,
+    Output<'static>,
+    Delay,
+>;
+
+/// Bring up the TFT and continuously render the control-request log.
+#[cfg(feature = "usb-spy")]
+#[embassy_executor::task]
+async fn display_task(mut disp: DisplayDriver, mut backlight: Output<'static>) {
+    // 64 KB framebuffer in a static so it doesn't blow the task's stack.
+    static mut FB: Framebuffer = Framebuffer::new();
+    let fb: &mut Framebuffer = unsafe { &mut *core::ptr::addr_of_mut!(FB) };
+
+    disp.init().await;
+    let _ = fb.clear(Rgb565::BLACK);
+    disp.flush(&mut *fb).await;
+    backlight.set_low(); // active-low: backlight on
+
+    let title = MonoTextStyle::new(&FONT_5X8, Rgb565::YELLOW);
+    let bodyc = MonoTextStyle::new(&FONT_5X8, Rgb565::GREEN);
+
+    let mut last_seq = u32::MAX;
+    loop {
+        let seq = LOG_SEQ.load(Ordering::Relaxed);
+        if seq != last_seq {
+            last_seq = seq;
+
+            // Snapshot the log out of the critical section, then draw.
+            let mut lines: Vec<String<64>, LOG_CAP> = Vec::new();
+            critical_section::with(|cs| {
+                for l in LOG.borrow_ref(cs).iter() {
+                    let _ = lines.push(l.clone());
+                }
+            });
+
+            let _ = fb.clear(Rgb565::BLACK);
+            let _ = Text::new("TeslaMic USB spy", Point::new(2, 7), title).draw(&mut *fb);
+            // Show the NEWEST ~15 events (the tail) — with the SET_REPORT and
+            // audio-alt floods suppressed, this reveals what the car does AFTER
+            // the config writes (e.g. any GET_REPORT read-back).
+            let start = lines.len().saturating_sub(15);
+            let mut y = 17;
+            for line in &lines[start..] {
+                let _ = Text::new(line, Point::new(2, y), bodyc).draw(&mut *fb);
+                y += 8;
+            }
+            disp.flush(&mut *fb).await;
+        }
+        Timer::after_millis(150).await;
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     // Force HFXO: USB needs the crystal-derived 48 MHz reference.  Legal to set
@@ -221,10 +475,19 @@ async fn main(spawner: Spawner) {
     config.device_protocol = 0x00;
     config.max_packet_size_0 = 64;
 
-    // HID class state — declared before the builder/buffers so it outlives
-    // `usb` (which holds a handler that borrows it).
+    // HID class state + request handler — declared before the builder/buffers so
+    // they outlive `usb` (which holds handlers that borrow them).
     #[cfg(feature = "hid-heartbeat")]
     let mut hid_state = HidState::new();
+    #[cfg(feature = "hid-heartbeat")]
+    let mut hid_handler = TeslaHidHandler;
+    // Second HID interface (IF3) — the genuine TeslaMic exposes two.
+    #[cfg(feature = "hid-heartbeat")]
+    let mut hid_state3 = HidState::new();
+    #[cfg(feature = "hid-heartbeat")]
+    let mut hid_handler3 = TeslaHidHandler;
+    #[cfg(feature = "usb-spy")]
+    let mut spy = SpyHandler;
 
     // Descriptor / control buffers.  Live on main's stack; main never returns
     // (usb.run() loops forever) so they outlive every use.
@@ -283,6 +546,11 @@ async fn main(spawner: Spawner) {
 
     drop(func);
 
+    // Register the spy FIRST so it observes every delegated control request
+    // before the HID class handler (added next) answers it.
+    #[cfg(feature = "usb-spy")]
+    builder.handler(&mut spy);
+
     // HID interface (IF2): 8-byte interrupt IN, matching the genuine TeslaMic's
     // telemetry endpoint.  Added under `hid-heartbeat`; the heartbeat loop below
     // streams reports the car's status watchdog may be waiting for.  (`hid_state`
@@ -293,7 +561,21 @@ async fn main(spawner: Spawner) {
         &mut hid_state,
         HidConfig {
             report_descriptor: &HID_REPORT_DESCRIPTOR,
-            request_handler: None,
+            request_handler: Some(&mut hid_handler),
+            poll_ms: 1,
+            max_packet_size: 8,
+            hid_subclass: HidSubclass::No,
+            hid_boot_protocol: HidBootProtocol::None,
+        },
+    );
+    // IF3: second HID interface (matching the genuine device's interface tree).
+    #[cfg(feature = "hid-heartbeat")]
+    let mut hid_writer3: HidWriter<'_, _, 8> = HidWriter::new(
+        &mut builder,
+        &mut hid_state3,
+        HidConfig {
+            report_descriptor: &HID_REPORT_DESCRIPTOR,
+            request_handler: Some(&mut hid_handler3),
             poll_ms: 1,
             max_packet_size: 8,
             hid_subclass: HidSubclass::No,
@@ -320,29 +602,59 @@ async fn main(spawner: Spawner) {
     #[cfg(not(feature = "stream"))]
     let _ = &spawner;
 
+    // Bring up the onboard ST7789 TFT and stream the spy log to it.
+    #[cfg(feature = "usb-spy")]
+    {
+        let mut spicfg = spim::Config::default();
+        spicfg.frequency = spim::Frequency::M8;
+        spicfg.mode = spim::MODE_0;
+        let dspi = Spim::new_txonly(p.TWISPI1, SpiIrqs, p.P1_08, p.P1_09, spicfg);
+        // nRF52840 SPIM-SCK PIN_CNF fixup for P1.08 (see wireless-performer-fw):
+        // force PIN_CNF[8].INPUT so SCK toggles correctly.
+        unsafe {
+            core::ptr::write_volatile(0x5000_0A20 as *mut u32, 0x301);
+        }
+        let cs = Output::new(p.P0_11, Level::High, OutputDrive::HighDrive);
+        let dc = Output::new(p.P0_12, Level::Low, OutputDrive::HighDrive);
+        let rst = Output::new(p.P0_02, Level::High, OutputDrive::HighDrive);
+        let vtft = Output::new(p.P0_03, Level::High, OutputDrive::Standard); // active-low gate
+        let backlight = Output::new(p.P0_15, Level::High, OutputDrive::Standard); // active-low
+        let disp = St7789::new(dspi, cs, dc, rst, vtft, Delay);
+        spawner.spawn(display_task(disp, backlight).unwrap());
+    }
+
     // Run the device: handles enumeration + control transfers forever.  With
     // the HID heartbeat enabled, run it concurrently with the report stream.
     #[cfg(feature = "hid-heartbeat")]
     {
-        let heartbeat = async {
+        // Heartbeat on each HID interface. Content is a GUESS (real 8-byte
+        // layout isn't in the dump); a rolling counter keeps the stream visibly
+        // "alive" for any liveness watchdog.
+        let hb2 = async {
             let mut report = [0u8; 8];
             let mut n: u8 = 0;
             loop {
-                // Blocks until the host has the interface configured/open.
                 hid_writer.ready().await;
-                // Content is a GUESS — the real 8-byte layout isn't in the dump.
-                // A rolling counter in byte 0 makes the stream visibly "alive"
-                // so a liveness/keepalive watchdog sees changing data.  Revisit
-                // once a genuine mic's HID reports are captured.
                 report[0] = n;
                 n = n.wrapping_add(1);
                 if hid_writer.write(&report).await.is_err() {
-                    // Endpoint not ready (host closed it); back off and re-arm.
                     Timer::after_millis(2).await;
                 }
             }
         };
-        join(usb.run(), heartbeat).await;
+        let hb3 = async {
+            let mut report = [0u8; 8];
+            let mut n: u8 = 0;
+            loop {
+                hid_writer3.ready().await;
+                report[0] = n;
+                n = n.wrapping_add(1);
+                if hid_writer3.write(&report).await.is_err() {
+                    Timer::after_millis(2).await;
+                }
+            }
+        };
+        join3(usb.run(), hb2, hb3).await;
     }
     #[cfg(not(feature = "hid-heartbeat"))]
     usb.run().await;
