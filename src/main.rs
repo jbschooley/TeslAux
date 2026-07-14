@@ -70,14 +70,14 @@ use embassy_nrf::pac::usbd::vals::Response;
 use embassy_time::Timer;
 
 #[cfg(feature = "hid-heartbeat")]
-use embassy_futures::join::join3;
-#[cfg(feature = "hid-heartbeat")]
 use embassy_usb::class::hid::{
     Config as HidConfig, HidBootProtocol, HidSubclass, HidWriter, ReportId, RequestHandler,
     State as HidState,
 };
 #[cfg(feature = "hid-heartbeat")]
-use embassy_usb::control::OutResponse;
+use embassy_usb::control::{InResponse, OutResponse, Request, RequestType};
+#[cfg(feature = "hid-heartbeat")]
+use embassy_usb::Handler;
 
 // ── usb-spy: onboard-TFT USB control-request logger ─────────────────────────
 #[cfg(feature = "usb-spy")]
@@ -96,14 +96,14 @@ use embassy_nrf::gpio::{Level, Output, OutputDrive};
 use embassy_nrf::spim::{self, Spim};
 #[cfg(feature = "usb-spy")]
 use embassy_time::Delay;
+// (Handler / Request / InResponse / RequestType come from the hid-heartbeat
+// imports above — usb-spy implies hid-heartbeat.)
 #[cfg(feature = "usb-spy")]
-use embassy_usb::control::{InResponse, Recipient, Request, RequestType};
+use embassy_usb::control::Recipient;
 #[cfg(feature = "usb-spy")]
 use embassy_usb::driver::Direction;
 #[cfg(feature = "usb-spy")]
 use embassy_usb::types::InterfaceNumber;
-#[cfg(feature = "usb-spy")]
-use embassy_usb::Handler;
 #[cfg(feature = "usb-spy")]
 use embedded_graphics::{
     mono_font::{ascii::FONT_5X8, MonoTextStyle},
@@ -229,30 +229,43 @@ const AS_ISO_ENDPOINT: [u8; 5] = [
 // The genuine TeslaMic's real report layout is unknown (not in the dump), so
 // this just makes IF2 a valid HID device that can push 8-byte reports; the
 // heartbeat content is a separate guess (see the heartbeat loop in `main`).
+// ── Real TeslaMic HID descriptors (dumped from a clone — see real_mic_dump.md) ─
+// IF2 is a standard HID boot keyboard (the mic's physical button -> keystrokes).
 #[cfg(feature = "hid-heartbeat")]
 #[rustfmt::skip]
-const HID_REPORT_DESCRIPTOR: [u8; 21] = [
-    0x06, 0x00, 0xFF, // Usage Page (Vendor-Defined 0xFF00)
-    0x09, 0x01,       // Usage (0x01)
-    0xA1, 0x01,       // Collection (Application)
-    0x15, 0x00,       //   Logical Minimum (0)
-    0x26, 0xFF, 0x00, //   Logical Maximum (255)
-    0x75, 0x08,       //   Report Size (8 bits)
-    0x95, 0x08,       //   Report Count (8 fields)
-    0x09, 0x01,       //   Usage (0x01)
-    0x81, 0x02,       //   Input (Data, Var, Abs)
-    0xC0,             // End Collection
+const HID_REPORT_KEYBOARD: [u8; 65] = [
+    0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x05, 0x07, 0x19, 0xe0, 0x29, 0xe7,
+    0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x95, 0x01,
+    0x75, 0x08, 0x81, 0x01, 0x95, 0x05, 0x75, 0x01, 0x05, 0x08, 0x19, 0x01,
+    0x29, 0x05, 0x91, 0x02, 0x95, 0x01, 0x75, 0x03, 0x91, 0x01, 0x95, 0x06,
+    0x75, 0x08, 0x15, 0x00, 0x26, 0xa4, 0x00, 0x05, 0x07, 0x19, 0x00, 0x2a,
+    0xa4, 0x00, 0x81, 0x00, 0xc0,
 ];
 
-// HID control-request handler for the IF2 interface.  With no handler embassy
-// STALLs GET_REPORT / SET_REPORT, which likely makes the car reject the device.
-// We answer everything permissively (feature reads return zeros) — still a blind
-// guess at the protocol, but "respond" beats "stall".
+// IF3 is an endpoint-less vendor HID (Usage Page 0xFF00, Usage 0x55AA) with a
+// 256-B Input, 256-B Output and 8-B Feature report (report ID 0). The car writes
+// its A5 5A config to the Output report via SET_REPORT.
 #[cfg(feature = "hid-heartbeat")]
-struct TeslaHidHandler;
+#[rustfmt::skip]
+const HID_REPORT_IF3: [u8; 36] = [
+    0x06, 0x00, 0xff, 0x0a, 0xaa, 0x55, 0xa1, 0x01, 0x15, 0x00, 0x26, 0xff,
+    0x00, 0x75, 0x08, 0x96, 0x00, 0x01, 0x09, 0x01, 0x81, 0x02, 0x96, 0x00,
+    0x01, 0x09, 0x01, 0x91, 0x02, 0x95, 0x08, 0x09, 0x01, 0xb1, 0x02, 0xc0,
+];
 
+// IF3's 9-byte HID descriptor (bcdHID 2.01, one 36-byte report descriptor).
 #[cfg(feature = "hid-heartbeat")]
-impl RequestHandler for TeslaHidHandler {
+const HID_DESC_IF3: [u8; 9] = [0x09, 0x21, 0x01, 0x02, 0x00, 0x01, 0x22, 0x24, 0x00];
+
+// IF3 Feature report the real mic returns on GET_REPORT(Feature) — version/status.
+#[cfg(feature = "hid-heartbeat")]
+const IF3_FEATURE: [u8; 8] = [0x00, 0x01, 0x00, 0x03, 0x03, 0x00, 0x08, 0x00];
+
+// IF2 keyboard request handler: return the empty key state on GET_REPORT.
+#[cfg(feature = "hid-heartbeat")]
+struct KeyboardHandler;
+#[cfg(feature = "hid-heartbeat")]
+impl RequestHandler for KeyboardHandler {
     fn get_report(&mut self, _id: ReportId, buf: &mut [u8]) -> Option<usize> {
         let n = buf.len().min(8);
         buf[..n].fill(0);
@@ -262,7 +275,46 @@ impl RequestHandler for TeslaHidHandler {
         OutResponse::Accepted
     }
     fn get_idle_ms(&mut self, _id: Option<ReportId>) -> Option<u32> {
-        Some(0) // indefinite — don't stall GET_IDLE
+        Some(0)
+    }
+}
+
+// IF3 is endpoint-less, so embassy's HidWriter can't build it. We hand-roll a
+// Handler that serves its report/HID descriptor, returns the Feature report, and
+// accepts the car's SET_REPORT config writes — exactly what the real mic does.
+#[cfg(feature = "hid-heartbeat")]
+struct If3Handler;
+#[cfg(feature = "hid-heartbeat")]
+impl Handler for If3Handler {
+    fn control_in<'a>(&'a mut self, req: Request, buf: &'a mut [u8]) -> Option<InResponse<'a>> {
+        if req.index != 3 {
+            return None;
+        }
+        match (req.request_type, req.request) {
+            // Standard GET_DESCRIPTOR: report (0x22) or HID (0x21) descriptor.
+            (RequestType::Standard, 0x06) => match (req.value >> 8) as u8 {
+                0x22 => Some(InResponse::Accepted(&HID_REPORT_IF3)),
+                0x21 => Some(InResponse::Accepted(&HID_DESC_IF3)),
+                _ => Some(InResponse::Rejected),
+            },
+            // Class GET_REPORT: return the Feature report.
+            (RequestType::Class, 0x01) => {
+                let n = IF3_FEATURE.len().min(buf.len());
+                buf[..n].copy_from_slice(&IF3_FEATURE[..n]);
+                Some(InResponse::Accepted(&buf[..n]))
+            }
+            _ => None,
+        }
+    }
+    fn control_out(&mut self, req: Request, _data: &[u8]) -> Option<OutResponse> {
+        if req.index != 3 {
+            return None;
+        }
+        // Accept the car's SET_REPORT (config writes) and SET_IDLE.
+        match req.request_type {
+            RequestType::Class => Some(OutResponse::Accepted),
+            _ => None,
+        }
     }
 }
 
@@ -461,11 +513,14 @@ async fn main(spawner: Spawner) {
     let vbus = HardwareVbusDetect::new(Irqs);
     let driver = Driver::new(p.USBD, Irqs, vbus);
 
-    // ── Device identity: clone the TeslaMic ────────────────────────────────
+    // ── Device identity: clone the TeslaMic (strings + serial from real_mic_dump) ─
     let mut config = Config::new(0x1235, 0x0002);
-    config.manufacturer = Some("TeslaMic_T004_OTA_231008");
+    config.manufacturer = Some("TeslaMic_V004_FW_20220217Tes");
     config.product = Some("TeslaMic");
-    config.bcd_usb = UsbVersion::Two; // report USB 2.00
+    // The real mic exposes a 40-byte serial (per-session random); the car reads it.
+    config.serial_number =
+        Some("0E02070008181F0B8AFB76F93A8C1B1D472AA0AA0C2535898B4D6A4738FAD0057B6A12DB17320B75");
+    config.bcd_usb = UsbVersion::Two; // real mic is 0x0110; enum lacks it, 0x0200 is harmless
     config.max_power = 500; // mA, matches the dump
     config.self_powered = false;
     // Plain (non-IAD) composite device: class codes live on the interfaces.
@@ -475,17 +530,14 @@ async fn main(spawner: Spawner) {
     config.device_protocol = 0x00;
     config.max_packet_size_0 = 64;
 
-    // HID class state + request handler — declared before the builder/buffers so
-    // they outlive `usb` (which holds handlers that borrow them).
+    // HID state + handlers — declared before the builder/buffers so they outlive
+    // `usb` (which holds handlers that borrow them).
     #[cfg(feature = "hid-heartbeat")]
-    let mut hid_state = HidState::new();
+    let mut hid_state = HidState::new(); // IF2 keyboard
     #[cfg(feature = "hid-heartbeat")]
-    let mut hid_handler = TeslaHidHandler;
-    // Second HID interface (IF3) — the genuine TeslaMic exposes two.
+    let mut kbd_handler = KeyboardHandler;
     #[cfg(feature = "hid-heartbeat")]
-    let mut hid_state3 = HidState::new();
-    #[cfg(feature = "hid-heartbeat")]
-    let mut hid_handler3 = TeslaHidHandler;
+    let mut if3_handler = If3Handler; // IF3 endpoint-less vendor HID
     #[cfg(feature = "usb-spy")]
     let mut spy = SpyHandler;
 
@@ -494,7 +546,9 @@ async fn main(spawner: Spawner) {
     let mut config_descriptor = [0u8; 256];
     let mut bos_descriptor = [0u8; 32];
     let mut msos_descriptor = [0u8; 16];
-    let mut control_buf = [0u8; 128];
+    // Must hold the largest control-transfer payload — the 40-byte serial string
+    // descriptor is 2 + 80*2 = 162 bytes, so 128 was too small (broke enumeration).
+    let mut control_buf = [0u8; 512];
 
     let mut builder = Builder::new(
         driver,
@@ -551,37 +605,37 @@ async fn main(spawner: Spawner) {
     #[cfg(feature = "usb-spy")]
     builder.handler(&mut spy);
 
-    // HID interface (IF2): 8-byte interrupt IN, matching the genuine TeslaMic's
-    // telemetry endpoint.  Added under `hid-heartbeat`; the heartbeat loop below
-    // streams reports the car's status watchdog may be waiting for.  (`hid_state`
-    // is declared up top so it outlives `usb`, which holds a handler borrowing it.)
+    // IF2: HID keyboard (real mic's report descriptor). Interrupt IN endpoint;
+    // we never send keystrokes (no keys pressed), matching an idle mic button.
+    // Kept alive so the endpoint stays allocated; its reports are never written.
     #[cfg(feature = "hid-heartbeat")]
-    let mut hid_writer: HidWriter<'_, _, 8> = HidWriter::new(
+    let _hid_kbd: HidWriter<'_, _, 8> = HidWriter::new(
         &mut builder,
         &mut hid_state,
         HidConfig {
-            report_descriptor: &HID_REPORT_DESCRIPTOR,
-            request_handler: Some(&mut hid_handler),
+            report_descriptor: &HID_REPORT_KEYBOARD,
+            request_handler: Some(&mut kbd_handler),
             poll_ms: 1,
             max_packet_size: 8,
             hid_subclass: HidSubclass::No,
             hid_boot_protocol: HidBootProtocol::None,
         },
     );
-    // IF3: second HID interface (matching the genuine device's interface tree).
+
+    // IF3: endpoint-less vendor HID. embassy's HidWriter always allocates an
+    // endpoint, so we hand-roll the interface (HID class, one alt, HID descriptor,
+    // no endpoint) and let `If3Handler` serve its report/feature and accept writes.
     #[cfg(feature = "hid-heartbeat")]
-    let mut hid_writer3: HidWriter<'_, _, 8> = HidWriter::new(
-        &mut builder,
-        &mut hid_state3,
-        HidConfig {
-            report_descriptor: &HID_REPORT_DESCRIPTOR,
-            request_handler: Some(&mut hid_handler3),
-            poll_ms: 1,
-            max_packet_size: 8,
-            hid_subclass: HidSubclass::No,
-            hid_boot_protocol: HidBootProtocol::None,
-        },
-    );
+    {
+        let mut func3 = builder.function(0x03, 0x00, 0x00);
+        let mut iface3 = func3.interface();
+        let mut alt3 = iface3.alt_setting(0x03, 0x00, 0x00, None);
+        // 0x21 = HID descriptor; payload is the bytes after bLength + type.
+        alt3.descriptor(0x21, &HID_DESC_IF3[2..]);
+        // (no endpoint)
+    }
+    #[cfg(feature = "hid-heartbeat")]
+    builder.handler(&mut if3_handler);
 
     let mut usb = builder.build();
 
@@ -623,40 +677,9 @@ async fn main(spawner: Spawner) {
         spawner.spawn(display_task(disp, backlight).unwrap());
     }
 
-    // Run the device: handles enumeration + control transfers forever.  With
-    // the HID heartbeat enabled, run it concurrently with the report stream.
-    #[cfg(feature = "hid-heartbeat")]
-    {
-        // Heartbeat on each HID interface. Content is a GUESS (real 8-byte
-        // layout isn't in the dump); a rolling counter keeps the stream visibly
-        // "alive" for any liveness watchdog.
-        let hb2 = async {
-            let mut report = [0u8; 8];
-            let mut n: u8 = 0;
-            loop {
-                hid_writer.ready().await;
-                report[0] = n;
-                n = n.wrapping_add(1);
-                if hid_writer.write(&report).await.is_err() {
-                    Timer::after_millis(2).await;
-                }
-            }
-        };
-        let hb3 = async {
-            let mut report = [0u8; 8];
-            let mut n: u8 = 0;
-            loop {
-                hid_writer3.ready().await;
-                report[0] = n;
-                n = n.wrapping_add(1);
-                if hid_writer3.write(&report).await.is_err() {
-                    Timer::after_millis(2).await;
-                }
-            }
-        };
-        join3(usb.run(), hb2, hb3).await;
-    }
-    #[cfg(not(feature = "hid-heartbeat"))]
+    // Run the device: handles enumeration + all control transfers forever
+    // (including the IF3 config writes, answered by If3Handler). IF2 is a keyboard
+    // that never presses a key, so there's nothing to stream from the app side.
     usb.run().await;
 }
 
