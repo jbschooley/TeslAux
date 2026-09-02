@@ -14,11 +14,18 @@ thread](https://www.reddit.com/r/hardwarehacking/comments/1ok256p/going_down_a_r
 | Max power | 500 mA |
 | Audio | USB Audio Class 1.0 — 48 kHz, 16-bit, **stereo**, 192 B/1 ms iso IN |
 
-## Status
+## Status — WORKING ✅ (popup solved 2026-07-14)
 
-Presents the full identity and a spec-correct UAC1 **microphone** (AudioControl
-+ AudioStreaming interfaces, stereo 48 k/16-bit), verified: macOS enrolls it as
-a 2-channel / 48 kHz USB input device named `TeslaMic`.
+`teslamic-hid.uf2` runs in the car with the **mic icon, working audio, and no
+"unsupported USB microphone" popup / disconnect**. The HID interfaces are a
+byte-exact clone of a real TeslaMic (dumped over libusb — see `real_mic_dump.md`):
+IF2 is a HID keyboard, IF3 is an endpoint-less vendor HID (Usage 0x55AA) whose
+report descriptor + Feature report the car validates. It also enumerates on macOS
+as a 2-channel / 48 kHz input named `TeslaMic`.
+
+Remaining work is product polish (an I²S line-in front-end to stream real audio)
+and the ~100 ms **Tesla-side** latency (not fixable on the device — our end is
+~1–2 ms; it's the car's audio pipeline).
 
 Four flashable builds:
 

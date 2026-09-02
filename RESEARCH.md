@@ -41,10 +41,17 @@ firmware/config channel.
 
 ---
 
-## 3. The "unsupported USB microphone" popup (unsolved)
+## 3. The "unsupported USB microphone" popup — SOLVED ✅ (2026-07-14)
 
-The car shows the icon + plays audio, then after **~60 s** pops "unsupported USB
-microphone" and disconnects. This is the remaining blocker.
+**Root cause:** our HID descriptors didn't match a real TeslaMic. Dumping a
+working clone over libusb (see `real_mic_dump.md`) showed IF2 is a HID **keyboard**
+and IF3 is an **endpoint-less** vendor HID (Usage 0x55AA) with a specific 36-byte
+report descriptor + 8-byte Feature report `0001000303000800` that the car
+validates. Cloning those exactly (plus the serial) → the car accepts it with **no
+popup**. History of the investigation is kept below for reference.
+
+The car shows the icon + plays audio, then (before the fix) after **~60 s** popped
+"unsupported USB microphone" and disconnected.
 
 ### 3.1 What we tried (all still popped)
 1. Enumeration only.
