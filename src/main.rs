@@ -781,6 +781,9 @@ async fn iso_pump(button: Input<'static>) {
 
     let mut phase: u32 = 0; // tone phase accumulator
     let mut samp_accum: u32 = 0; // fractional-rate sample-count accumulator
+    // `ramp` diagnostic build: 16-bit counter, +1 per audio sample.
+    #[cfg(feature = "ramp")]
+    let mut ramp: u16 = 0;
 
     // Debounced button; each fresh press advances the channel the tone plays on.
     let mut stable_pressed = false;
@@ -886,6 +889,30 @@ async fn iso_pump(button: Input<'static>) {
                             }
                         }
                     }
+                }
+
+                // `ramp` diagnostic: overwrite the frame with a counter that
+                // increments once per audio sample, identical on every channel.
+                // Recorded bit-exactly on a host, consecutive samples must
+                // differ by exactly 1 — any repeat, gap or truncation is a
+                // transport fault, and its position says which frame dropped it.
+                #[cfg(feature = "ramp")]
+                for s in 0..nsamp {
+                    for ch in 0..CHANNELS {
+                        let off = (s * CHANNELS + ch) * BYTES_PER_SAMPLE;
+                        if BYTES_PER_SAMPLE == 2 {
+                            let b = ramp.to_le_bytes();
+                            buf[off] = b[0];
+                            buf[off + 1] = b[1];
+                        } else {
+                            // 24-bit: same counter, shifted into the top bits.
+                            let b = ((ramp as u32) << 8).to_le_bytes();
+                            buf[off] = b[0];
+                            buf[off + 1] = b[1];
+                            buf[off + 2] = b[2];
+                        }
+                    }
+                    ramp = ramp.wrapping_add(1);
                 }
 
                 arm_iso(usbd, buf.as_ptr() as u32, nbytes as u16);

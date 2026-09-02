@@ -28,6 +28,10 @@ hid-heartbeat = ["stream"]
 # (50 Hz .. 20 kHz) on ALL channels, to map the car's mic-processing passband
 # (teslamic-sweep.uf2). Implies `stream`.
 sweep = ["stream"]
+# Diagnostic: replace the audio payload with a 16-bit counter that increments
+# once per sample, so a bit-exact host recording shows exactly what the iso
+# transport did (dropped / duplicated / truncated samples). Implies `stream`.
+ramp = ["stream"]
 # Log every USB control request the host (car) sends to the onboard ST7789 TFT,
 # in real time — turns the T114 into its own USB analyzer to reverse-engineer
 # the HID handshake behind the "unsupported mic" popup. Implies `hid-heartbeat`
