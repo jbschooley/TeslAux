@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: MIT
+[package]
+name    = "teslamic-rp"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "RP2040 TeslaMic emulator + USB audio source bridge. `car` faces the Tesla, `source` faces the phone."
+
+# Car-facing: clones the TeslaMic, captures I2S, streams the iso IN endpoint.
+# This is the ONLY binary needed for the PCM2706 build.
+[[bin]]
+name = "car"
+path = "src/bin/car.rs"
+
+# Phone-facing: a UAC1 speaker advertising 48 kHz ONLY, re-emitting as I2S.
+# Only needed for the two-board (clock-locked) build.
+[[bin]]
+name = "source"
+path = "src/bin/source.rs"
+
+[features]
+default = []
+# Car board drives the I2S clock from the car's SOF and emits fixed-size
+# packets (PaceMode::Locked). Requires the `source` board on the other end.
+# Without it, the car board is an I2S slave to a PCM2706 and paces elastically.
+clock-locked = []
+
+# DIAGNOSTIC (car board): generate a 1 kHz tone internally and deliberately swing
+# the iso packet size 47/49 every frame. Answers "does Tesla tolerate variable
+# packet sizes?" with no PCM2706, no source board, no wiring — flash, plug into
+# the car, listen. Clean tone => Elastic pacing is safe. Never ship this.
+packet-stress = []
+
+[dependencies]
+embassy-rp       = { version = "0.9", features = ["rp2040", "time-driver", "critical-section-impl", "unstable-pac"] }
+embassy-usb      = { version = "0.6", default-features = false }
+embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread"] }
+embassy-time     = { version = "0.5" }
+embassy-futures  = { version = "0.1" }
+embassy-sync     = { version = "0.7" }
+
+cortex-m    = { version = "0.7", features = ["inline-asm"] }
+cortex-m-rt = "0.7"
+pio          = "0.3"
+pio-proc     = "0.3"
+fixed        = "1"
+
+[profile.release]
+opt-level     = "s"
+lto           = "fat"
+codegen-units = 1
+debug         = 2

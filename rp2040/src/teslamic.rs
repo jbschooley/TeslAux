@@ -1,0 +1,263 @@
+// SPDX-License-Identifier: MIT
+//! The TeslaMic USB device, byte-for-byte.
+//!
+//! Lifted from the nRF52840 firmware's `src/main.rs`, which is the version the
+//! car actually accepts (mic icon, audio, no "unsupported USB microphone"
+//! popup). Everything here is `embassy-usb`, which is chip-agnostic — the only
+//! thing that changed porting it to RP2040 is who allocates the endpoints.
+//!
+//! Descriptor values come from `real_mic_dump.md` (a working clone dumped over
+//! libusb). The car validates these, so **do not "clean them up"**: the
+//! endpoint-less IF3 with its exact 36-byte report descriptor and its
+//! `00 01 00 03 03 00 08 00` Feature report is what defeats the popup.
+//!
+//! Deliberate, known-good divergences from the real mic (all present in the
+//! nRF build that works in the car):
+//!   * Audio topology is Input Terminal 1 -> Output Terminal 2. The real mic has
+//!     Input 4 -> Feature Unit 5 -> Selector 6 -> Output 7 and advertises two
+//!     sample rates. The car does not care.
+//!   * `bcd_usb` is 0x0200; the real mic is 0x0110.
+//!   * The iso IN endpoint number differs (the host keys on class + format).
+
+use embassy_usb::class::hid::{
+    Config as HidConfig, HidBootProtocol, HidSubclass, HidWriter, ReportId, RequestHandler,
+    State as HidState,
+};
+use embassy_usb::control::{InResponse, OutResponse, Request, RequestType};
+use embassy_usb::descriptor::{SynchronizationType, UsageType};
+use embassy_usb::driver::Driver;
+use embassy_usb::{Builder, Config, Handler, UsbVersion};
+
+/// The shipping format: exactly the real TeslaMic's. Not a build-time knob —
+/// the car is stereo-48k and the PCM2706 is 16-bit only, so there is one
+/// correct answer.
+pub const SAMPLE_RATE: u32 = 48_000;
+pub const CHANNELS: usize = 2;
+pub const BYTES_PER_SAMPLE: usize = 2;
+/// 48 frames * 2ch * 2B. The real mic's wMaxPacketSize exactly.
+pub const BYTES_PER_FRAME: usize = 192;
+
+const CS_INTERFACE: u8 = 0x24;
+const CS_ENDPOINT: u8 = 0x25;
+const AUDIO_CLASS: u8 = 0x01;
+const SUBCLASS_AUDIOCONTROL: u8 = 0x01;
+const SUBCLASS_AUDIOSTREAMING: u8 = 0x02;
+const PROTO_UNDEFINED: u8 = 0x00;
+
+const AC_HEADER: [u8; 7] = [
+    0x01, // HEADER
+    0x00, 0x01, // bcdADC = 1.00
+    0x1E, 0x00, // wTotalLength = 30
+    0x01, // bInCollection
+    0x01, // baInterfaceNr(1) = the AudioStreaming interface
+];
+
+const AC_INPUT_TERMINAL: [u8; 10] = [
+    0x02, // INPUT_TERMINAL
+    0x01, // bTerminalID = 1
+    0x01, 0x02, // wTerminalType = 0x0201 (Microphone)
+    0x00, // bAssocTerminal
+    CHANNELS as u8,
+    0x03, 0x00, // wChannelConfig = L+R
+    0x00, // iChannelNames
+    0x00, // iTerminal
+];
+
+const AC_OUTPUT_TERMINAL: [u8; 7] = [
+    0x03, // OUTPUT_TERMINAL
+    0x02, // bTerminalID = 2
+    0x01, 0x01, // wTerminalType = 0x0101 (USB Streaming)
+    0x00, // bAssocTerminal
+    0x01, // bSourceID = the microphone input terminal
+    0x00, // iTerminal
+];
+
+const AS_GENERAL: [u8; 5] = [
+    0x01, // AS_GENERAL
+    0x02, // bTerminalLink = 2
+    0x01, // bDelay
+    0x01, 0x00, // wFormatTag = PCM
+];
+
+const AS_FORMAT_TYPE_I: [u8; 9] = [
+    0x02, // FORMAT_TYPE
+    0x01, // FORMAT_TYPE_I
+    CHANNELS as u8,
+    BYTES_PER_SAMPLE as u8,
+    16,   // bBitResolution
+    0x01, // one discrete frequency
+    (SAMPLE_RATE & 0xff) as u8,
+    ((SAMPLE_RATE >> 8) & 0xff) as u8,
+    ((SAMPLE_RATE >> 16) & 0xff) as u8,
+];
+
+const AS_ISO_ENDPOINT: [u8; 5] = [
+    0x01, // EP_GENERAL
+    0x00, // bmAttributes
+    0x00, // bLockDelayUnits
+    0x00, 0x00, // wLockDelay
+];
+
+/// IF2: a standard HID boot keyboard, 65 bytes. The real mic's physical button
+/// sends keystrokes; ours never presses a key.
+#[rustfmt::skip]
+const HID_REPORT_KEYBOARD: [u8; 65] = [
+    0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x05, 0x07, 0x19, 0xe0, 0x29, 0xe7,
+    0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x95, 0x01,
+    0x75, 0x08, 0x81, 0x01, 0x95, 0x05, 0x75, 0x01, 0x05, 0x08, 0x19, 0x01,
+    0x29, 0x05, 0x91, 0x02, 0x95, 0x01, 0x75, 0x03, 0x91, 0x01, 0x95, 0x06,
+    0x75, 0x08, 0x15, 0x00, 0x26, 0xa4, 0x00, 0x05, 0x07, 0x19, 0x00, 0x2a,
+    0xa4, 0x00, 0x81, 0x00, 0xc0,
+];
+
+/// IF3: endpoint-less vendor HID, Usage Page 0xFF00 / Usage 0x55AA, with 256-B
+/// In, 256-B Out and 8-B Feature reports. The car writes `A5 5A`-framed config
+/// to the Output report. **This descriptor is what the car validates.**
+#[rustfmt::skip]
+const HID_REPORT_IF3: [u8; 36] = [
+    0x06, 0x00, 0xff, 0x0a, 0xaa, 0x55, 0xa1, 0x01, 0x15, 0x00, 0x26, 0xff,
+    0x00, 0x75, 0x08, 0x96, 0x00, 0x01, 0x09, 0x01, 0x81, 0x02, 0x96, 0x00,
+    0x01, 0x09, 0x01, 0x91, 0x02, 0x95, 0x08, 0x09, 0x01, 0xb1, 0x02, 0xc0,
+];
+
+const HID_DESC_IF3: [u8; 9] = [0x09, 0x21, 0x01, 0x02, 0x00, 0x01, 0x22, 0x24, 0x00];
+
+/// What the real mic returns on GET_REPORT(Feature) for IF3.
+const IF3_FEATURE: [u8; 8] = [0x00, 0x01, 0x00, 0x03, 0x03, 0x00, 0x08, 0x00];
+
+pub struct KeyboardHandler;
+
+impl RequestHandler for KeyboardHandler {
+    fn get_report(&mut self, _id: ReportId, buf: &mut [u8]) -> Option<usize> {
+        let n = buf.len().min(8);
+        buf[..n].fill(0);
+        Some(n)
+    }
+    fn set_report(&mut self, _id: ReportId, _data: &[u8]) -> OutResponse {
+        OutResponse::Accepted
+    }
+    fn get_idle_ms(&mut self, _id: Option<ReportId>) -> Option<u32> {
+        Some(0)
+    }
+}
+
+/// IF3 is endpoint-less, so `HidWriter` can't build it (it always allocates an
+/// endpoint). Hand-rolled: serve the report/HID descriptors, return the Feature
+/// report, and accept the car's SET_REPORT config writes.
+pub struct If3Handler;
+
+impl Handler for If3Handler {
+    fn control_in<'a>(&'a mut self, req: Request, buf: &'a mut [u8]) -> Option<InResponse<'a>> {
+        if req.index != 3 {
+            return None;
+        }
+        match (req.request_type, req.request) {
+            (RequestType::Standard, 0x06) => match (req.value >> 8) as u8 {
+                0x22 => Some(InResponse::Accepted(&HID_REPORT_IF3)),
+                0x21 => Some(InResponse::Accepted(&HID_DESC_IF3)),
+                _ => Some(InResponse::Rejected),
+            },
+            (RequestType::Class, 0x01) => {
+                let n = IF3_FEATURE.len().min(buf.len());
+                buf[..n].copy_from_slice(&IF3_FEATURE[..n]);
+                Some(InResponse::Accepted(&buf[..n]))
+            }
+            _ => None,
+        }
+    }
+
+    fn control_out(&mut self, req: Request, _data: &[u8]) -> Option<OutResponse> {
+        if req.index != 3 {
+            return None;
+        }
+        match req.request_type {
+            RequestType::Class => Some(OutResponse::Accepted),
+            _ => None,
+        }
+    }
+}
+
+/// Device identity. The 40-byte serial forces a 162-byte string descriptor, so
+/// the control buffer must be >= 256 (128 broke enumeration on nRF).
+pub fn config() -> Config<'static> {
+    let mut c = Config::new(0x1235, 0x0002);
+    c.manufacturer = Some("TeslaMic_V004_FW_20220217Tes");
+    c.product = Some("TeslaMic");
+    c.serial_number =
+        Some("0E02070008181F0B8AFB76F93A8C1B1D472AA0AA0C2535898B4D6A4738FAD0057B6A12DB17320B75");
+    c.bcd_usb = UsbVersion::Two;
+    c.max_power = 500;
+    c.self_powered = false;
+    c.composite_with_iads = false;
+    c.device_class = 0x00;
+    c.device_sub_class = 0x00;
+    c.device_protocol = 0x00;
+    c.max_packet_size_0 = 64;
+    c
+}
+
+/// Build all four interfaces onto `builder` and hand back the iso IN endpoint.
+///
+/// Interface order is load-bearing — the car addresses IF2/IF3 by index.
+pub fn build<'d, D: Driver<'d>>(
+    builder: &mut Builder<'d, D>,
+    hid_state: &'d mut HidState<'d>,
+    kbd: &'d mut KeyboardHandler,
+    if3: &'d mut If3Handler,
+) -> D::EndpointIn {
+    // IF0 AudioControl + IF1 AudioStreaming.
+    let mut func = builder.function(AUDIO_CLASS, SUBCLASS_AUDIOCONTROL, PROTO_UNDEFINED);
+    {
+        let mut ac = func.interface();
+        let mut alt = ac.alt_setting(AUDIO_CLASS, SUBCLASS_AUDIOCONTROL, PROTO_UNDEFINED, None);
+        alt.descriptor(CS_INTERFACE, &AC_HEADER);
+        alt.descriptor(CS_INTERFACE, &AC_INPUT_TERMINAL);
+        alt.descriptor(CS_INTERFACE, &AC_OUTPUT_TERMINAL);
+    }
+    let iso_in = {
+        let mut stream = func.interface();
+        // alt 0 is the zero-bandwidth setting the car parks on between uses.
+        stream.alt_setting(AUDIO_CLASS, SUBCLASS_AUDIOSTREAMING, PROTO_UNDEFINED, None);
+        let mut alt1 =
+            stream.alt_setting(AUDIO_CLASS, SUBCLASS_AUDIOSTREAMING, PROTO_UNDEFINED, None);
+        alt1.descriptor(CS_INTERFACE, &AS_GENERAL);
+        alt1.descriptor(CS_INTERFACE, &AS_FORMAT_TYPE_I);
+        let ep = alt1.endpoint_isochronous_in(
+            None,
+            BYTES_PER_FRAME as u16,
+            1,
+            SynchronizationType::Asynchronous,
+            UsageType::DataEndpoint,
+            &[0x00, 0x00], // bRefresh, bSynchAddress -> the 9-byte UAC form
+        );
+        alt1.descriptor(CS_ENDPOINT, &AS_ISO_ENDPOINT);
+        ep
+    };
+    drop(func);
+
+    // IF2: the real keyboard descriptor. Kept alive so the endpoint stays
+    // allocated; no key is ever pressed.
+    let _kbd: HidWriter<'_, D, 8> = HidWriter::new(
+        builder,
+        hid_state,
+        HidConfig {
+            report_descriptor: &HID_REPORT_KEYBOARD,
+            request_handler: Some(kbd),
+            poll_ms: 1,
+            max_packet_size: 8,
+            hid_subclass: HidSubclass::No,
+            hid_boot_protocol: HidBootProtocol::None,
+        },
+    );
+
+    // IF3: HID class interface with a HID descriptor and no endpoint.
+    {
+        let mut f3 = builder.function(0x03, 0x00, 0x00);
+        let mut i3 = f3.interface();
+        let mut a3 = i3.alt_setting(0x03, 0x00, 0x00, None);
+        a3.descriptor(0x21, &HID_DESC_IF3[2..]);
+    }
+    builder.handler(if3);
+
+    iso_in
+}
