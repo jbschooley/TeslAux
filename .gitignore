@@ -1,5 +1,8 @@
-# Rust / Cargo build output
-/target/
+# Rust / Cargo build output.
+# NOT anchored with a leading slash: there are several crates in this repo
+# (root, rp2040/) and each grows its own target/. A leading slash would only
+# match the root one and silently let the others be committed.
+target/
 **/*.rs.bk
 *.pdb
 
