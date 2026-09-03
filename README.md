@@ -168,12 +168,11 @@ worth knowing before optimising it further.
 
 ## Licence
 
-MIT — see [`LICENSE`](LICENSE).
+MIT throughout — see [`LICENSE`](LICENSE).
 
-Two exceptions, both detailed in [`NOTICE.md`](NOTICE.md): the T114's optional
-`usb-spy` display driver is AGPL-3.0-or-later and makes that one build a
-combined AGPL work, and `tools/uf2conv.py` comes from Microsoft's uf2 project.
-The firmware in `rp2040/` — the part you actually flash — is entirely MIT.
+[`NOTICE.md`](NOTICE.md) records the provenance of two pieces: the T114's ST7789
+driver, ported from an AGPL project and relicensed MIT here by its copyright
+holder, and `tools/uf2conv.py`, from Microsoft's uf2 project.
 
 "Tesla", "TeslaMic" and "CaraokeMic" are trademarks of Tesla, Inc. This project
 is independent and not affiliated with or endorsed by Tesla.

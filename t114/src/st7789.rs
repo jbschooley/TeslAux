@@ -1,6 +1,7 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
-// Ported (unmodified except this header note) from wireless-performer-fw's
-// osrf-driver-display-st7789. Stays AGPL; the rest of this crate is MIT.
+// SPDX-License-Identifier: MIT
+// Ported from wireless-performer-fw's osrf-driver-display-st7789, and
+// relicensed MIT for this project by the copyright holder. The original in
+// wireless-performer-fw remains AGPL-3.0-or-later; this copy does not.
 #![allow(async_fn_in_trait, dead_code, unexpected_cfgs, unused_imports)]
 
 //! Hand-rolled ST7789 driver tuned for the T114's 1.14″ 240×135

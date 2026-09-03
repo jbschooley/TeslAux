@@ -1,29 +1,22 @@
 # Licensing
 
-The project is **MIT** (see [`LICENSE`](LICENSE)), with two exceptions worth
-knowing about before you redistribute anything.
+The project is **MIT** throughout — see [`LICENSE`](LICENSE). Two pieces have
+histories worth recording.
 
-## AGPL: the T114's `usb-spy` display driver
+## `t114/src/st7789*`
 
-`t114/src/st7789.rs` and `t114/src/st7789/framebuffer.rs` are
-**AGPL-3.0-or-later**. They were ported from `wireless-performer-fw`, a
-separate AGPL project, and keep their original licence.
+The ST7789 display driver and its framebuffer were ported from
+`wireless-performer-fw`, which is licensed AGPL-3.0-or-later. They have been
+**relicensed MIT for this project by the copyright holder**, who owns both.
 
-Nothing includes them unless you build the T114 firmware with
-`--features usb-spy`, which is the on-screen USB request logger. Because the
-AGPL is copyleft, **that particular binary is a combined work and is AGPL**,
-even though the rest of its sources are MIT. Every other T114 build, and the
-whole of `rp2040/`, is MIT and contains no AGPL code.
+The originals in `wireless-performer-fw` remain AGPL-3.0-or-later. Only this
+copy is MIT, and that grant does not extend to anything else in that project.
 
-If you want a fully MIT T114 build, do not enable `usb-spy`. The copyright
-holder of both projects is the same person, so relicensing those two files for
-this project is also an option, and would remove the exception entirely.
-
-## Third party: `tools/uf2conv.py`
+## `tools/uf2conv.py`
 
 `tools/uf2conv.py` and `tools/uf2families.json` come from Microsoft's
 [uf2](https://github.com/microsoft/uf2) repository and are MIT licensed there.
-They are packaging tools, not part of any firmware image.
+They are packaging tools and are not part of any firmware image.
 
 ## Trademark
 
