@@ -122,11 +122,11 @@ is how you check the car's channel mapping.
 
 | File | Format | Car result | Env |
 |------|--------|-----------|-----|
-| `teslamic-48k-24bit.uf2` | 48 kHz / 2ch / 24   | ✅ clean | `TESLAMIC_BITS=24` |
+| `teslamic-48k-24bit.uf2` | 48 kHz / 2ch / 24   | ❔ July result is uninformative, not retested | `TESLAMIC_BITS=24` |
 | `teslamic-96k.uf2`     | 96 kHz / 2ch / 16   | ✅ clean | `TESLAMIC_RATE=96000` |
-| `teslamic-96k-24bit.uf2` | 96 kHz / 2ch / 24   | ✅ clean | `TESLAMIC_RATE=96000 TESLAMIC_BITS=24` |
+| `teslamic-96k-24bit.uf2` | 96 kHz / 2ch / 24   | ❔ July result is uninformative, not retested | `TESLAMIC_RATE=96000 TESLAMIC_BITS=24` |
 | `teslamic-mono.uf2`    | 48 kHz / 1ch / 16   | ✅ works | `TESLAMIC_CHANNELS=1` |
-| `teslamic-sweep.uf2`   | 48 kHz / 2ch / 24, **freq sweep** | ✅ full range, no obvious band-limiting | `--features sweep TESLAMIC_BITS=24` |
+| `teslamic-sweep.uf2`   | 48 kHz / 2ch / 24, **freq sweep** | ❔ measured under the transport bugs | `--features sweep TESLAMIC_BITS=24` |
 | `teslamic-44k.uf2`     | 44.1 kHz / 2ch / 16 | ✅ **clean** (retested 2026-09-02) | `TESLAMIC_RATE=44100` |
 | `teslamic-32k.uf2`     | 32 kHz / 2ch / 16   | ✅ clean (retested 2026-09-02) | `TESLAMIC_RATE=32000` |
 | `teslamic-44k-24bit.uf2` | 44.1 kHz / 2ch / 24 | ❔ not retested since the fixes | `TESLAMIC_RATE=44100 TESLAMIC_BITS=24` |

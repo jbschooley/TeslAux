@@ -113,12 +113,28 @@ it was our own corruption, and 44.1 kHz was simply the rate most exposed to it.
 
 | | |
 |---|---|
-| 32 kHz, 44.1 kHz, 48 kHz | clean |
-| 96 kHz | clean |
-| 192 kHz | plays, with a click roughly every 2 s (not diagnosed) |
+| 32 kHz, 44.1 kHz, 48 kHz, 16-bit | clean — retested after the transport fixes |
+| 96 kHz, 16-bit | clean — retested |
+| 192 kHz, 16-bit | plays, with a click roughly every 2 s (not diagnosed) |
 | stereo | yes |
 | more than 2 channels | only the first two are ever played |
-| 16-bit | yes |
+| **24-bit** | **unverified** — see below |
+
+**24-bit is an open question, not a result.** It was tested in July and appeared
+clean at 48 and 96 kHz, but that predates the two transport bugs being found, and
+those July tests used a 1 kHz tone at 48 kHz — exactly one cycle per USB packet,
+and therefore blind to the packet corruption by construction. The same test
+signal also reported 48 kHz as "clean" while every packet was being mangled. So
+the July result carries no information either way.
+
+`t114/teslamic-48k-24bit.uf2` and `teslamic-96k-24bit.uf2` are rebuilt against
+the fixed firmware with a 997 Hz tone (deliberately not packet-periodic) if you
+want to settle it. Note 192 kHz at 24-bit is impossible regardless: 1152 bytes
+per frame against the 1023-byte full-speed isochronous limit.
+
+It does not currently matter for the shipping firmware, which is 16-bit
+throughout — the PCM2706 is 16-bit only, and the RP2040 path is built around
+16-bit samples.
 
 ### Variable packet sizes
 

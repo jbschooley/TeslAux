@@ -33,14 +33,20 @@ firmware/config channel.
   applying nRF52840 erratum 166)** — Tesla is **stereo, but not rate-fussy**:
   32 k, 44.1 k, 48 k and 96 k all play clean. The earlier readings below were
   taken with those two bugs present and were measuring our own corruption:
-  - 48 kHz & 96 kHz: clean (16- and 24-bit both fine).
+  - 48 kHz & 96 kHz at 16-bit: clean.
+  - **24-bit: NOT established.** The July "clean" reading was taken with both
+    transport bugs present, using a 1 kHz tone at 48 kHz — one cycle per USB
+    packet, and so blind to the packet rotation by construction. That same
+    signal called 48 kHz clean while every packet was being corrupted, so it
+    proves nothing about 24-bit either. Rebuilt 24-bit images with a 997 Hz tone
+    are in `t114/` if it is worth settling.
   - 192 kHz: no output (beyond the car's max rate).
   - 44.1 kHz: **clean** (the July "buzzes" reading was our fractional-packet
     handling being corrupted, not the car resampling).
   - >2 channels (4ch/5ch): only the first 2 channels ever play → stereo-max.
   - Frequency sweep 50 Hz–20 kHz came through full-range → **not heavily
     band-limited** (good for real/music audio, not just voice).
-  - **Recommended format: 48 kHz or 96 kHz, stereo, 16- or 24-bit.**
+  - **Recommended format: 48 kHz stereo 16-bit** — what the real mic uses.
 - ~100 ms button-to-sound latency is Tesla's own audio buffering, not the device.
 
 ---
