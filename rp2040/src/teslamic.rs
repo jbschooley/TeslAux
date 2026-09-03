@@ -37,6 +37,19 @@ pub const BYTES_PER_SAMPLE: usize = 2;
 /// 48 frames * 2ch * 2B. The real mic's wMaxPacketSize exactly.
 pub const BYTES_PER_FRAME: usize = 192;
 
+/// One extra stereo frame of headroom.
+///
+/// Any build that paces elastically sends `nominal + 1` samples when shedding
+/// drift, i.e. 49 frames = 196 bytes. embassy-rp rejects a write longer than the
+/// endpoint's `max_packet_size` with `BufferOverflow`, so an endpoint declared
+/// at 192 silently drops every corrected packet — which sounds like a click at
+/// every packet boundary, not like a drift problem at all.
+///
+/// Deviating from the real mic's 192 is safe: verified in the car with the nRF
+/// `packet-stress-control` build, which advertises 196 with constant packets and
+/// plays clean.
+pub const BYTES_PER_FRAME_ELASTIC: usize = BYTES_PER_FRAME + 4;
+
 const CS_INTERFACE: u8 = 0x24;
 const CS_ENDPOINT: u8 = 0x25;
 const AUDIO_CLASS: u8 = 0x01;
@@ -199,11 +212,16 @@ pub fn config() -> Config<'static> {
 /// Build all four interfaces onto `builder` and hand back the iso IN endpoint.
 ///
 /// Interface order is load-bearing — the car addresses IF2/IF3 by index.
+/// `ep_max_bytes` is the iso IN endpoint's wMaxPacketSize. Pass
+/// [`BYTES_PER_FRAME`] for a build that always sends exactly 48 frames
+/// (clock-locked), or [`BYTES_PER_FRAME_ELASTIC`] for anything that varies the
+/// packet size.
 pub fn build<'d, D: Driver<'d>>(
     builder: &mut Builder<'d, D>,
     hid_state: &'d mut HidState<'d>,
     kbd: &'d mut KeyboardHandler,
     if3: &'d mut If3Handler,
+    ep_max_bytes: u16,
 ) -> D::EndpointIn {
     // IF0 AudioControl + IF1 AudioStreaming.
     let mut func = builder.function(AUDIO_CLASS, SUBCLASS_AUDIOCONTROL, PROTO_UNDEFINED);
@@ -224,7 +242,7 @@ pub fn build<'d, D: Driver<'d>>(
         alt1.descriptor(CS_INTERFACE, &AS_FORMAT_TYPE_I);
         let ep = alt1.endpoint_isochronous_in(
             None,
-            BYTES_PER_FRAME as u16,
+            ep_max_bytes,
             1,
             SynchronizationType::Asynchronous,
             UsageType::DataEndpoint,
