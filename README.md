@@ -105,27 +105,40 @@ is how you check the car's channel mapping.
 | `teslamic-96k-24bit.uf2` | 96 kHz / 2ch / 24   | ✅ clean | `TESLAMIC_RATE=96000 TESLAMIC_BITS=24` |
 | `teslamic-mono.uf2`    | 48 kHz / 1ch / 16   | ✅ works | `TESLAMIC_CHANNELS=1` |
 | `teslamic-sweep.uf2`   | 48 kHz / 2ch / 24, **freq sweep** | ✅ full range, no obvious band-limiting | `--features sweep TESLAMIC_BITS=24` |
-| `teslamic-44k.uf2`     | 44.1 kHz / 2ch / 16 | ⚠️ plays but **buzzes** | `TESLAMIC_RATE=44100` |
-| `teslamic-44k-24bit.uf2` | 44.1 kHz / 2ch / 24 | ⚠️ plays but **buzzes** | `TESLAMIC_RATE=44100 TESLAMIC_BITS=24` |
+| `teslamic-44k.uf2`     | 44.1 kHz / 2ch / 16 | ✅ **clean** (retested 2026-09-02) | `TESLAMIC_RATE=44100` |
+| `teslamic-32k.uf2`     | 32 kHz / 2ch / 16   | ✅ clean (retested 2026-09-02) | `TESLAMIC_RATE=32000` |
+| `teslamic-44k-24bit.uf2` | 44.1 kHz / 2ch / 24 | ❔ not retested since the fixes | `TESLAMIC_RATE=44100 TESLAMIC_BITS=24` |
 | `teslamic-4ch.uf2`     | 48 kHz / 4ch / 16   | ⚠️ only ch 1–2 play | `TESLAMIC_CHANNELS=4` |
 | `teslamic-96k-4ch.uf2` | 96 kHz / 4ch / 16   | ⚠️ only ch 1–2 play | `TESLAMIC_RATE=96000 TESLAMIC_CHANNELS=4` |
 | `teslamic-5ch.uf2`     | 48 kHz / **5.0 surround** / 16 | ⚠️ only ch 1–2 play | `TESLAMIC_CHANNELS=5 TESLAMIC_CHMASK=0x37` |
-| `teslamic-192k.uf2`    | 192 kHz / 2ch / 16  | ❌ no output | `TESLAMIC_RATE=192000` |
+| `teslamic-192k.uf2`    | 192 kHz / 2ch / 16  | ❔ "no output" in July; not retested since the fixes | `TESLAMIC_RATE=192000` |
 
 Column key: ✅ works cleanly · ⚠️ works with a caveat · ❌ no audio.
 
 ### What the results tell us
 
+> **Corrected 2026-09-02.** The original matrix was measured with two firmware
+> bugs present (an ISO-IN DMA race, and nRF52840 erratum 166 unapplied). Both
+> corrupted the audio *we* transmitted, so several "Tesla can't do this"
+> conclusions were actually our own faults. Rates marked ❔ were measured under
+> those bugs and have not been retested.
+
+- **Tesla is NOT 48 kHz-family only.** With the transport fixed, **32 kHz,
+  44.1 kHz, 48 kHz and 96 kHz all play cleanly.** The old "44.1 kHz buzzes"
+  finding was our bug: 44.1 is the one standard rate that doesn't divide into
+  1 ms frames, so it alternates 44/45 samples per packet, and varying the packet
+  size was exactly what the two bugs corrupted.
+- **Variable packet sizes are fine.** `teslamic-stress-variable.uf2` changes the
+  packet size on *every frame* — ~500x harsher than real clock drift — and plays
+  clean. Elastic pacing against a drifting source is therefore viable.
 - **Tesla is stereo-max.** Every multichannel build (4ch / 5ch) plays only the
-  first two channels — the car ignores channels 3+. No reason to go above stereo.
-- **48 kHz family only.** 48 k and 96 k are clean at 16- **and** 24-bit. **192 kHz
-  produces no output** (beyond the car's max rate) and **44.1 kHz buzzes** (the
-  one rate outside the 48 k family — likely the car resampling it poorly; not yet
-  confirmed whether it's the car or our fractional-packet handling).
+  first two channels. Measured before the fixes, but the fixes cannot plausibly
+  affect channel *mapping*, so this one still stands.
 - **Not heavily processed.** The 50 Hz–20 kHz sweep comes through full-range with
   no obvious roll-off, so the car isn't aggressively band-limiting the mic input —
   promising for piping real/music audio, not just voice.
-- **Recommended format: 48 kHz or 96 kHz, stereo, 16- or 24-bit.**
+- **Recommended format: 48 kHz stereo 16-bit** — not because the others fail,
+  but because it is exactly what the real TeslaMic advertises.
 
 `TESLAMIC_CHMASK` overrides the `wChannelConfig` spatial-position bitmap (default =
 low `channels` bits). The **sweep** build ignores per-channel stepping: while the

@@ -29,10 +29,14 @@ firmware/config channel.
 
 - **Mic icon appears** in the car; audio plays through the cabin speakers.
 - Enumerates on macOS as a 2-ch / 48 kHz input, with the IF2/IF3 HID interfaces.
-- **Format support (tested in-car)** — Tesla is effectively **stereo, 48 kHz-family**:
+- **Format support (RETESTED 2026-09-02, after fixing the ISO-IN DMA race and
+  applying nRF52840 erratum 166)** — Tesla is **stereo, but not rate-fussy**:
+  32 k, 44.1 k, 48 k and 96 k all play clean. The earlier readings below were
+  taken with those two bugs present and were measuring our own corruption:
   - 48 kHz & 96 kHz: clean (16- and 24-bit both fine).
   - 192 kHz: no output (beyond the car's max rate).
-  - 44.1 kHz: plays but buzzes (only rate outside the 48 k family).
+  - 44.1 kHz: **clean** (the July "buzzes" reading was our fractional-packet
+    handling being corrupted, not the car resampling).
   - >2 channels (4ch/5ch): only the first 2 channels ever play → stereo-max.
   - Frequency sweep 50 Hz–20 kHz came through full-range → **not heavily
     band-limited** (good for real/music audio, not just voice).
