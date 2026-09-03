@@ -1,4 +1,24 @@
-# TeslaMic emulator (Heltec T114 / nRF52840)
+# TeslAux
+
+Pipe audio from a phone into a Tesla's cabin speakers, by emulating the USB
+microphone the car already accepts.
+
+The car exposes no aux input, but it does accept Tesla's own cabin microphone
+over USB. This project clones that device — descriptors and all — and feeds it
+real audio instead of a microphone, so anything that can play into a USB audio
+output can play through the car.
+
+Two hardware paths, both documented in `rp2040/FLASHING.md`:
+
+* **Two RP2040 boards** — one presents a USB audio output to the phone, the
+  other presents the TeslaMic to the car, joined by I2S.
+* **A PCM2706 USB-to-I2S bridge plus one RP2040** — fewer parts, and the clock
+  recovery happens in hardware.
+
+The original nRF52840 (Heltec T114) firmware is still here and still works; it is
+what the descriptor cloning was worked out on.
+
+## TeslaMic emulator (Heltec T114 / nRF52840)
 
 Firmware that makes a **Heltec Mesh Node T114** enumerate over USB as Tesla's
 cabin microphone, to test whether the car will show its **MIC overlay icon**.

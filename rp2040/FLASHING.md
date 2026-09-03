@@ -25,10 +25,10 @@ Hold BOOTSEL while plugging the board into your Mac, then:
 
 ```sh
 # SOURCE board — the one the phone plugs into
-cp ~/Projects/TeslaAudio/rp2040/teslamic-rp-source-steered-lowlat.uf2 /Volumes/RPI-RP2/
+cp ~/Projects/TeslAux/rp2040/teslamic-rp-source-steered-lowlat.uf2 /Volumes/RPI-RP2/
 
 # CAR board — the one that plugs into the Tesla
-cp ~/Projects/TeslaAudio/rp2040/teslamic-rp-car-elastic-lowlat.uf2 /Volumes/RPI-RP2/
+cp ~/Projects/TeslAux/rp2040/teslamic-rp-car-elastic-lowlat.uf2 /Volumes/RPI-RP2/
 ```
 
 Copy from the terminal, not Finder — Finder crashes on `RPI-RP2` because the
