@@ -66,6 +66,11 @@ pan-test = []
 # by the peak. That is the real lower bound on the cushion — everything else is
 # inference. See src/bin/source.rs.
 measure-excursion = []
+# Source cushion at 2x the MEASURED peak excursion rather than an inferred bound:
+# ring 256 (2.67 ms) with a 16-frame I2S block. Requires clock-steered — a
+# free-running clock has drift to absorb as well as jitter, and its slip deadband
+# would not fit this ring.
+ultra-low = ["clock-steered"]
 # Car board drives the I2S clock from the car's SOF and emits fixed-size
 # packets (PaceMode::Locked). Requires the `source` board on the other end.
 # Without it, the car board is an I2S slave to a PCM2706 and paces elastically.

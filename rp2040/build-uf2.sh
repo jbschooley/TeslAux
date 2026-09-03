@@ -21,6 +21,7 @@ build source ""              teslamic-rp-source-adaptive
 build source low-latency     teslamic-rp-source-lowlat
 build source clock-steered   teslamic-rp-source-steered
 build source clock-steered,low-latency teslamic-rp-source-steered-lowlat
+build source ultra-low       teslamic-rp-source-ultralow
 # --- alternative pairing: clock-locked chain (fixed 192-B packets to the car) ---
 # source clock-locked is deliberately not built — see the compile_error in
 # src/bin/source.rs. It would make both boards drive the I2S clock lines.

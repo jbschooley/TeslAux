@@ -50,7 +50,8 @@ bootloader reboots and unmounts the volume the moment the last block lands.
 
 | image | board | notes |
 |---|---|---|
-| `teslamic-rp-source-steered-lowlat.uf2` | source | **recommended.** Clock steered to the host, 5.3 ms cushion |
+| `teslamic-rp-source-ultralow.uf2` | source | 2.7 ms cushion — sized at 2x the *measured* peak excursion (<64 frames over a full track) |
+| `teslamic-rp-source-steered-lowlat.uf2` | source | **safe default.** Clock steered to the host, 5.3 ms cushion |
 | `teslamic-rp-source-steered.uf2` | source | same, 10.7 ms cushion — more margin |
 | `teslamic-rp-source-adaptive.uf2` | source | fallback: upstream I²S master, free-running clock, uses slip correction |
 | `teslamic-rp-source-lowlat.uf2` | source | as adaptive, halved cushion |

@@ -71,18 +71,35 @@ const BYTES_PER_FRAME: usize = 192; // 48 * 2ch * 2B
 /// bunching, and the cushion has to comfortably exceed the deadband.
 ///
 /// The added latency is irrelevant: ~5 ms more against Tesla's own ~100 ms.
-#[cfg(not(feature = "low-latency"))]
+/// Sized from measurement, not inference: with the clock steered, the peak
+/// buffer excursion measured over a full track stayed under 64 frames, so 128
+/// gives 2x margin. Ring 128 would give none.
+#[cfg(feature = "ultra-low")]
+const RING: usize = 256;
+#[cfg(all(not(feature = "low-latency"), not(feature = "ultra-low")))]
 const RING: usize = 1024;
 /// Half the cushion. Ring must stay above ~2x(deadband + one consumer burst) =
 /// 2x(192+32) = 448, so 512 is the nearest safe power of two.
-#[cfg(feature = "low-latency")]
+#[cfg(all(feature = "low-latency", not(feature = "ultra-low")))]
 const RING: usize = 512;
 /// Four USB frames. Tolerates a host bunching up to three packets.
 const HYSTERESIS: usize = 192;
-#[cfg(not(feature = "low-latency"))]
+
+/// The free-running (non-steered) path paces with `slip`, whose deadband must
+/// fit inside the buffer — a deadband at or above the target means the pacer can
+/// never correct. The steered path does not slip at all, so it is exempt. This
+/// is why `ultra-low` requires `clock-steered`.
+#[cfg(not(feature = "clock-steered"))]
+const _: () = assert!(
+    HYSTERESIS + I2S_BLOCK < RING / 2,
+    "slip deadband does not fit this RING; use clock-steered or grow the buffer"
+);
+#[cfg(all(not(feature = "low-latency"), not(feature = "ultra-low")))]
 const I2S_BLOCK: usize = 64;
-#[cfg(feature = "low-latency")]
+#[cfg(all(feature = "low-latency", not(feature = "ultra-low")))]
 const I2S_BLOCK: usize = 32;
+#[cfg(feature = "ultra-low")]
+const I2S_BLOCK: usize = 16;
 /// 32-bit I2S slots => BCK at 64x fs, matching `slave_rx` and the PCM2706. The
 /// 16-bit sample rides in the top half of each word.
 const I2S_BIT_DEPTH: u32 = 32;
