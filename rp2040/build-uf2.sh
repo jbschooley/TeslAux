@@ -18,7 +18,8 @@ build() { # <bin> <features> <out>
 build car    ""              teslamic-rp-car-elastic
 build source ""              teslamic-rp-source-adaptive
 # --- alternative pairing: clock-locked chain (fixed 192-B packets to the car) ---
-build source clock-locked    teslamic-rp-source-locked
+# source clock-locked is deliberately not built — see the compile_error in
+# src/bin/source.rs. It would make both boards drive the I2S clock lines.
 # --- PCM2706 variant: same car binary as elastic, kept under its old name ---
 build car    ""              teslamic-rp-car-pcm2706
 build car    clock-locked    teslamic-rp-car-locked

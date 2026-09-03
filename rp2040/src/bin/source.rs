@@ -36,6 +36,7 @@ use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{PIO0, USB};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
+use embassy_rp::pio_programs::i2s::{PioI2sOut, PioI2sOutProgram};
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
@@ -63,6 +64,9 @@ const CHANNELS: usize = 2;
 const BYTES_PER_FRAME: usize = 192; // 48 * 2ch * 2B
 const RING: usize = 512;
 const I2S_BLOCK: usize = 64;
+/// 32-bit I2S slots => BCK at 64x fs, matching `slave_rx` and the PCM2706. The
+/// 16-bit sample rides in the top half of each word.
+const I2S_BIT_DEPTH: u32 = 32;
 
 const CS_INTERFACE: u8 = 0x24;
 const CS_ENDPOINT: u8 = 0x25;
@@ -191,7 +195,23 @@ static CLOCK_LIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    let p = embassy_rp::init(Default::default());
+    // Run the system clock at 124.8 MHz, not the default 125 MHz.
+    //
+    // The PIO clock divider is 8.8 fixed point. At 125 MHz the divider needed
+    // for 48 kHz is 20.345052, which quantises to 20.343750 — so the I2S runs at
+    // 48003.07 Hz, a systematic +64 ppm. Against a host at 48000 that is ~3.1
+    // dropped or duplicated frames per second, forever, and the size of each
+    // discontinuity scales with signal level: inaudible when quiet, audibly
+    // crusty on loud bass.
+    //
+    // 124.8 MHz makes the divider exactly 20.3125, so fs is exactly 48000.000
+    // and only crystal tolerance remains (~1 slip/sec worst case, usually far
+    // less). It is PLL-reachable from the 12 MHz crystal: FBDIV 52 -> VCO
+    // 624 MHz, POSTDIV 5/1. USB is unaffected — it runs from its own PLL.
+    let mut cfg = embassy_rp::config::Config::default();
+    cfg.clocks = embassy_rp::clocks::ClockConfig::system_freq(124_800_000)
+        .expect("124.8 MHz must be PLL-reachable");
+    let p = embassy_rp::init(cfg);
     let driver = Driver::new(p.USB, Irqs);
 
     let mut config = Config::new(0x1209, 0x0001); // pid.codes test VID/PID
@@ -334,19 +354,50 @@ async fn main(spawner: Spawner) {
     let usb = builder.build();
 
     let Pio { mut common, mut sm0, .. } = Pio::new(p.PIO0, Irqs);
-    #[cfg(not(feature = "clock-locked"))]
-    i2s_pio::master_tx(
+    // The clock-locked pairing needs this board to be an I2S *slave* (the car
+    // board supplies the clock). Upstream provides controller-role drivers only,
+    // so building it that way would leave BOTH boards driving BCK and LRCK into
+    // each other — two push-pull outputs shorted together, which can damage
+    // pins. Refuse to build it rather than let that be flashed by accident.
+    //
+    // The pairing is not currently needed: Tesla accepts variable packet sizes
+    // (verified in the car, 10 minutes clean), so the elastic design works and
+    // the clock-locked fallback is unnecessary. Reviving it means proving
+    // `i2s_pio::slave_tx` on hardware first, the way `slave_rx` was proven with
+    // `i2srx`.
+    #[cfg(feature = "clock-locked")]
+    compile_error!(
+        "source --features clock-locked is disabled: it would drive BCK/LRCK \
+         against the car board's outputs. See the comment here."
+    );
+
+    // Upstream embassy-rp I2S master, not my own PIO.
+    //
+    // `i2stest` + `i2srx` already proved this exact configuration end to end:
+    // bit_depth = 32 puts BCK at 64x fs, which is the framing `slave_rx` on the
+    // car board expects and the same the PCM2706 produces, with the 16-bit
+    // sample in the top half of each word. My hand-written `master_tx` has never
+    // run on hardware and had a bit-clock-ratio bug as recently as yesterday, so
+    // there is no reason to prefer it here.
+    //
+    // The cost is that upstream exposes no runtime clock retuning (its state
+    // machine is private), so this board runs at its own crystal rate instead of
+    // steering to the phone. The phone-vs-us difference is absorbed by
+    // `Pipe::slip` — one duplicated or dropped frame every half second or so at
+    // typical crystal error, inaudible in practice. Steering would remove even
+    // that, and needs `master_tx` proven first.
+    let program = PioI2sOutProgram::new(&mut common);
+    let mut i2s = PioI2sOut::new(
         &mut common,
-        &mut sm0,
+        sm0,
+        p.DMA_CH0,
         p.PIN_2,
         p.PIN_3,
         p.PIN_4,
-        embassy_rp::clocks::clk_sys_freq(),
         RATE,
+        I2S_BIT_DEPTH,
+        &program,
     );
-    #[cfg(feature = "clock-locked")]
-    i2s_pio::slave_tx(&mut common, &mut sm0, p.PIN_2, p.PIN_3, p.PIN_4);
-    sm0.set_enable(true);
 
     // The RP2040-Zero has no plain LED; status goes to its WS2812 on GPIO16,
     // driven from PIO1 since PIO0 is I2S.
@@ -371,7 +422,7 @@ async fn main(spawner: Spawner) {
     led.set(smart_leds::RGB8::new(8, 0, 8));
 
     spawner.spawn(usb_task(usb).unwrap());
-    spawner.spawn(i2s_out(sm0, p.DMA_CH0).unwrap());
+    spawner.spawn(i2s_out(i2s).unwrap());
     spawner.spawn(status_task(led).unwrap());
     #[cfg(feature = "clock-locked")]
     spawner.spawn(feedback(feedback_ep).unwrap());
@@ -445,109 +496,63 @@ async fn sink(mut ep: impl EndpointOut) -> ! {
     }
 }
 
-/// Consumer: clock frames out over I2S at the car board's rate.
+/// Consumer: clock frames out over I2S.
+///
+/// The I2S clock is ours (upstream `PioI2sOut` is the controller), so the
+/// phone's rate and ours differ by whatever the two crystals disagree on.
+/// `Pipe::slip` absorbs that: one frame duplicated or dropped when the buffer
+/// wanders off target, roughly twice a second at 20-50 ppm.
 #[embassy_executor::task]
 async fn i2s_out(
-    mut sm: embassy_rp::pio::StateMachine<'static, PIO0, 0>,
-    dma: embassy_rp::Peri<'static, embassy_rp::peripherals::DMA_CH0>,
+    mut i2s: PioI2sOut<'static, PIO0, 0>,
 ) -> ! {
-    let mut raw = [0u32; (I2S_BLOCK + 1) * 2];
-    let mut dma = dma;
-    // Rolling measurement of the I2S clock against the phone's USB frame clock.
-    let (mut win_frames, mut win_sofs, mut last_sof) = (0u32, 0u32, sof_frame());
+    // Two buffers so the DMA always has one in flight while the other is filled.
+    let mut bufs = [[0u32; I2S_BLOCK * 2]; 2];
+    let mut cur = 0usize;
     let (mut slip_ticks, mut last_slips) = (0u32, 0u32);
+
     loop {
-        // The I2S clock is fixed by the car board, so this sink consumes
-        // exactly I2S_BLOCK frames no matter what we do — varying the batch
-        // size (as the car board does with its USB packets) corrects nothing
-        // here, it just changes how often this loop runs. The phone's clock is
-        // independent (our endpoint is adaptive, with no feedback endpoint to
-        // make the phone follow us), so the difference has to be absorbed by an
-        // actual sample slip: one frame discarded or repeated, a couple of times
-        // a second at typical crystal error.
-        let n = PIPE.lock(|p| {
+        let live = PIPE.lock(|p| {
             let mut pipe = p.borrow_mut();
             let adj = pipe.slip(PaceMode::Elastic);
+
             slip_ticks += 1;
-            if slip_ticks >= 7500 {
-                // ~10 s at one batch per 1.33 ms. More than one correction in
-                // that window means the host is not tracking our feedback.
+            if slip_ticks >= 750 {
+                // ~1 s at one block per 1.33 ms. More than a couple of
+                // corrections in that window means the host is not tracking us.
                 let now = pipe.stats.adj_up + pipe.stats.adj_down;
-                SLIPPING.store(now.wrapping_sub(last_slips) > 1, core::sync::atomic::Ordering::Relaxed);
+                SLIPPING.store(
+                    now.wrapping_sub(last_slips) > 2,
+                    core::sync::atomic::Ordering::Relaxed,
+                );
                 last_slips = now;
                 slip_ticks = 0;
             }
-            // Always hand the DMA a full block; `adj` changes only how many
+
+            // Always hand the DMA a full block; `adj` only changes how many
             // frames come out of the ring to fill it.
             let draw = (I2S_BLOCK as i32 + adj) as usize;
+            let buf = &mut bufs[cur];
             let mut last = [0i16; 2];
             for i in 0..draw {
                 last = pipe.pop();
                 if i < I2S_BLOCK {
-                    raw[i * 2] = last[0] as u16 as u32;
-                    raw[i * 2 + 1] = last[1] as u16 as u32;
+                    // 16-bit sample in the top half of a 32-bit slot.
+                    buf[i * 2] = (last[0] as u16 as u32) << 16;
+                    buf[i * 2 + 1] = (last[1] as u16 as u32) << 16;
                 }
             }
             if adj < 0 {
-                // Drew one fewer: repeat the last frame to pad the block.
                 let i = I2S_BLOCK - 1;
-                raw[i * 2] = last[0] as u16 as u32;
-                raw[i * 2 + 1] = last[1] as u16 as u32;
+                buf[i * 2] = (last[0] as u16 as u32) << 16;
+                buf[i * 2 + 1] = (last[1] as u16 as u32) << 16;
             }
-            I2S_BLOCK
+            pipe.primed()
         });
-        // If the car board loses power its PIO stops driving BCK/LRCK, and this
-        // board's I2S state machine blocks forever on its `wait` instruction.
-        // Time the transfer out so the task cannot wedge, and drop what we were
-        // holding — when the car comes back its clock restarts and we resume
-        // with live audio rather than replaying whatever was buffered when it
-        // died. This is the source side's half of surviving a car restart.
-        let push = sm.tx().dma_push(dma.reborrow(), &raw[..n * 2], false);
-        if with_timeout(Duration::from_millis(200), push).await.is_err() {
-            PIPE.lock(|p| p.borrow_mut().reset());
-            CLOCK_LIVE.store(false, core::sync::atomic::Ordering::Relaxed);
-        } else {
-            CLOCK_LIVE.store(true, core::sync::atomic::Ordering::Relaxed);
+        CLOCK_LIVE.store(live, core::sync::atomic::Ordering::Relaxed);
 
-            // How many I2S frames elapsed per phone-USB frame? That ratio, in
-            // 10.14, is exactly what the feedback endpoint must report.
-            win_frames += I2S_BLOCK as u32;
-            let _ = win_frames;
-            let sof = sof_frame();
-            win_sofs += sof.wrapping_sub(last_sof);
-            last_sof = sof;
-            // 256 ms: long enough that one frame of counting error is ~4 ppm,
-            // short enough to track a car board that is still converging.
-            #[cfg(feature = "clock-locked")]
-            if win_sofs >= 256 {
-                let v = (win_frames as u64 * 16384 / win_sofs as u64) as u32;
-                // Ignore nonsense from a stalled or restarting clock.
-                if v > (40 << 14) && v < (56 << 14) {
-                    FEEDBACK.store(v, core::sync::atomic::Ordering::Relaxed);
-                }
-                win_frames = 0;
-                win_sofs = 0;
-            }
-
-            // Adaptive mode: we own the I2S clock, so steer it to follow the
-            // phone. Same level-steered loop as the car board and for the same
-            // reason (the PIO divider is too coarse to hit 48000 exactly), but
-            // the sign is INVERTED: here the pipe fills from USB and drains to
-            // I2S, so a rising buffer means our clock is too *slow*.
-            #[cfg(not(feature = "clock-locked"))]
-            if win_sofs >= 100 {
-                win_sofs = 0;
-                win_frames = 0;
-                let off = PIPE.lock(|p| p.borrow().off_target()) as i64;
-                let cmd = ((RATE as i64) * 1000 + off * 2000)
-                    .clamp((RATE as i64 - 2000) * 1000, (RATE as i64 + 2000) * 1000);
-                i2s_pio::set_master_rate(
-                    &mut sm,
-                    embassy_rp::clocks::clk_sys_freq(),
-                    cmd as u64,
-                );
-            }
-        }
+        i2s.write(&bufs[cur]).await;
+        cur ^= 1;
     }
 }
 
