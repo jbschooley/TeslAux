@@ -87,6 +87,21 @@ const I2S_BLOCK: usize = 32;
 /// 16-bit sample rides in the top half of each word.
 const I2S_BIT_DEPTH: u32 = 32;
 
+/// Swap L/R when packing I2S slots.
+///
+/// Verified by ear: without this the stereo image comes out reversed. The root
+/// cause is NOT understood — tracing the side-set bit mapping, the WS polarity,
+/// the slot order and the push order all say the unswapped version should be
+/// correct, so one of those assumptions about PIO semantics is wrong.
+///
+/// It is compensated **here, on our own master**, rather than in the car board's
+/// receive path, deliberately: `slave_rx` keeps the standard I2S convention
+/// (WS low = left), so a PCM2706 — which is a known-correct I2S master — will
+/// still be interpreted normally. If a PCM2706 source also turns out reversed,
+/// the fault is in `slave_rx` instead and this constant should go back to false
+/// with the fix applied there.
+const SWAP_LR: bool = true;
+
 const CS_INTERFACE: u8 = 0x24;
 const CS_ENDPOINT: u8 = 0x25;
 const AUDIO_CLASS: u8 = 0x01;
@@ -577,8 +592,9 @@ async fn i2s_out_steered(
             for i in 0..I2S_BLOCK {
                 let f = pipe.pop();
                 // 16-bit sample in the top half of a 32-bit slot.
-                raw[i * 2] = (f[0] as u16 as u32) << 16;
-                raw[i * 2 + 1] = (f[1] as u16 as u32) << 16;
+                let (a, b) = if SWAP_LR { (f[1], f[0]) } else { (f[0], f[1]) };
+                raw[i * 2] = (a as u16 as u32) << 16;
+                raw[i * 2 + 1] = (b as u16 as u32) << 16;
             }
             true
         });
@@ -664,14 +680,16 @@ async fn i2s_out(
                 last = pipe.pop();
                 if i < I2S_BLOCK {
                     // 16-bit sample in the top half of a 32-bit slot.
-                    buf[i * 2] = (last[0] as u16 as u32) << 16;
-                    buf[i * 2 + 1] = (last[1] as u16 as u32) << 16;
+                    let (a, b) = if SWAP_LR { (last[1], last[0]) } else { (last[0], last[1]) };
+                    buf[i * 2] = (a as u16 as u32) << 16;
+                    buf[i * 2 + 1] = (b as u16 as u32) << 16;
                 }
             }
             if adj < 0 {
                 let i = I2S_BLOCK - 1;
-                buf[i * 2] = (last[0] as u16 as u32) << 16;
-                buf[i * 2 + 1] = (last[1] as u16 as u32) << 16;
+                let (a, b) = if SWAP_LR { (last[1], last[0]) } else { (last[0], last[1]) };
+                buf[i * 2] = (a as u16 as u32) << 16;
+                buf[i * 2 + 1] = (b as u16 as u32) << 16;
             }
             pipe.primed()
         });
