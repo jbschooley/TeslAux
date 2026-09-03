@@ -514,6 +514,20 @@ async fn i2s_out(
     loop {
         let live = PIPE.lock(|p| {
             let mut pipe = p.borrow_mut();
+
+            // Do not start draining until the buffer has filled.
+            //
+            // The consumer takes a 64-frame block every 1.33 ms and USB delivers
+            // 64 frames in the same time, so if we pop from the first block the
+            // level hovers at zero and never reaches the priming threshold —
+            // whether it ever primes depends on the host happening to burst at
+            // stream start, which made it work once and not the next time.
+            // Emitting silence until primed lets the buffer build its cushion.
+            if !pipe.primed() {
+                bufs[cur] = [0u32; I2S_BLOCK * 2];
+                return false;
+            }
+
             let adj = pipe.slip(PaceMode::Elastic);
 
             slip_ticks += 1;
