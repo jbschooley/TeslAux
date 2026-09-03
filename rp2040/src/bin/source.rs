@@ -51,6 +51,10 @@ use core::cell::RefCell;
 mod audio_pipe;
 #[path = "../i2s_pio.rs"]
 mod i2s_pio;
+#[path = "../status.rs"]
+mod status;
+#[path = "../ws2812.rs"]
+mod ws2812;
 
 use audio_pipe::{PaceMode, Pipe};
 
@@ -166,6 +170,11 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
+});
+
+#[cfg(feature = "rp2040-zero")]
+bind_interrupts!(struct Pio1Irqs {
+    PIO1_IRQ_0 => PioInterruptHandler<embassy_rp::peripherals::PIO1>;
 });
 
 static PIPE: Mutex<CriticalSectionRawMutex, RefCell<Pipe<RING>>> =
@@ -339,11 +348,31 @@ async fn main(spawner: Spawner) {
     i2s_pio::slave_tx(&mut common, &mut sm0, p.PIN_2, p.PIN_3, p.PIN_4);
     sm0.set_enable(true);
 
+    // The RP2040-Zero has no plain LED; status goes to its WS2812 on GPIO16,
+    // driven from PIO1 since PIO0 is I2S.
+    #[cfg(not(feature = "rp2040-zero"))]
     let led = Output::new(p.PIN_25, Level::Low);
+    #[cfg(feature = "rp2040-zero")]
+    // NOTE: `Common` must outlive the LED. embassy-rp's `Drop for Common` calls
+    // on_pio_drop(), which resets every PIO-claimed pin's function-select to
+    // NULL once the user count falls to 1 — disconnecting GPIO16 from PIO. When
+    // this was built inside a `let led = { ... }` block, Common dropped at the
+    // end of it: the boot colour clocked out and the WS2812 latched it, then
+    // every later write went to a dead pin. That looked exactly like "the status
+    // task never runs". Keeping Common bound in main (which never returns) holds
+    // the pin.
+    let (mut led_common, led_sm) = {
+        let Pio { common, sm0, .. } = Pio::new(p.PIO1, Pio1Irqs);
+        (common, sm0)
+    };
+    #[cfg(feature = "rp2040-zero")]
+    let mut led = ws2812::Ws2812::new(&mut led_common, led_sm, p.PIN_16);
+    #[cfg(feature = "rp2040-zero")]
+    led.set(smart_leds::RGB8::new(8, 0, 8));
 
     spawner.spawn(usb_task(usb).unwrap());
     spawner.spawn(i2s_out(sm0, p.DMA_CH0).unwrap());
-    spawner.spawn(blink(led).unwrap());
+    spawner.spawn(status_task(led).unwrap());
     #[cfg(feature = "clock-locked")]
     spawner.spawn(feedback(feedback_ep).unwrap());
     sink(iso_out).await;
@@ -389,7 +418,15 @@ async fn sink(mut ep: impl EndpointOut) -> ! {
         ep.wait_enabled().await;
         loop {
             match ep.read(&mut buf).await {
-                Ok(n) => PIPE.lock(|p| {
+                Ok(n) => {
+                    // One completed read == one USB frame; this is our frame clock.
+                    // Plain load/store: thumbv6m has no atomic read-modify-write,
+                    // and this is the only writer.
+                    USB_FRAMES.store(
+                        USB_FRAMES.load(core::sync::atomic::Ordering::Relaxed).wrapping_add(1),
+                        core::sync::atomic::Ordering::Relaxed,
+                    );
+                    PIPE.lock(|p| {
                     let mut pipe = p.borrow_mut();
                     for f in buf[..n].chunks_exact(4) {
                         pipe.push([
@@ -397,7 +434,8 @@ async fn sink(mut ep: impl EndpointOut) -> ! {
                             i16::from_le_bytes([f[2], f[3]]),
                         ]);
                     }
-                }),
+                    })
+                }
                 // Endpoint disabled (host went to alt 0); wait to be re-enabled
                 // rather than tearing anything down.
                 Err(_) => break,
@@ -417,6 +455,7 @@ async fn i2s_out(
     let mut dma = dma;
     // Rolling measurement of the I2S clock against the phone's USB frame clock.
     let (mut win_frames, mut win_sofs, mut last_sof) = (0u32, 0u32, sof_frame());
+    let (mut slip_ticks, mut last_slips) = (0u32, 0u32);
     loop {
         // The I2S clock is fixed by the car board, so this sink consumes
         // exactly I2S_BLOCK frames no matter what we do — varying the batch
@@ -429,6 +468,15 @@ async fn i2s_out(
         let n = PIPE.lock(|p| {
             let mut pipe = p.borrow_mut();
             let adj = pipe.slip(PaceMode::Elastic);
+            slip_ticks += 1;
+            if slip_ticks >= 7500 {
+                // ~10 s at one batch per 1.33 ms. More than one correction in
+                // that window means the host is not tracking our feedback.
+                let now = pipe.stats.adj_up + pipe.stats.adj_down;
+                SLIPPING.store(now.wrapping_sub(last_slips) > 1, core::sync::atomic::Ordering::Relaxed);
+                last_slips = now;
+                slip_ticks = 0;
+            }
             // Always hand the DMA a full block; `adj` changes only how many
             // frames come out of the ring to fill it.
             let draw = (I2S_BLOCK as i32 + adj) as usize;
@@ -466,7 +514,7 @@ async fn i2s_out(
             win_frames += I2S_BLOCK as u32;
             let _ = win_frames;
             let sof = sof_frame();
-            win_sofs += (sof.wrapping_sub(last_sof) & 0x7ff) as u32;
+            win_sofs += sof.wrapping_sub(last_sof);
             last_sof = sof;
             // 256 ms: long enough that one frame of counting error is ~4 ppm,
             // short enough to track a car board that is still converging.
@@ -503,57 +551,55 @@ async fn i2s_out(
     }
 }
 
-/// The phone's USB frame counter — our view of the *phone's* clock, which is
-/// what the feedback value must be expressed against.
-fn sof_frame() -> u16 {
-    embassy_rp::pac::USB.sof_rd().read().count()
+/// USB frames elapsed, counted by completed isochronous reads.
+///
+/// One iso OUT packet arrives per frame, so this advances at the *phone's* frame
+/// rate — which is exactly what the feedback value must be expressed against.
+/// Counted from reads rather than the `SOF_RD` register because embassy-rp never
+/// enables SOF tracking, so that register cannot be relied on to advance; gating
+/// on it hung the car board outright.
+static USB_FRAMES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn sof_frame() -> u32 {
+    USB_FRAMES.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// LED, which doubles as the answer to "does this phone honour USB feedback?".
+/// Status, and incidentally the answer to "does this host honour USB feedback?".
 ///
-/// If the host follows the rate we report on the feedback endpoint, our buffer
-/// sits on target and `slip()` never fires. If it ignores feedback and free-runs,
-/// slip corrects a couple of times a second. So the slip rate over a 10 s window
-/// *is* the test result — no serial console needed:
-///
-/// * **solid**          — streaming, feedback honoured (0-1 slips / 10 s)
-/// * **double-blink**   — streaming, host ignoring feedback (slipping)
-/// * **slow blink**     — no I2S clock; car board unpowered or restarting
-#[embassy_executor::task]
-async fn blink(mut led: Output<'static>) -> ! {
+/// If the host follows the rate we report, our buffer sits on target and slip()
+/// never fires. If it free-runs, slip corrects a couple of times a second. So a
+/// Slipping indication over a 10 s window *is* the test result.
+fn current_state() -> status::State {
     use core::sync::atomic::Ordering;
-    let mut last_slips = 0u32;
-    let mut slipping = false;
-    let mut ticks = 0u32;
-    loop {
-        // Sample the slip counters once every 10 s.
-        ticks += 1;
-        if ticks >= 50 {
-            ticks = 0;
-            let now = PIPE.lock(|p| {
-                let st = p.borrow().stats;
-                st.adj_up + st.adj_down
-            });
-            // >1 correction per 10 s means the host is not tracking us.
-            slipping = now.wrapping_sub(last_slips) > 1;
-            last_slips = now;
-        }
-
-        if !CLOCK_LIVE.load(Ordering::Relaxed) {
-            led.toggle();
-            Timer::after_millis(600).await;
-        } else if slipping {
-            led.set_high();
-            Timer::after_millis(80).await;
-            led.set_low();
-            Timer::after_millis(80).await;
-            led.set_high();
-            Timer::after_millis(80).await;
-            led.set_low();
-            Timer::after_millis(160).await;
-        } else {
-            led.set_high();
-            Timer::after_millis(200).await;
-        }
+    if !CLOCK_LIVE.load(Ordering::Relaxed) {
+        return status::State::Waiting;
     }
+    if SLIPPING.load(Ordering::Relaxed) {
+        status::State::Slipping
+    } else {
+        status::State::Ok
+    }
+}
+
+/// Sampled from the slip counters once every 10 s by `status_task`.
+static SLIPPING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(not(feature = "rp2040-zero"))]
+#[embassy_executor::task]
+async fn status_task(mut led: Output<'static>) -> ! {
+    spawn_slip_watch();
+    status::run(&mut led, current_state).await
+}
+
+#[cfg(feature = "rp2040-zero")]
+#[embassy_executor::task]
+async fn status_task(mut led: ws2812::Ws2812<'static, embassy_rp::peripherals::PIO1, 0>) -> ! {
+    spawn_slip_watch();
+    status::run(&mut led, current_state).await
+}
+
+/// Track the slip rate in the background so `current_state` stays cheap.
+fn spawn_slip_watch() {
+    // Nothing to spawn: the sampling happens in `i2s_out`, which already owns
+    // the pipe lock each batch. Kept as a named no-op so the intent is obvious.
 }

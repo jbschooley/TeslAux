@@ -34,7 +34,7 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_time::{Duration, Instant, Timer};
 use embassy_usb::class::hid::State as HidState;
-use embassy_usb::driver::EndpointIn;
+use embassy_usb::driver::{EndpointError, EndpointIn};
 use embassy_usb::Builder;
 
 use core::cell::RefCell;
@@ -43,6 +43,10 @@ use core::cell::RefCell;
 mod audio_pipe;
 #[path = "../i2s_pio.rs"]
 mod i2s_pio;
+#[path = "../status.rs"]
+mod status;
+#[path = "../ws2812.rs"]
+mod ws2812;
 #[path = "../teslamic.rs"]
 mod teslamic;
 
@@ -129,6 +133,11 @@ bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
 });
 
+#[cfg(feature = "rp2040-zero")]
+bind_interrupts!(struct Pio1Irqs {
+    PIO1_IRQ_0 => PioInterruptHandler<embassy_rp::peripherals::PIO1>;
+});
+
 /// Shared between the capture task (producer) and the USB pump (consumer).
 static PIPE: Mutex<CriticalSectionRawMutex, RefCell<Pipe<RING>>> =
     Mutex::new(RefCell::new(Pipe::new(RATE)));
@@ -137,6 +146,10 @@ static PIPE: Mutex<CriticalSectionRawMutex, RefCell<Pipe<RING>>> =
 /// pump then emits silence: wrong-pitch audio is worse than none, and it makes
 /// a misconfigured source obvious instead of mysterious.
 static MUTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Latched if a packet was ever rejected for exceeding wMaxPacketSize — a
+/// firmware bug, shown as a fault rather than left to look like an audio glitch.
+static OVERSIZE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// True while I2S frames are actually arriving.
 static SOURCE_LIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -180,7 +193,13 @@ async fn main(spawner: Spawner) {
         msos_desc,
         control_buf,
     );
-    let iso_in = teslamic::build(&mut builder, hid_state, kbd, if3);
+    // Clock-locked always sends exactly 48 frames, so it can advertise the real
+    // mic's 192. Everything else varies the packet size and needs room for 49.
+    #[cfg(feature = "clock-locked")]
+    let ep_max = teslamic::BYTES_PER_FRAME as u16;
+    #[cfg(not(feature = "clock-locked"))]
+    let ep_max = teslamic::BYTES_PER_FRAME_ELASTIC as u16;
+    let iso_in = teslamic::build(&mut builder, hid_state, kbd, if3, ep_max);
     let usb = builder.build();
 
     // ── I2S capture ─────────────────────────────────────────────────────────
@@ -204,14 +223,32 @@ async fn main(spawner: Spawner) {
     #[cfg(not(feature = "packet-stress"))]
     sm0.set_enable(true);
 
+    // The RP2040-Zero has no plain LED; its only indicator is a WS2812 on
+    // GPIO16, driven from PIO1 (PIO0 is I2S).
+    #[cfg(not(feature = "rp2040-zero"))]
     let led = Output::new(p.PIN_25, Level::Low);
+    #[cfg(feature = "rp2040-zero")]
+    // NOTE: `Common` must outlive the LED. embassy-rp's `Drop for Common` calls
+    // on_pio_drop(), which resets every PIO-claimed pin's function-select to
+    // NULL once the user count falls to 1 — disconnecting GPIO16 from PIO. When
+    // this was built inside a `let led = { ... }` block, Common dropped at the
+    // end of it: the boot colour clocked out and the WS2812 latched it, then
+    // every later write went to a dead pin. That looked exactly like "the status
+    // task never runs". Keeping Common bound in main (which never returns) holds
+    // the pin.
+    let (mut led_common, led_sm) = {
+        let Pio { common, sm0, .. } = Pio::new(p.PIO1, Pio1Irqs);
+        (common, sm0)
+    };
+    #[cfg(feature = "rp2040-zero")]
+    let mut led = ws2812::Ws2812::new(&mut led_common, led_sm, p.PIN_16);
+    #[cfg(feature = "rp2040-zero")]
+    led.set(smart_leds::RGB8::new(8, 0, 8));
 
     spawner.spawn(usb_task(usb).unwrap());
     #[cfg(not(feature = "packet-stress"))]
     spawner.spawn(capture(sm0, p.DMA_CH0).unwrap());
-    #[cfg(feature = "packet-stress")]
-    spawner.spawn(tone_source().unwrap());
-    spawner.spawn(status(led).unwrap());
+    spawner.spawn(status_task(led).unwrap());
     pump(iso_in).await;
 }
 
@@ -237,7 +274,8 @@ async fn capture(
     let mut detect = RateDetect::new(1000);
     let mut last_block = Instant::now();
     #[cfg(feature = "clock-locked")]
-    let (mut win_sofs, mut last_sof) = (0u32, sof_frame());
+    let (mut win_sofs, mut last_sof) =
+        (0u32, USB_FRAMES.load(core::sync::atomic::Ordering::Relaxed));
 
     loop {
         sm.rx().dma_pull(dma.reborrow(), &mut raw, false).await;
@@ -275,8 +313,8 @@ async fn capture(
         // restarts, and the loop re-converges from wherever it left off.
         #[cfg(feature = "clock-locked")]
         {
-            let sof = sof_frame();
-            win_sofs += (sof.wrapping_sub(last_sof) & 0x7ff) as u32;
+            let sof = USB_FRAMES.load(Ordering::Relaxed);
+            win_sofs += sof.wrapping_sub(last_sof);
             last_sof = sof;
             if win_sofs >= 100 {
                 win_sofs = 0;
@@ -302,38 +340,24 @@ async fn capture(
     }
 }
 
-/// `packet-stress` only: fill the pipe with a 1 kHz tone at exactly 48 frames
-/// per millisecond, so the only thing varying is the iso packet size.
-#[cfg(feature = "packet-stress")]
-#[embassy_executor::task]
-async fn tone_source() -> ! {
-    use core::sync::atomic::Ordering;
-    let mut phase: u32 = 0;
-    loop {
-        // 48 frames every millisecond: exactly the nominal rate, no drift.
-        PIPE.lock(|p| {
-            let mut pipe = p.borrow_mut();
-            for _ in 0..48 {
-                let idx = ((phase >> 24) & 0xFF) as usize;
-                let frac = ((phase >> 16) & 0xFF) as i32;
-                let a = SINE256[idx] as i32;
-                let b = SINE256[(idx + 1) & 0xFF] as i32;
-                let v = (a + (((b - a) * frac) >> 8)) as i16;
-                phase = phase.wrapping_add(TONE_PHASE_INC);
-                pipe.push([v, v]);
-            }
-        });
-        SOURCE_LIVE.store(true, Ordering::Relaxed);
-        Timer::after_millis(1).await;
-    }
-}
-
 /// Consumer: hand the car exactly one packet per USB frame.
+///
+/// Pacing comes from `write().await` itself: an isochronous IN buffer is
+/// consumed once per frame when the host polls it, so the await returns exactly
+/// once per frame. Nothing else is needed, and nothing else should be used.
+///
+/// An earlier version gated each write on the USB frame counter (`SOF_RD`)
+/// changing. That hung: embassy-rp never enables SOF tracking, so the counter
+/// need not advance, and the loop span forever without ever sending a packet —
+/// the device enumerated fine and then blocked any host that tried to open the
+/// stream.
 async fn pump(mut iso_in: impl EndpointIn) -> ! {
     use core::sync::atomic::Ordering;
 
     let mut buf = [0u8; teslamic::BYTES_PER_FRAME + 8];
     let mut detect = RateDetect::new(1000);
+    #[cfg(feature = "packet-stress")]
+    let (mut phase, mut stress_hi) = (0u32, false);
 
     loop {
         iso_in.wait_enabled().await;
@@ -341,56 +365,101 @@ async fn pump(mut iso_in: impl EndpointIn) -> ! {
         // The car toggles AudioStreaming alt1/alt0 constantly (seen in the
         // on-screen USB spy capture), so do NOT tear anything down when the
         // stream goes idle — just stop writing and wait to be re-enabled.
-        let mut last_sof = sof_frame();
         loop {
-            // Pace off the car's SOF, exactly like the nRF build. This is what
-            // makes packets land in their frame rather than bunching.
-            let sof = sof_frame();
-            if sof == last_sof {
-                yield_now().await;
-                continue;
+            // The packet-stress diagnostic generates its tone HERE, in the frame
+            // it is filling, rather than in a producer task feeding the pipe.
+            //
+            // A producer on a 1 ms timer cannot work: the consumer runs at
+            // exactly the host's 1 kHz frame rate while a timer loop is always
+            // a little slower, so the pipe drains and every packet degrades to a
+            // held sample. Measured: 97.9% repeated samples, in runs of exactly
+            // 47 — one starved packet each.
+            #[cfg(feature = "packet-stress")]
+            let n = {
+                stress_hi = !stress_hi;
+                let frames = if stress_hi { 49 } else { 47 };
+                for i in 0..frames {
+                    let idx = ((phase >> 24) & 0xFF) as usize;
+                    let frac = ((phase >> 16) & 0xFF) as i32;
+                    let a = SINE256[idx] as i32;
+                    let b = SINE256[(idx + 1) & 0xFF] as i32;
+                    let v = ((a + (((b - a) * frac) >> 8)) as i16).to_le_bytes();
+                    phase = phase.wrapping_add(TONE_PHASE_INC);
+                    buf[i * 4] = v[0];
+                    buf[i * 4 + 1] = v[1];
+                    buf[i * 4 + 2] = v[0];
+                    buf[i * 4 + 3] = v[1];
+                }
+                SOURCE_LIVE.store(true, Ordering::Relaxed);
+                frames * 4
+            };
+            #[cfg(not(feature = "packet-stress"))]
+            let n = PIPE.lock(|p| p.borrow_mut().take(&mut buf, MODE));
+            if MUTED.load(Ordering::Relaxed) {
+                buf[..n].fill(0);
             }
-            last_sof = sof;
+            match iso_in.write(&buf[..n]).await {
+                Ok(()) => {}
+                // The host deselected the stream; normal, just wait to be
+                // re-enabled.
+                Err(EndpointError::Disabled) => break,
+                // We tried to send more than wMaxPacketSize. That is a firmware
+                // bug, not a transient — the packet is silently dropped and the
+                // audio degrades to a click at every boundary. Latch it as a
+                // fault so the LED says so instead of it looking like drift.
+                Err(EndpointError::BufferOverflow) => {
+                    OVERSIZE.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+            // One completed write == one USB frame. This is the frame clock the
+            // rest of the firmware uses; see USB_FRAMES.
+            // Plain load/store, not fetch_add: thumbv6m (Cortex-M0+) has no
+            // atomic read-modify-write. Sound here because this is the only
+            // writer, and the only reader just takes a wrapping difference.
+            USB_FRAMES.store(USB_FRAMES.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
 
             #[cfg(not(feature = "packet-stress"))]
             if let Some(hz) = detect.on_usb_frame() {
                 let ok = classify(hz) == Some(RATE);
                 MUTED.store(!ok, Ordering::Relaxed);
             }
-
-            let n = PIPE.lock(|p| p.borrow_mut().take(&mut buf, MODE));
-            if MUTED.load(Ordering::Relaxed) {
-                buf[..n].fill(0);
-            }
-            if iso_in.write(&buf[..n]).await.is_err() {
-                break; // endpoint disabled underneath us; re-arm
-            }
+            let _ = &mut detect;
         }
     }
 }
 
-/// Read the USB frame counter. Changes once per millisecond, driven by the
-/// car's host controller — this is our only view of the car's clock.
-fn sof_frame() -> u16 {
-    embassy_rp::pac::USB.sof_rd().read().count()
-}
+/// USB frames elapsed, counted by completed isochronous writes.
+///
+/// One iso IN write completes per frame, so this advances at exactly the host's
+/// frame rate — i.e. it *is* a view of the car's clock, which is what the
+/// clock-locked build's control loop needs. Derived from writes rather than the
+/// `SOF_RD` register because embassy-rp never enables SOF tracking, so that
+/// register cannot be relied on to advance.
+static USB_FRAMES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// LED: solid = streaming, slow blink = no source, fast blink = rate mismatch.
-#[embassy_executor::task]
-async fn status(mut led: Output<'static>) -> ! {
+/// Map the firmware's atomics onto a board-independent status. How it is shown
+/// depends on the board: a blink code on a plain LED, or colour on the
+/// RP2040-Zero's WS2812 (it has no plain LED — see `status.rs`).
+fn current_state() -> status::State {
     use core::sync::atomic::Ordering;
-    loop {
-        if MUTED.load(Ordering::Relaxed) {
-            led.toggle();
-            Timer::after_millis(100).await;
-        } else if SOURCE_LIVE.load(Ordering::Relaxed) {
-            led.set_high();
-            Timer::after_millis(250).await;
-            // Cleared by the next capture; if none arrives the source is gone.
-            SOURCE_LIVE.store(false, Ordering::Relaxed);
-        } else {
-            led.toggle();
-            Timer::after_millis(700).await;
-        }
+    if MUTED.load(Ordering::Relaxed) || OVERSIZE.load(Ordering::Relaxed) {
+        status::State::Fault
+    } else if SOURCE_LIVE.load(Ordering::Relaxed) {
+        status::State::Ok
+    } else {
+        status::State::Waiting
     }
+}
+
+#[cfg(not(feature = "rp2040-zero"))]
+#[embassy_executor::task]
+async fn status_task(mut led: Output<'static>) -> ! {
+    status::run(&mut led, current_state).await
+}
+
+#[cfg(feature = "rp2040-zero")]
+#[embassy_executor::task]
+async fn status_task(mut led: ws2812::Ws2812<'static, embassy_rp::peripherals::PIO1, 0>) -> ! {
+    status::run(&mut led, current_state).await
 }
