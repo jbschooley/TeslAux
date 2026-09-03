@@ -17,6 +17,7 @@ build() { # <bin> <features> <out>
 # --- recommended pairing: 2x RP2040, adaptive source + elastic car ---
 build car    ""              teslamic-rp-car-elastic
 build source ""              teslamic-rp-source-adaptive
+build source low-latency     teslamic-rp-source-lowlat
 # --- alternative pairing: clock-locked chain (fixed 192-B packets to the car) ---
 # source clock-locked is deliberately not built — see the compile_error in
 # src/bin/source.rs. It would make both boards drive the I2S clock lines.

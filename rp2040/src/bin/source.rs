@@ -70,10 +70,18 @@ const BYTES_PER_FRAME: usize = 192; // 48 * 2ch * 2B
 /// bunching, and the cushion has to comfortably exceed the deadband.
 ///
 /// The added latency is irrelevant: ~5 ms more against Tesla's own ~100 ms.
+#[cfg(not(feature = "low-latency"))]
 const RING: usize = 1024;
+/// Half the cushion. Ring must stay above ~2x(deadband + one consumer burst) =
+/// 2x(192+32) = 448, so 512 is the nearest safe power of two.
+#[cfg(feature = "low-latency")]
+const RING: usize = 512;
 /// Four USB frames. Tolerates a host bunching up to three packets.
 const HYSTERESIS: usize = 192;
+#[cfg(not(feature = "low-latency"))]
 const I2S_BLOCK: usize = 64;
+#[cfg(feature = "low-latency")]
+const I2S_BLOCK: usize = 32;
 /// 32-bit I2S slots => BCK at 64x fs, matching `slave_rx` and the PCM2706. The
 /// 16-bit sample rides in the top half of each word.
 const I2S_BIT_DEPTH: u32 = 32;
