@@ -4,6 +4,7 @@ name    = "teslamic-rp"
 version = "0.1.0"
 edition = "2021"
 publish = false
+license = "MIT"
 description = "RP2040 TeslaMic emulator + USB audio source bridge. `car` faces the Tesla, `source` faces the phone."
 
 # Car-facing: clones the TeslaMic, captures I2S, streams the iso IN endpoint.

@@ -165,3 +165,15 @@ worth knowing before optimising it further.
 | [`tools/`](tools) | UF2 packaging, and analysis scripts for recorded audio |
 | [`RESEARCH.md`](RESEARCH.md) | how the CaraokeMic was reverse engineered |
 | [`real_mic_dump.md`](real_mic_dump.md) | raw descriptor dump from a real unit |
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE).
+
+Two exceptions, both detailed in [`NOTICE.md`](NOTICE.md): the T114's optional
+`usb-spy` display driver is AGPL-3.0-or-later and makes that one build a
+combined AGPL work, and `tools/uf2conv.py` comes from Microsoft's uf2 project.
+The firmware in `rp2040/` — the part you actually flash — is entirely MIT.
+
+"Tesla", "TeslaMic" and "CaraokeMic" are trademarks of Tesla, Inc. This project
+is independent and not affiliated with or endorsed by Tesla.
