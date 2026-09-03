@@ -74,6 +74,34 @@ Q1 is the one that actually decides the architecture; Q2 only decides how good
 the two-board version is. So run Q1 first — if it passes, you may never need the
 second board at all.
 
+## Known issue: the RP2040-Zero status LED
+
+The Zero has no plain LED, only a WS2812 on GPIO16, and the status indicator on
+it is **not working**. It shows a boot colour (magenta) and never updates.
+
+What was tried, and what each attempt showed:
+
+1. Status in a spawned task, using embassy-rp's `PioWs2812` (DMA) — LED stayed
+   on the boot colour set from `main`.
+2. Same, writing unconditionally instead of only on state change — no change, so
+   it is not change-detection masking a stable state.
+3. Own DMA-free driver pushing the PIO FIFO directly (`src/ws2812.rs`) — no
+   change, so it is not the DMA.
+4. Driven from the pump loop instead of a task — LED stopped lighting at all.
+
+Attempt 4 is the confusing one and has no explanation I can support. `LoadedProgram`
+has no `Drop`, so instruction memory is not being freed underneath it. Parked at
+the state that at least shows a boot colour rather than left worse.
+
+**Audio is unaffected by all of this** — the LED is diagnostics only. If it
+becomes worth solving, the honest next step is a logic analyser on GPIO16 or RTT
+over SWD, not more guessing.
+
+Relevant beyond the LED: attempt 1 suggests spawned tasks may not be getting
+polled, and the I2S capture path is also a spawned task doing DMA. Worth keeping
+in mind if I2S produces nothing — but note `usb_task` is spawned and works, so it
+cannot be a blanket failure.
+
 ## Caveat
 
 None of this has run on hardware. The PIO I2S bit alignment is the most likely
