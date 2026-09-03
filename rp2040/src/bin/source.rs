@@ -297,7 +297,13 @@ async fn main(spawner: Spawner) {
             // endpoint, nothing for a host to get wrong.
             let ep = alt1.endpoint_isochronous_out(
                 None,
-                BYTES_PER_FRAME as u16,
+                // Headroom for one extra frame. Nominally an adaptive sink
+                // receives exactly 48 frames per packet, but hosts vary packet
+                // size for their own drift management and a host that sends 49
+                // into a 192-byte endpoint has its packet truncated. This is the
+                // mirror of the bug that silently dropped every corrected packet
+                // on the car board's IN endpoint.
+                (BYTES_PER_FRAME + 4) as u16,
                 1,
                 SynchronizationType::Adaptive,
                 UsageType::DataEndpoint,
