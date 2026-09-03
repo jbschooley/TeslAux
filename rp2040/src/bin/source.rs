@@ -89,18 +89,34 @@ const I2S_BIT_DEPTH: u32 = 32;
 
 /// Swap L/R when packing I2S slots.
 ///
-/// Verified by ear: without this the stereo image comes out reversed. The root
-/// cause is NOT understood — tracing the side-set bit mapping, the WS polarity,
-/// the slot order and the push order all say the unswapped version should be
-/// correct, so one of those assumptions about PIO semantics is wrong.
+/// **False.** `pan-test` settled this empirically: a tone written into I2S slot 0
+/// arrives on the LEFT at the car board's USB output, so the mapping is correct
+/// straight through and no swap is needed. An earlier build set this true on a
+/// by-ear report of reversed stereo; the pan test showed that was misattributed.
 ///
-/// It is compensated **here, on our own master**, rather than in the car board's
-/// receive path, deliberately: `slave_rx` keeps the standard I2S convention
-/// (WS low = left), so a PCM2706 — which is a known-correct I2S master — will
-/// still be interpreted normally. If a PCM2706 source also turns out reversed,
-/// the fault is in `slave_rx` instead and this constant should go back to false
-/// with the fix applied there.
-const SWAP_LR: bool = true;
+/// If stereo ever does appear reversed, re-run `--features pan-test` before
+/// changing this — it takes the host, the pipe and this constant out of the path
+/// and answers the question directly.
+const SWAP_LR: bool = false;
+
+/// `pan-test` only: 997 Hz into I2S slot 0, silence into slot 1.
+#[cfg(feature = "pan-test")]
+const PAN_INC: u32 = ((997u64 << 32) / 48_000u64) as u32;
+#[cfg(feature = "pan-test")]
+#[rustfmt::skip]
+static PAN_SINE: [i16; 256] = {
+    let mut t = [0i16; 256];
+    let mut i = 0;
+    while i < 256 {
+        // Quarter-wave table built at compile time; sin is not const, so this
+        // uses a triangle approximation — good enough to hear which side it is.
+        let q = (i % 128) as i32;
+        let tri = if q < 64 { q * 250 } else { (128 - q) * 250 };
+        t[i] = if i < 128 { tri as i16 } else { -(tri as i16) };
+        i += 1;
+    }
+    t
+};
 
 const CS_INTERFACE: u8 = 0x24;
 const CS_ENDPOINT: u8 = 0x25;
@@ -578,6 +594,8 @@ async fn i2s_out_steered(
     let mut dma = dma;
     let mut raw = [0u32; I2S_BLOCK * 2];
     let mut ticks = 0u32;
+    #[cfg(feature = "pan-test")]
+    let mut pan_phase: u32 = 0;
 
     loop {
         let live = PIPE.lock(|p| {
@@ -585,6 +603,7 @@ async fn i2s_out_steered(
             if pipe.starved() {
                 pipe.reset();
             }
+            #[cfg(not(feature = "pan-test"))]
             if !pipe.primed() {
                 raw = [0u32; I2S_BLOCK * 2];
                 return false;
@@ -595,6 +614,19 @@ async fn i2s_out_steered(
                 let (a, b) = if SWAP_LR { (f[1], f[0]) } else { (f[0], f[1]) };
                 raw[i * 2] = (a as u16 as u32) << 16;
                 raw[i * 2 + 1] = (b as u16 as u32) << 16;
+
+                // Diagnostic: overwrite with a tone in slot 0 and silence in
+                // slot 1, ignoring everything upstream. Whichever side it comes
+                // out of tells us how the I2S slots map, with no host, no pipe
+                // and no SWAP_LR in the way.
+                #[cfg(feature = "pan-test")]
+                {
+                    let idx = ((pan_phase >> 24) & 0xFF) as usize;
+                    let v = PAN_SINE[idx];
+                    pan_phase = pan_phase.wrapping_add(PAN_INC);
+                    raw[i * 2] = (v as u16 as u32) << 16;
+                    raw[i * 2 + 1] = 0;
+                }
             }
             true
         });
@@ -602,6 +634,13 @@ async fn i2s_out_steered(
 
         // Retune roughly every 100 ms. Kp = 2000 mHz per frame off target,
         // simulated stable across +/-2000 ppm of crystal error.
+        // pan-test bypasses the pipe, so its level is meaningless — steering on
+        // it drove the clock to the clamp at 46 kHz, which the car board rightly
+        // muted as an unrecognised rate. Hold the nominal rate instead.
+        #[cfg(feature = "pan-test")]
+        let _ = &mut ticks;
+        #[cfg(not(feature = "pan-test"))]
+        {
         ticks += 1;
         if ticks >= 75 {
             ticks = 0;
@@ -609,6 +648,7 @@ async fn i2s_out_steered(
             let cmd = ((RATE as i64) * 1000 + off * 2000)
                 .clamp((RATE as i64 - 2000) * 1000, (RATE as i64 + 2000) * 1000);
             i2s_pio::set_master_rate(&mut sm, embassy_rp::clocks::clk_sys_freq(), cmd as u64);
+        }
         }
 
         sm.tx().dma_push(dma.reborrow(), &raw, false).await;

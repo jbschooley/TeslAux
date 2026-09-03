@@ -58,6 +58,10 @@ low-latency = []
 # unproven PIO. Uses `i2s_pio::master_tx` instead of upstream's fixed-rate
 # driver, because upstream cannot retune its divider at runtime.
 clock-steered = []
+# Diagnostic: ignore USB entirely and emit a tone on the LEFT channel only,
+# straight into the I2S slots. Isolates the I2S channel mapping from the host,
+# the pipe and the car board's USB side. See src/bin/source.rs.
+pan-test = []
 # Car board drives the I2S clock from the car's SOF and emits fixed-size
 # packets (PaceMode::Locked). Requires the `source` board on the other end.
 # Without it, the car board is an I2S slave to a PCM2706 and paces elastically.
