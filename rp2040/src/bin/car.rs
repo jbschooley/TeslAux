@@ -64,18 +64,55 @@ const MODE: PaceMode = PaceMode::Locked;
 #[cfg(feature = "packet-stress")]
 const MODE: PaceMode = PaceMode::Stress;
 
-/// 1 kHz at 48 kHz: 48 samples per cycle, quarter-scale so it is audible without
-/// being unpleasant. Only used by the `packet-stress` diagnostic build.
+/// 256-point sine, quarter scale. Only used by the `packet-stress` diagnostic.
+///
+/// Indexed by a phase accumulator at **997 Hz**, not 1000 Hz, and interpolated.
+/// Both details matter: 1 kHz at 48 kHz is exactly 48 samples, i.e. exactly one
+/// cycle per USB packet, so a fault that merely reorders a packet's contents is
+/// completely inaudible — that blind spot hid a real corruption bug in the nRF
+/// firmware for two months. 997 shares no factor with the frame rate. And
+/// indexing by the top 8 bits alone gives only ~-40 dBFS of phase-truncation
+/// error, audible as a spurious tone, so the low bits interpolate.
 #[cfg(feature = "packet-stress")]
 #[rustfmt::skip]
-const TONE48: [i16; 48] = [
-        0,  1072,  2120,  3122,  4056,  4903,  5646,  6270,  6762,  7113,
-     7317,  7371,  7275,  7033,  6650,  6138,  5508,  4778,  3964,  3088,
-     2170,  1234,   300,  -620, -1513, -2367, -3172, -3915, -4589, -5185,
-    -5696, -6116, -6441, -6668, -6795, -6822, -6750, -6582, -6322, -5975,
-    -5548, -5049, -4485, -3868, -3206, -2511, -1794, -1067,
+const SINE256: [i16; 256] = [
+         0,    393,    785,   1177,   1568,   1959,   2348,   2735,
+      3121,   3506,   3888,   4267,   4645,   5019,   5390,   5758,
+      6123,   6484,   6841,   7194,   7542,   7886,   8226,   8560,
+      8889,   9213,   9531,   9844,  10150,  10451,  10745,  11033,
+     11314,  11588,  11855,  12115,  12368,  12614,  12851,  13081,
+     13304,  13518,  13724,  13921,  14111,  14292,  14464,  14627,
+     14782,  14928,  15065,  15192,  15311,  15420,  15521,  15611,
+     15693,  15764,  15827,  15880,  15923,  15957,  15981,  15995,
+     16000,  15995,  15981,  15957,  15923,  15880,  15827,  15764,
+     15693,  15611,  15521,  15420,  15311,  15192,  15065,  14928,
+     14782,  14627,  14464,  14292,  14111,  13921,  13724,  13518,
+     13304,  13081,  12851,  12614,  12368,  12115,  11855,  11588,
+     11314,  11033,  10745,  10451,  10150,   9844,   9531,   9213,
+      8889,   8560,   8226,   7886,   7542,   7194,   6841,   6484,
+      6123,   5758,   5390,   5019,   4645,   4267,   3888,   3506,
+      3121,   2735,   2348,   1959,   1568,   1177,    785,    393,
+         0,   -393,   -785,  -1177,  -1568,  -1959,  -2348,  -2735,
+     -3121,  -3506,  -3888,  -4267,  -4645,  -5019,  -5390,  -5758,
+     -6123,  -6484,  -6841,  -7194,  -7542,  -7886,  -8226,  -8560,
+     -8889,  -9213,  -9531,  -9844, -10150, -10451, -10745, -11033,
+    -11314, -11588, -11855, -12115, -12368, -12614, -12851, -13081,
+    -13304, -13518, -13724, -13921, -14111, -14292, -14464, -14627,
+    -14782, -14928, -15065, -15192, -15311, -15420, -15521, -15611,
+    -15693, -15764, -15827, -15880, -15923, -15957, -15981, -15995,
+    -16000, -15995, -15981, -15957, -15923, -15880, -15827, -15764,
+    -15693, -15611, -15521, -15420, -15311, -15192, -15065, -14928,
+    -14782, -14627, -14464, -14292, -14111, -13921, -13724, -13518,
+    -13304, -13081, -12851, -12614, -12368, -12115, -11855, -11588,
+    -11314, -11033, -10745, -10451, -10150,  -9844,  -9531,  -9213,
+     -8889,  -8560,  -8226,  -7886,  -7542,  -7194,  -6841,  -6484,
+     -6123,  -5758,  -5390,  -5019,  -4645,  -4267,  -3888,  -3506,
+     -3121,  -2735,  -2348,  -1959,  -1568,  -1177,   -785,   -393,
 ];
 
+/// Phase step per sample for the diagnostic tone.
+#[cfg(feature = "packet-stress")]
+const TONE_PHASE_INC: u32 = ((997u64 << 32) / 48_000u64) as u32;
 /// The one rate we advertise to the car. A source running anything else is
 /// muted rather than played at the wrong pitch.
 const RATE: u32 = teslamic::SAMPLE_RATE;
@@ -271,14 +308,18 @@ async fn capture(
 #[embassy_executor::task]
 async fn tone_source() -> ! {
     use core::sync::atomic::Ordering;
-    let mut phase = 0usize;
+    let mut phase: u32 = 0;
     loop {
         // 48 frames every millisecond: exactly the nominal rate, no drift.
         PIPE.lock(|p| {
             let mut pipe = p.borrow_mut();
             for _ in 0..48 {
-                let v = TONE48[phase % TONE48.len()];
-                phase += 1;
+                let idx = ((phase >> 24) & 0xFF) as usize;
+                let frac = ((phase >> 16) & 0xFF) as i32;
+                let a = SINE256[idx] as i32;
+                let b = SINE256[(idx + 1) & 0xFF] as i32;
+                let v = (a + (((b - a) * frac) >> 8)) as i16;
+                phase = phase.wrapping_add(TONE_PHASE_INC);
                 pipe.push([v, v]);
             }
         });
