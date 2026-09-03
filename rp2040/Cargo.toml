@@ -18,8 +18,17 @@ path = "src/bin/car.rs"
 name = "source"
 path = "src/bin/source.rs"
 
+# Standalone WS2812 bring-up test: no USB, no audio, no tasks. See src/bin/ledtest.rs.
+[[bin]]
+name = "ledtest"
+path = "src/bin/ledtest.rs"
+
 [features]
 default = []
+# Board select. The RP2040-Zero has NO plain LED on GPIO25 — its only indicator
+# is a WS2812 on GPIO16 — so status has to be driven over PIO1 instead of a
+# GPIO. Everything else (Pico, RP2040-Plus) keeps the simple GPIO25 LED.
+rp2040-zero = []
 # Car board drives the I2S clock from the car's SOF and emits fixed-size
 # packets (PaceMode::Locked). Requires the `source` board on the other end.
 # Without it, the car board is an I2S slave to a PCM2706 and paces elastically.
@@ -44,6 +53,8 @@ cortex-m-rt = "0.7"
 pio          = "0.3"
 pio-proc     = "0.3"
 fixed        = "1"
+# RGB8, for the RP2040-Zero's onboard WS2812 (it has no plain LED).
+smart-leds   = "0.4"
 
 [profile.release]
 opt-level     = "s"

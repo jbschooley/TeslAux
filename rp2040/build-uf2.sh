@@ -5,8 +5,12 @@ set -e
 cd "$(dirname "$0")"
 UF2=../tools/uf2conv.py
 OBJ=${OBJCOPY:-arm-none-eabi-objcopy}
+# BOARD=rp2040-zero (default, what we have) or BOARD= for a Pico / RP2040-Plus.
+# The Zero has no plain LED, so status goes to its WS2812 on GPIO16 instead.
+BOARD=${BOARD-rp2040-zero}
 build() { # <bin> <features> <out>
-  cargo build --release --bin "$1" ${2:+--features "$2"}
+  FEATS=$(echo "$BOARD${2:+,$2}" | sed 's/^,//')
+  cargo build --release --bin "$1" ${FEATS:+--features "$FEATS"}
   $OBJ -O binary "target/thumbv6m-none-eabi/release/$1" "/tmp/$3.bin"
   python3 $UF2 "/tmp/$3.bin" -c -b 0x10000000 -f 0xe48bff56 -o "$3.uf2"
 }

@@ -1303,6 +1303,7 @@ dependencies = [
  "fixed",
  "pio",
  "pio-proc",
+ "smart-leds",
 ]
 
 [[package]]
