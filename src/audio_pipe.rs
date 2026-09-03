@@ -289,9 +289,17 @@ impl<const N: usize> Pipe<N> {
         if mode == PaceMode::Locked || mode == PaceMode::Stress {
             return 0;
         }
-        // Quarter of the deadband: correct early and often, in single frames,
-        // rather than waiting for a large excursion and lurching.
-        let band = (self.hyst / 4) as i32;
+        // The FULL deadband, not a fraction of it.
+        //
+        // Same rule as [`Self::hyst`]: the band must exceed the burst
+        // granularity of both sides, or the correction fires on sampling phase
+        // rather than on drift. On the source board the producer delivers one
+        // USB packet (48 frames) at a time and the consumer takes one I2S DMA
+        // block (64 frames) at a time, so the level jitters by up to 64 frames
+        // with the clocks perfectly matched. An earlier version used hyst/4 = 24
+        // and slipped continuously against that jitter — audible on loud
+        // material, because a slip's discontinuity scales with sample value.
+        let band = self.hyst as i32;
         let off = self.off_target();
         if off > band {
             self.stats.adj_up = self.stats.adj_up.saturating_add(1);
@@ -703,8 +711,12 @@ mod tests {
             let p = run_fixed_sink(ppm, 200_000, true);
             assert_eq!(p.stats.underruns, 0, "{ppm} ppm: underran");
             assert_eq!(p.stats.overruns, 0, "{ppm} ppm: overran");
+            // `slip` samples the level *before* the batch is popped, so the
+            // level observed here reads one batch lower. The bound is therefore
+            // the deadband plus a batch, not the deadband alone.
+            const BATCH: usize = 64;
             assert!(
-                p.off_target().unsigned_abs() as usize <= p.hysteresis(),
+                p.off_target().unsigned_abs() as usize <= p.hysteresis() + BATCH + 4,
                 "{ppm} ppm: drifted to {}",
                 p.off_target()
             );
@@ -748,6 +760,38 @@ mod tests {
         assert_eq!(total, 48_000);
         assert_eq!(p.stats.underruns, 0);
         assert_eq!(p.stats.overruns, 0);
+    }
+
+    #[test]
+    fn slip_ignores_burst_phase_with_matched_clocks() {
+        // Regression: producer and consumer both deliver in bursts, of different
+        // sizes, with zero drift. Nothing should ever be slipped.
+        for (in_burst, out_burst) in [(48, 64), (64, 48), (48, 48), (1, 64), (64, 1)] {
+            let mut p = Pipe::<512>::new(48000);
+            while !p.primed() {
+                p.push([0, 0]);
+            }
+            let mut owed_in = 0usize;
+            for _ in 0..20_000 {
+                // Same number of frames in as out, just delivered in lumps.
+                owed_in += out_burst;
+                while owed_in >= in_burst {
+                    for _ in 0..in_burst {
+                        p.push([0, 0]);
+                    }
+                    owed_in -= in_burst;
+                }
+                let adj = p.slip(PaceMode::Elastic);
+                for _ in 0..(out_burst as i32 + adj) {
+                    p.pop();
+                }
+            }
+            assert_eq!(
+                p.stats.adj_up + p.stats.adj_down,
+                0,
+                "in {in_burst}/out {out_burst}: slipped on burst phase, not drift"
+            );
+        }
     }
 
     #[test]
