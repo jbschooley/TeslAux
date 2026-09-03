@@ -142,7 +142,37 @@ const DEFAULT_RATE: u32 = teslamic::SAMPLE_RATE;
 /// Retested in the car after the ISO transport fixes: 32 k, 44.1 k, 48 k and
 /// 96 k all play cleanly, so following the source's rate is safe. The July
 /// finding that 44.1 kHz buzzed was our own bug, not the car's.
-const SUPPORTED_RATES: [u32; 4] = [32_000, 44_100, 48_000, 96_000];
+/// The ring size caps this. `set_rate` scales the deadband with the rate, and a
+/// deadband at or above the target means the pacer can never correct — the level
+/// cannot travel far enough to leave the band, so drift accumulates unchecked
+/// until the buffer hits an end. At 96 kHz the deadband is 192 frames, which
+/// exceeds the low-latency build's 128-frame target, so that build must not
+/// advertise 96 kHz. Checked below at compile time rather than trusted.
+///
+/// 96 kHz is deliberately absent even though the car plays it: its deadband is
+/// 192 frames, which with a 64-frame I2S block does not fit inside either
+/// build's target (256 and 128). Supporting it would mean a 1024-frame ring on
+/// the car board — 21 ms of cushion — for a rate nothing in this chain produces:
+/// the PCM2706 tops out at 48 kHz and the RP2040 source advertises 48 kHz only.
+/// If a 96 kHz bridge is ever used, grow RING and the assertion below will stop
+/// complaining.
+const SUPPORTED_RATES: [u32; 3] = [32_000, 44_100, 48_000];
+
+/// Every advertised rate must leave the pacer room to work: deadband strictly
+/// below target, with at least one producer burst of slack.
+const _: () = {
+    let mut i = 0;
+    while i < SUPPORTED_RATES.len() {
+        let r = SUPPORTED_RATES[i] as usize;
+        let deadband = (r / 1000) * 2;
+        let target = RING / 2;
+        assert!(
+            deadband + I2S_BLOCK < target,
+            "a supported rate's deadband does not fit this RING; drop the rate or grow the buffer"
+        );
+        i += 1;
+    }
+};
 
 /// Marks scratch1 as holding a rate we put there, rather than power-on garbage.
 const RATE_MAGIC: u32 = 0x5453_4C41; // "TSLA"
