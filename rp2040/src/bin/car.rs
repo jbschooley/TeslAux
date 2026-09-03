@@ -385,7 +385,24 @@ async fn capture(
         (0u32, USB_FRAMES.load(core::sync::atomic::Ordering::Relaxed));
 
     loop {
-        sm.rx().dma_pull(dma.reborrow(), &mut raw, false).await;
+        // Bound the wait. With no I2S clock the DMA never completes, so without
+        // a timeout this task blocks forever and the pipe keeps whatever it last
+        // held — which the pump then streams to the car as DC, or as noise if
+        // the floating inputs picked any up.
+        if embassy_time::with_timeout(
+            Duration::from_millis(250),
+            sm.rx().dma_pull(dma.reborrow(), &mut raw, false),
+        )
+        .await
+        .is_err()
+        {
+            // Source gone. Reset clears the held sample to zero and un-primes,
+            // so the pump emits real silence and re-primes cleanly when audio
+            // comes back.
+            PIPE.lock(|p| p.borrow_mut().reset());
+            SOURCE_LIVE.store(false, Ordering::Relaxed);
+            continue;
+        }
         let now = Instant::now();
 
         // A stalled source (phone unplugged, PCM2706 suspended) leaves the DMA

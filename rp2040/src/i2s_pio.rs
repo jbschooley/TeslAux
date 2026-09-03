@@ -30,6 +30,7 @@
 //! distorted or channel-swapped.
 
 use embassy_rp::dma::Channel;
+use embassy_rp::gpio::Pull;
 use embassy_rp::pio::{
     Common, Config, Direction, FifoJoin, Instance, PioPin, ShiftConfig, ShiftDirection,
     StateMachine,
@@ -81,9 +82,21 @@ pub fn slave_rx<'d, P: Instance, const SM: usize>(
         ".wrap",
     );
 
-    let data = common.make_pio_pin(data);
-    let bck = common.make_pio_pin(bck);
-    let lrck = common.make_pio_pin(lrck);
+    let mut data = common.make_pio_pin(data);
+    let mut bck = common.make_pio_pin(bck);
+    let mut lrck = common.make_pio_pin(lrck);
+
+    // Pull all three down.
+    //
+    // Without this, an unpowered or disconnected source leaves the lines
+    // floating, they pick up noise, and the state machine happily syncs on
+    // spurious edges and pushes garbage into the pipe — which the car board then
+    // streams to the car as clicks. Pulled down, an absent source holds the
+    // lines low, the program blocks on `wait 1 pin 1` forever, and no data is
+    // produced at all, which is what "no source" should look like.
+    data.set_pull(Pull::Down);
+    bck.set_pull(Pull::Down);
+    lrck.set_pull(Pull::Down);
     sm.set_pin_dirs(Direction::In, &[&data, &bck, &lrck]);
 
     let mut cfg = Config::default();
