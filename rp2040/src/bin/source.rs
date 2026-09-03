@@ -240,6 +240,10 @@ static PIPE: Mutex<CriticalSectionRawMutex, RefCell<Pipe<RING>>> =
 static FEEDBACK: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new((RATE / 1000) << 14);
 
+/// `measure-excursion` only: the largest |off_target| seen since boot, in frames.
+#[cfg(feature = "measure-excursion")]
+static PEAK_OFF: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// False while the car board's I2S clock is absent (car asleep or restarting).
 static CLOCK_LIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -634,6 +638,17 @@ async fn i2s_out_steered(
 
         // Retune roughly every 100 ms. Kp = 2000 mHz per frame off target,
         // simulated stable across +/-2000 ppm of crystal error.
+        // Record how far the level actually wanders. The cushion has to exceed
+        // this; every figure used to size it so far has been inferred rather
+        // than measured.
+        #[cfg(feature = "measure-excursion")]
+        {
+            let off = PIPE.lock(|p| p.borrow().off_target()).unsigned_abs();
+            if off > PEAK_OFF.load(core::sync::atomic::Ordering::Relaxed) {
+                PEAK_OFF.store(off, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
         // pan-test bypasses the pipe, so its level is meaningless — steering on
         // it drove the clock to the clamp at 46 kHz, which the car board rightly
         // muted as an unrecognised rate. Hold the nominal rate instead.
@@ -760,6 +775,23 @@ fn sof_frame() -> u32 {
 /// Slipping indication over a 10 s window *is* the test result.
 fn current_state() -> status::State {
     use core::sync::atomic::Ordering;
+
+    // In measurement mode the LED reports the peak buffer excursion instead of
+    // health, so the cushion can be sized from what the host actually does:
+    //   green <64 frames (1.3 ms) | amber <128 (2.7 ms) | red >=128
+    #[cfg(feature = "measure-excursion")]
+    {
+        let peak = PEAK_OFF.load(Ordering::Relaxed);
+        return if peak < 64 {
+            status::State::Ok
+        } else if peak < 128 {
+            status::State::Slipping
+        } else {
+            status::State::Fault
+        };
+    }
+
+    #[cfg(not(feature = "measure-excursion"))]
     if !CLOCK_LIVE.load(Ordering::Relaxed) {
         return status::State::Waiting;
     }

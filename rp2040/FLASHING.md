@@ -71,6 +71,7 @@ which is expected.
 | `teslamic-rp-I2SRX.uf2` | car | does `slave_rx` produce samples? red stalled / amber all-zero / green real data |
 | `teslamic-rp-I2STEST.uf2` | source | drives the link with embassy-rp's upstream I²S master, to test `slave_rx` against known-good code |
 | `teslamic-rp-source-PANTEST.uf2` | source | which side does I²S slot 0 come out of? Tone in slot 0, silence in slot 1 |
+| `teslamic-rp-source-MEASURE.uf2` | source | how far does the buffer actually wander? LED: green <64 frames, amber <128, red >=128. Run a full song; the peak is the real lower bound on the cushion |
 | `teslamic-rp-car-STRESS-TEST.uf2` | car | does the car accept variable packet sizes? Self-contained, needs no wiring |
 
 **Start with the isolation builds, not with a theory.** Every hard bug in this

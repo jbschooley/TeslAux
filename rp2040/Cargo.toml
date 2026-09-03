@@ -62,6 +62,10 @@ clock-steered = []
 # straight into the I2S slots. Isolates the I2S channel mapping from the host,
 # the pipe and the car board's USB side. See src/bin/source.rs.
 pan-test = []
+# Diagnostic: track how far the buffer level actually wanders and colour the LED
+# by the peak. That is the real lower bound on the cushion — everything else is
+# inference. See src/bin/source.rs.
+measure-excursion = []
 # Car board drives the I2S clock from the car's SOF and emits fixed-size
 # packets (PaceMode::Locked). Requires the `source` board on the other end.
 # Without it, the car board is an I2S slave to a PCM2706 and paces elastically.
