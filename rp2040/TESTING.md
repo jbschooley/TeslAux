@@ -74,6 +74,35 @@ Q1 is the one that actually decides the architecture; Q2 only decides how good
 the two-board version is. So run Q1 first — if it passes, you may never need the
 second board at all.
 
+## I2S bring-up: `teslamic-rp-I2STEST.uf2`
+
+Wire GPIO2 (DATA), GPIO3 (BCK), GPIO4 (LRCK) and **GND** between the two boards,
+then flash `teslamic-rp-I2STEST.uf2` to the source-side board and
+`teslamic-rp-car-elastic.uf2` to the car-side board, and listen on the car
+board's USB input.
+
+The test board drives the link with embassy-rp's **upstream** `PioI2sOut` rather
+than any of my PIO code, configured `bit_depth = 32` so BCK is 64x fs — the same
+framing `slave_rx` expects and the PCM2706 produces, with the 16-bit sample in
+the top half of each word. So this isolates my `slave_rx` against known-good
+master code:
+
+| result | meaning |
+|---|---|
+| clean 997 Hz | wiring and `slave_rx` are both correct |
+| distorted / channel-swapped | `slave_rx` bit alignment is wrong (1 bit or 1 slot out) |
+| silence | no clock reaching the car board — check wiring, and check GND |
+
+Do this before trusting the two-board pairings. Any fault it shows is in my code,
+not upstream's, which is the point.
+
+### Why upstream isn't used in the shipping firmware
+
+`PioI2sIn`/`PioI2sOut` are controller-role only and expose no runtime clock
+retuning (their state machine is private). Every pairing here needs a slave on
+one side, and both master roles need a steerable clock — that is what adaptive
+and clock-locked mean. So they fit as a test master and nowhere else.
+
 ## Known issue: the RP2040-Zero status LED
 
 The Zero has no plain LED, only a WS2812 on GPIO16, and the status indicator on

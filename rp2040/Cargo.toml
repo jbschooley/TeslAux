@@ -23,6 +23,22 @@ path = "src/bin/source.rs"
 name = "ledtest"
 path = "src/bin/ledtest.rs"
 
+# I2S bring-up: upstream embassy-rp I2S master, to test slave_rx against known
+# good code. See src/bin/i2stest.rs.
+[[bin]]
+name = "i2stest"
+path = "src/bin/i2stest.rs"
+
+# Clock presence check on the car side: plain GPIO, no PIO, no USB.
+[[bin]]
+name = "i2ssniff"
+path = "src/bin/i2ssniff.rs"
+
+# slave_rx isolation test: real PIO program, no USB. See src/bin/i2srx.rs.
+[[bin]]
+name = "i2srx"
+path = "src/bin/i2srx.rs"
+
 [features]
 default = []
 # Board select. The RP2040-Zero has NO plain LED on GPIO25 — its only indicator
