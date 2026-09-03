@@ -151,6 +151,20 @@ static MUTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::n
 /// firmware bug, shown as a fault rather than left to look like an audio glitch.
 static OVERSIZE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Audio frames captured from I2S, counted by the capture task and read by the
+/// pump.
+///
+/// Rate detection needs both halves: how many frames arrived (capture) and how
+/// many USB frames elapsed (pump). They live in different tasks, so the count
+/// has to cross between them. An earlier version gave each task its own
+/// `RateDetect`, so the pump's saw zero captured frames, computed 0 Hz, failed
+/// `classify()` and muted the output one second after startup — with perfectly
+/// good audio arriving.
+///
+/// Plain load/store: thumbv6m has no atomic read-modify-write, and the capture
+/// task is the only writer.
+static CAPTURED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// True while I2S frames are actually arriving.
 static SOURCE_LIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -271,7 +285,6 @@ async fn capture(
     // I2S_BLOCK stereo frames.
     let mut raw = [0u32; I2S_BLOCK * 2];
     let mut dma = dma;
-    let mut detect = RateDetect::new(1000);
     let mut last_block = Instant::now();
     #[cfg(feature = "clock-locked")]
     let (mut win_sofs, mut last_sof) =
@@ -286,7 +299,6 @@ async fn capture(
         // drop what we have rather than splicing stale audio onto new.
         if now.duration_since(last_block) > Duration::from_millis(200) {
             PIPE.lock(|p| p.borrow_mut().reset());
-            detect.reset();
         }
         last_block = now;
         SOURCE_LIVE.store(true, Ordering::Relaxed);
@@ -336,7 +348,10 @@ async fn capture(
                 pipe.push([f[0] as u16 as i16, f[1] as u16 as i16]);
             }
         });
-        detect.on_capture(I2S_BLOCK as u32);
+        CAPTURED.store(
+            CAPTURED.load(Ordering::Relaxed).wrapping_add(I2S_BLOCK as u32),
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -356,6 +371,7 @@ async fn pump(mut iso_in: impl EndpointIn) -> ! {
 
     let mut buf = [0u8; teslamic::BYTES_PER_FRAME + 8];
     let mut detect = RateDetect::new(1000);
+    let mut last_captured = CAPTURED.load(Ordering::Relaxed);
     #[cfg(feature = "packet-stress")]
     let (mut phase, mut stress_hi) = (0u32, false);
 
@@ -420,9 +436,22 @@ async fn pump(mut iso_in: impl EndpointIn) -> ! {
             USB_FRAMES.store(USB_FRAMES.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
 
             #[cfg(not(feature = "packet-stress"))]
-            if let Some(hz) = detect.on_usb_frame() {
-                let ok = classify(hz) == Some(RATE);
-                MUTED.store(!ok, Ordering::Relaxed);
+            {
+                // Feed the detector both halves: frames captured since the last
+                // USB frame, then the USB frame tick itself.
+                let c = CAPTURED.load(Ordering::Relaxed);
+                detect.on_capture(c.wrapping_sub(last_captured));
+                last_captured = c;
+                if let Some(hz) = detect.on_usb_frame() {
+                    // Only mute on a rate we can actually identify as wrong. An
+                    // unclassifiable reading means the source is absent or still
+                    // starting, which is not a reason to latch silence.
+                    match classify(hz) {
+                        Some(r) => MUTED.store(r != RATE, Ordering::Relaxed),
+                        None if hz > 1000 => MUTED.store(true, Ordering::Relaxed),
+                        None => MUTED.store(false, Ordering::Relaxed),
+                    }
+                }
             }
             let _ = &mut detect;
         }
