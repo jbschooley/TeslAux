@@ -32,6 +32,32 @@ sweep = ["stream"]
 # once per sample, so a bit-exact host recording shows exactly what the iso
 # transport did (dropped / duplicated / truncated samples). Implies `stream`.
 ramp = ["stream"]
+# `ramp` and `packet-stress` compose: the counter payload is written for whatever
+# packet size the stress pacing chose, so a bit-exact recording shows exactly
+# which samples a size change loses or repeats.
+# DIAGNOSTIC: answer "does Tesla tolerate variable-size isochronous packets?" on
+# the one board whose descriptors the car is already known to accept. Emits a
+# continuous tone and swings the packet between 47 and 49 samples on alternate
+# frames, average exactly 48. Build WITH hid-heartbeat or the popup confounds
+# the result. Implies `stream`.
+packet-stress = ["stream"]
+# Control for the above: identical build, identical 196-byte wMaxPacketSize, but
+# a constant 48 samples per frame. Isolates "the car dislikes varying sizes"
+# from "the car dislikes a wMaxPacketSize that isn't the real mic's 192".
+packet-stress-control = ["stream"]
+# The realistic version of packet-stress: one odd-sized packet every ~500 ms,
+# alternating direction, which is what genuine 20-50 ppm clock drift actually
+# produces. `packet-stress` is deliberately ~500x harsher, so if that one fails
+# and this one is clean, elastic pacing is still viable — the extreme test would
+# have been condemning a condition that never occurs. Implies `stream`.
+packet-stress-gentle = ["stream"]
+# Restores the OLD arming order (fill the frame, then arm) so the double-buffer
+# fix can be A/B'd against the bug it fixes. Diagnostic only — never ship it.
+legacy-arm = ["stream"]
+# Play the test tone continuously instead of while the button is held, without
+# any of the packet-size meddling the `packet-stress*` features do. For testing
+# a format in the car, where holding a button is not practical. Implies `stream`.
+tone-always = ["stream"]
 # Log every USB control request the host (car) sends to the onboard ST7789 TFT,
 # in real time — turns the T114 into its own USB analyzer to reverse-engineer
 # the HID handshake behind the "unsupported mic" popup. Implies `hid-heartbeat`

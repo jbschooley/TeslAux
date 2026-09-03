@@ -27,15 +27,26 @@ fn main() {
     // wChannelConfig (spatial positions). Defaults to the low `channels` bits;
     // override e.g. TESLAMIC_CHMASK=0x37 for 5.0 surround (L,R,C,LS,RS).
     let chmask: u32 = envint_maybe_hex("TESLAMIC_CHMASK", (1u32 << channels) - 1);
+    // Test-tone frequency. The default 1000 Hz is a BAD diagnostic at 48 kHz:
+    // it is exactly 48 samples, exactly one cycle per USB packet, so any fault
+    // that merely reorders a packet's contents is inaudible. 997 Hz is the
+    // classic audio-test frequency precisely because it shares no factor with
+    // the frame rate, making such faults audible as roughness.
+    let tone: u32 = envint("TESLAMIC_TONE_HZ", 1000);
     println!("cargo:rerun-if-env-changed=TESLAMIC_RATE");
     println!("cargo:rerun-if-env-changed=TESLAMIC_CHANNELS");
     println!("cargo:rerun-if-env-changed=TESLAMIC_BITS");
     println!("cargo:rerun-if-env-changed=TESLAMIC_CHMASK");
+    println!("cargo:rerun-if-env-changed=TESLAMIC_TONE_HZ");
 
     assert!(matches!(bits, 16 | 24), "TESLAMIC_BITS must be 16 or 24 (got {bits})");
     assert!((1..=8).contains(&channels), "TESLAMIC_CHANNELS must be 1..=8 (got {channels})");
     assert!((8000..=192000).contains(&rate), "TESLAMIC_RATE out of range (got {rate})");
     assert!(chmask <= 0xFFFF, "TESLAMIC_CHMASK must fit 16 bits (got {chmask})");
+    assert!(
+        tone > 0 && tone < rate / 2,
+        "TESLAMIC_TONE_HZ must be below Nyquist for {rate} Hz (got {tone})"
+    );
 
     let bytes_per_sample = bits / 8;
     // Full-speed sends one packet per 1 ms frame; a fractional rate (e.g. 44100)
@@ -56,7 +67,8 @@ fn main() {
          const BITS: u8 = {bits};\n\
          const BYTES_PER_SAMPLE: usize = {bytes_per_sample};\n\
          const MAX_BYTES_PER_FRAME: usize = {max_bytes_per_frame};\n\
-         const CHANNEL_MASK: u16 = {chmask};\n"
+         const CHANNEL_MASK: u16 = {chmask};\n\
+         const TONE_HZ: u32 = {tone};\n"
     );
     fs::write(out.join("format.rs"), body).unwrap();
 }

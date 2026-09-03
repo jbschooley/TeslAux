@@ -129,6 +129,26 @@ embassy_nrf::bind_interrupts!(struct SpiIrqs {
 //            MAX_SAMPLES_PER_FRAME, MAX_BYTES_PER_FRAME.
 include!(concat!(env!("OUT_DIR"), "/format.rs"));
 
+// wMaxPacketSize for the iso IN endpoint.
+//
+// The packet-stress diagnostics sometimes send 49 samples, so their endpoint
+// must advertise room for one extra frame. That deviates from the real mic's
+// 192, which is exactly why `packet-stress-control` exists: it carries the same
+// 196 with a *constant* 48 samples, so the two builds together separate "the car
+// dislikes varying packet sizes" from "the car dislikes wMaxPacketSize != 192".
+#[cfg(any(
+    feature = "packet-stress",
+    feature = "packet-stress-control",
+    feature = "packet-stress-gentle"
+))]
+const EP_MAX_BYTES: usize = MAX_BYTES_PER_FRAME + CHANNELS * BYTES_PER_SAMPLE;
+#[cfg(not(any(
+    feature = "packet-stress",
+    feature = "packet-stress-control",
+    feature = "packet-stress-gentle"
+)))]
+const EP_MAX_BYTES: usize = MAX_BYTES_PER_FRAME;
+
 // Minimal panic handler: no probe is attached in the car, so there is nothing
 // to print to — just idle the core.  (Avoids pulling in defmt / panic-probe.)
 #[panic_handler]
@@ -588,7 +608,7 @@ async fn main(spawner: Spawner) {
         // bSynchAddress] makes this the 9-byte UAC audio-endpoint form.
         let _iso_in = alt1.endpoint_isochronous_in(
             None,
-            MAX_BYTES_PER_FRAME as u16,
+            EP_MAX_BYTES as u16,
             1,
             SynchronizationType::Asynchronous,
             UsageType::DataEndpoint,
@@ -725,7 +745,6 @@ const SINE256: [i16; 256] = [
 
 // Test-tone frequency and its per-sample phase increment (freq * 2^32 / rate).
 #[cfg(feature = "stream")]
-const TONE_HZ: u32 = 1000;
 #[cfg(feature = "stream")]
 const PHASE_INC: u32 = (((TONE_HZ as u64) << 32) / SAMPLE_RATE as u64) as u32;
 
@@ -739,6 +758,36 @@ const SWEEP_STEP_FRAMES: u32 = 350; // ~0.35 s per tone
 /// Arm the ISO IN endpoint's EasyDMA with a `len`-byte packet at `ptr` and kick
 /// the transfer.  The hardware sends it on the next IN token, then raises
 /// EVENTS_ENDISOIN.
+/// Apply the workaround for **nRF52840 Erratum 166 — "USBD: ISO double buffering
+/// not functional"**.
+///
+/// Nordic's text: *Conditions: Always. With default settings, the buffers
+/// overlap. Consequences: During ISO transition, received or transmitted data is
+/// likely to be corrupted.*
+///
+/// The ISO IN and ISO OUT endpoint buffers overlap in the default configuration,
+/// so anything that shifts where a packet lands in the buffer corrupts it. That
+/// matches what we measured exactly: with a constant packet size the corruption
+/// is a fixed rotation (inaudible on a packet-periodic tone, which is why this
+/// survived every car test since July), and the moment the packet size varies
+/// the rotation changes and it becomes an audible click per size change.
+///
+/// embassy-nrf applies errata 187 and 171 in its USB driver but **not** 166, so
+/// nothing else in this firmware does it for us. These are the two undocumented
+/// register writes Nordic specifies, verbatim, relative to USBD base 0x4002_7000.
+///
+/// Must be applied *after* the USBD peripheral is enabled, so the pump does it
+/// each time the isochronous endpoint comes up rather than once at boot.
+#[cfg(feature = "stream")]
+#[inline]
+fn apply_errata_166() {
+    const USBD_BASE: usize = 0x4002_7000;
+    unsafe {
+        core::ptr::write_volatile((USBD_BASE + 0x800) as *mut u32, 0x7E3);
+        core::ptr::write_volatile((USBD_BASE + 0x804) as *mut u32, 0x40);
+    }
+}
+
 #[cfg(feature = "stream")]
 #[inline]
 fn arm_iso(usbd: pac::usbd::Usbd, ptr: u32, len: u16) {
@@ -777,8 +826,32 @@ async fn iso_pump(button: Input<'static>) {
 
     // One frame's PCM, sized for the biggest frame this format needs.  Lives in
     // the task future (RAM) — a stable address EasyDMA can read.
-    let mut buf = [0u8; MAX_BYTES_PER_FRAME];
+    // TWO buffers. The packet for the next frame is prepared during the current
+    // one, so the only work between detecting SOF and arming the DMA is three
+    // register writes.
+    //
+    // This is not an optimisation, it is the fix for a real corruption bug.
+    // Hosts issue the isochronous IN token within microseconds of SOF. The old
+    // code detected SOF and then generated a whole frame of samples before
+    // arming, so the host frequently read the endpoint buffer while EasyDMA was
+    // still filling it and got a mixture: the 64-byte chunks already written
+    // held the new frame, the rest still held the previous one. Recorded against
+    // the `ramp` counter that shows up as each 192-byte packet arriving rotated
+    // at a 64-byte boundary, with the stale chunks reading exactly one frame
+    // (48 samples) behind.
+    //
+    // It was invisible in every previous car test because those used a 1 kHz
+    // tone at 48 kHz — exactly 48 samples, exactly one cycle per packet — so a
+    // fixed rotation of a whole cycle is still the same sine wave. Any signal
+    // that is not packet-periodic (real audio, a sweep, the ramp) is corrupted.
+    let mut bufs = [[0u8; EP_MAX_BYTES]; 2];
+    let mut cur = 0usize;
+    let mut prepared: usize = 0;
 
+    #[cfg(any(feature = "packet-stress", feature = "packet-stress-gentle"))]
+    let mut stress_hi = false; // alternates the packet size 47/49
+    #[cfg(feature = "packet-stress-gentle")]
+    let mut stress_ctr: u32 = 0; // frames since the last odd packet
     let mut phase: u32 = 0; // tone phase accumulator
     let mut samp_accum: u32 = 0; // fractional-rate sample-count accumulator
     // `ramp` diagnostic build: 16-bit counter, +1 per audio sample.
@@ -805,6 +878,11 @@ async fn iso_pump(button: Input<'static>) {
             Timer::after_millis(4).await;
         }
 
+        // USBD is enabled by now (the host has selected alt-1), which is what
+        // the erratum requires. Re-applied on every re-enable, e.g. after the
+        // car unplugs and reconnects.
+        apply_errata_166();
+
         // Arm exactly ONE packet per USB frame, immediately after Start-of-Frame,
         // never mid-frame: a re-arm DMAs into the single ISO buffer, and doing
         // that while the packet is clocking out (~128 us for a full one) corrupts
@@ -814,6 +892,17 @@ async fn iso_pump(button: Input<'static>) {
         while usbd.epinen().read().isoin() {
             if usbd.events_sof().read() != 0 {
                 usbd.events_sof().write_value(0);
+
+                // Arm IMMEDIATELY, before doing anything else this frame.
+                #[cfg(not(feature = "legacy-arm"))]
+                {
+                    if prepared > 0 {
+                        arm_iso(usbd, bufs[cur].as_ptr() as u32, prepared as u16);
+                    }
+                    // Everything below fills the *other* buffer, for the next
+                    // frame, with a whole millisecond of slack.
+                    cur ^= 1;
+                }
 
                 // Debounce the button once per frame; a fresh press steps the
                 // active channel.
@@ -830,8 +919,18 @@ async fn iso_pump(button: Input<'static>) {
                         }
                     }
                 }
-                let tone =
-                    (cfg!(feature = "sine-button") || cfg!(feature = "sweep")) && stable_pressed;
+                let tone = if cfg!(any(
+                    feature = "tone-always",
+                    feature = "packet-stress",
+                    feature = "packet-stress-control",
+                    feature = "packet-stress-gentle"
+                )) {
+                    // Always on: you cannot hold a button while driving, and a
+                    // steady tone makes any packet-size fault obvious.
+                    true
+                } else {
+                    (cfg!(feature = "sine-button") || cfg!(feature = "sweep")) && stable_pressed
+                };
 
                 // Per-frame phase increment: fixed 1 kHz, or the current sweep
                 // step (restarting from the bottom each time the button is held).
@@ -852,7 +951,13 @@ async fn iso_pump(button: Input<'static>) {
                 };
 
                 // sweep -> all channels; sine-button -> just the selected channel.
-                let (ch_lo, ch_hi) = if cfg!(feature = "sweep") {
+                let (ch_lo, ch_hi) = if cfg!(any(
+                    feature = "sweep",
+                    feature = "tone-always",
+                    feature = "packet-stress",
+                    feature = "packet-stress-control",
+                    feature = "packet-stress-gentle"
+                )) {
                     (0, CHANNELS)
                 } else {
                     (sel, sel + 1)
@@ -862,16 +967,62 @@ async fn iso_pump(button: Input<'static>) {
                 samp_accum += SAMPLE_RATE;
                 let nsamp = (samp_accum / 1000) as usize;
                 samp_accum %= 1000;
+                // Swing the packet size around the nominal count while keeping
+                // the long-run average exact, so the ONLY thing under test is
+                // whether the host copes with the size changing frame to frame.
+                // One odd packet every 500 frames, alternating direction: the
+                // cadence real 20-50 ppm drift produces, rather than the
+                // every-frame worst case.
+                #[cfg(feature = "packet-stress-gentle")]
+                let nsamp = {
+                    stress_ctr += 1;
+                    if stress_ctr >= 500 {
+                        stress_ctr = 0;
+                        stress_hi = !stress_hi;
+                        if stress_hi {
+                            nsamp + 1
+                        } else {
+                            nsamp - 1
+                        }
+                    } else {
+                        nsamp
+                    }
+                };
+                #[cfg(feature = "packet-stress")]
+                let nsamp = {
+                    stress_hi = !stress_hi;
+                    if stress_hi {
+                        nsamp + 1
+                    } else {
+                        nsamp - 1
+                    }
+                };
                 let nbytes = nsamp * CHANNELS * BYTES_PER_SAMPLE;
 
                 // Zero the frame, then lay the tone into the active channel(s).
                 // Phase advances every sample (even when silent) so the tone
                 // resumes phase-continuous.
+                let buf = &mut bufs[cur];
                 for b in buf[..nbytes].iter_mut() {
                     *b = 0;
                 }
                 for s in 0..nsamp {
-                    let v = SINE256[((phase >> 24) & 0xFF) as usize];
+                    // Linearly interpolate between table entries using the
+                    // next 8 bits of phase.
+                    //
+                    // Indexing a 256-entry table by the top 8 bits alone gives
+                    // only 8 bits of phase resolution, i.e. ~48 dB spurious-free
+                    // dynamic range — audible as a faint high-pitched tone on an
+                    // otherwise clean signal. Interpolating drops the error to
+                    // roughly -82 dB, below anything you can hear.
+                    //
+                    // This affects only the built-in test tone; audio arriving
+                    // over I2S never goes through here.
+                    let idx = ((phase >> 24) & 0xFF) as usize;
+                    let frac = ((phase >> 16) & 0xFF) as i32;
+                    let a = SINE256[idx] as i32;
+                    let b = SINE256[(idx + 1) & 0xFF] as i32;
+                    let v = (a + (((b - a) * frac) >> 8)) as i16;
                     phase = phase.wrapping_add(inc);
                     if tone {
                         for ch in ch_lo..ch_hi {
@@ -915,7 +1066,11 @@ async fn iso_pump(button: Input<'static>) {
                     ramp = ramp.wrapping_add(1);
                 }
 
-                arm_iso(usbd, buf.as_ptr() as u32, nbytes as u16);
+                prepared = nbytes;
+                // The bug, on purpose: arm only after a whole frame of sample
+                // generation has already burned through the host's IN token.
+                #[cfg(feature = "legacy-arm")]
+                arm_iso(usbd, bufs[cur].as_ptr() as u32, nbytes as u16);
             }
             // Tight poll so we catch SOF within microseconds (before the frame's
             // IN token). The device has nothing else to do; usb.run() still runs
