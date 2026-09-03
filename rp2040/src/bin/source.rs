@@ -240,7 +240,12 @@ static PIPE: Mutex<CriticalSectionRawMutex, RefCell<Pipe<RING>>> =
 static FEEDBACK: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new((RATE / 1000) << 14);
 
-/// `measure-excursion` only: the largest |off_target| seen since boot, in frames.
+/// Blocks to ignore after the pipe primes, while the steering loop pulls the
+/// level to target. ~1500 blocks at one per 1.33 ms is about two seconds.
+#[cfg(feature = "measure-excursion")]
+const SETTLE_BLOCKS: u32 = 1500;
+
+/// `measure-excursion` only: the largest |off_target| seen while streaming.
 #[cfg(feature = "measure-excursion")]
 static PEAK_OFF: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
@@ -600,6 +605,8 @@ async fn i2s_out_steered(
     let mut ticks = 0u32;
     #[cfg(feature = "pan-test")]
     let mut pan_phase: u32 = 0;
+    #[cfg(feature = "measure-excursion")]
+    let mut settle: u32 = 0;
 
     loop {
         let live = PIPE.lock(|p| {
@@ -643,9 +650,24 @@ async fn i2s_out_steered(
         // than measured.
         #[cfg(feature = "measure-excursion")]
         {
-            let off = PIPE.lock(|p| p.borrow().off_target()).unsigned_abs();
-            if off > PEAK_OFF.load(core::sync::atomic::Ordering::Relaxed) {
-                PEAK_OFF.store(off, core::sync::atomic::Ordering::Relaxed);
+            use core::sync::atomic::Ordering;
+            let (off, primed) = PIPE.lock(|p| {
+                let b = p.borrow();
+                (b.off_target().unsigned_abs(), b.primed())
+            });
+            if !primed {
+                // Not streaming: an empty pipe reads a full target's worth off
+                // target, which is the startup transient rather than anything
+                // about the host. Hold the peak cleared until audio is flowing,
+                // and clear it again on pause so each run measures fresh.
+                PEAK_OFF.store(0, Ordering::Relaxed);
+                settle = 0;
+            } else if settle < SETTLE_BLOCKS {
+                // Give the steering loop time to pull the level to target before
+                // believing anything it does.
+                settle += 1;
+            } else if off > PEAK_OFF.load(Ordering::Relaxed) {
+                PEAK_OFF.store(off, Ordering::Relaxed);
             }
         }
 
