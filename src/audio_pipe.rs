@@ -112,19 +112,33 @@ pub struct Pipe<const N: usize> {
 impl<const N: usize> Pipe<N> {
     /// `rate` is the source sample rate in Hz (48000, 44100, ...).
     ///
+    /// Deadband defaults to two USB frames. Use [`Self::new_with_hysteresis`]
+    /// where the host delivers in larger bursts than that.
+    ///
     /// `const` so a `Pipe` can live in a `static` and be shared between the
     /// capture task and the USB pump without a lazy init.
     pub const fn new(rate: u32) -> Self {
+        Self::new_with_hysteresis(rate, (rate as usize / 1000) * 2)
+    }
+
+    /// As [`Self::new`], but with an explicit deadband in frames.
+    ///
+    /// The deadband must exceed the largest level excursion the two sides can
+    /// produce on their own — one producer burst, one consumer burst, and any
+    /// bunching the host does. A host that delivers three USB packets at once
+    /// moves the level by three frames' worth, and anything narrower than that
+    /// corrects against delivery jitter instead of drift.
+    ///
+    /// It must also stay comfortably below `N / 2`, or the deadband edge sits
+    /// too close to an end of the buffer to recover from.
+    pub const fn new_with_hysteresis(rate: u32, hyst: usize) -> Self {
         Self {
             ring: [[0i16; 2]; N],
             head: 0,
             tail: 0,
             len: 0,
             target: N / 2,
-            // Two USB frames' worth: wider than any plausible I2S DMA block, so
-            // burst delivery alone can never trip a correction, yet still far
-            // inside the buffer so real drift is caught long before either end.
-            hyst: (rate as usize / 1000) * 2,
+            hyst,
             accum: 0,
             rate,
             last: [0, 0],
@@ -171,6 +185,17 @@ impl<const N: usize> Pipe<N> {
     /// a bug; in Elastic mode, normal and about to be corrected.
     pub fn drifting(&self) -> bool {
         self.off_target().unsigned_abs() as usize > self.hyst
+    }
+
+    /// True when the buffer has run completely dry.
+    ///
+    /// Distinct from an underrun statistic: this means the source has stopped
+    /// entirely (playback paused, host stopped delivering) rather than drifted.
+    /// Treat it as "not streaming" and stop pacing — otherwise the pacer keeps
+    /// trying to correct a buffer that has nothing in it, which shows up as a
+    /// storm of slips for as long as the pause lasts.
+    pub fn starved(&self) -> bool {
+        self.len == 0
     }
 
     /// Drop everything — call when the source clock stops (phone unplugged) so
@@ -792,6 +817,45 @@ mod tests {
                 "in {in_burst}/out {out_burst}: slipped on burst phase, not drift"
             );
         }
+    }
+
+    #[test]
+    fn starved_reports_a_stopped_source() {
+        let mut p = Pipe::<512>::new(48000);
+        assert!(p.starved());
+        while !p.primed() {
+            p.push([1, 1]);
+        }
+        assert!(!p.starved());
+        // Drain it the way a paused host would.
+        for _ in 0..600 {
+            p.pop();
+        }
+        assert!(p.starved(), "a dry buffer must report starved");
+    }
+
+    #[test]
+    fn wider_hysteresis_tolerates_bigger_bursts() {
+        // Four USB frames of deadband must survive a host bunching 3 packets.
+        let mut p = Pipe::<1024>::new_with_hysteresis(48000, 192);
+        assert_eq!(p.hysteresis(), 192);
+        while !p.primed() {
+            p.push([0, 0]);
+        }
+        for _ in 0..5000 {
+            for _ in 0..3 {
+                for _ in 0..48 {
+                    p.push([0, 0]);
+                }
+            }
+            for _ in 0..3 {
+                let adj = p.slip(PaceMode::Elastic);
+                for _ in 0..(48i32 + adj) {
+                    p.pop();
+                }
+            }
+        }
+        assert_eq!(p.stats.adj_up + p.stats.adj_down, 0, "slipped on 3-packet bursts");
     }
 
     #[test]

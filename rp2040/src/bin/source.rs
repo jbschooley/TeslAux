@@ -62,7 +62,17 @@ use audio_pipe::{PaceMode, Pipe};
 const RATE: u32 = 48_000;
 const CHANNELS: usize = 2;
 const BYTES_PER_FRAME: usize = 192; // 48 * 2ch * 2B
-const RING: usize = 512;
+/// 1024 frames = 21.3 ms, target 512 = 10.7 ms of cushion each way.
+///
+/// Larger than the car board's, because a *host* is the producer here and hosts
+/// bunch packets. iOS in particular can deliver several USB frames at once, and
+/// each one moves the level by 48 frames. The deadband below has to exceed that
+/// bunching, and the cushion has to comfortably exceed the deadband.
+///
+/// The added latency is irrelevant: ~5 ms more against Tesla's own ~100 ms.
+const RING: usize = 1024;
+/// Four USB frames. Tolerates a host bunching up to three packets.
+const HYSTERESIS: usize = 192;
 const I2S_BLOCK: usize = 64;
 /// 32-bit I2S slots => BCK at 64x fs, matching `slave_rx` and the PCM2706. The
 /// 16-bit sample rides in the top half of each word.
@@ -182,7 +192,7 @@ bind_interrupts!(struct Pio1Irqs {
 });
 
 static PIPE: Mutex<CriticalSectionRawMutex, RefCell<Pipe<RING>>> =
-    Mutex::new(RefCell::new(Pipe::new(RATE)));
+    Mutex::new(RefCell::new(Pipe::new_with_hysteresis(RATE, HYSTERESIS)));
 
 /// Explicit-feedback value in 10.14 format (samples per USB frame << 14).
 /// Starts at the nominal 48.000 and is corrected as soon as the I2S clock is
@@ -523,6 +533,14 @@ async fn i2s_out(
             // whether it ever primes depends on the host happening to burst at
             // stream start, which made it work once and not the next time.
             // Emitting silence until primed lets the buffer build its cushion.
+            // A dry buffer means the host has stopped sending — paused, or
+            // between tracks — not that we have drifted. Re-arm rather than
+            // pacing against nothing: otherwise the pacer slips continuously for
+            // as long as the pause lasts, which is what made the LED go amber
+            // whenever music was paused.
+            if pipe.starved() {
+                pipe.reset();
+            }
             if !pipe.primed() {
                 bufs[cur] = [0u32; I2S_BLOCK * 2];
                 return false;
