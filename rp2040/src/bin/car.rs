@@ -39,7 +39,7 @@ use embassy_usb::Builder;
 
 use core::cell::RefCell;
 
-#[path = "../../../src/audio_pipe.rs"]
+#[path = "../audio_pipe.rs"]
 mod audio_pipe;
 #[path = "../i2s_pio.rs"]
 mod i2s_pio;

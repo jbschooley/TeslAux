@@ -151,7 +151,7 @@ session (connect → ~60 s). Extract, in order:
 3. Whether the mic's reports are `A5 5A`-framed (likely) and their exact fields.
 
 ### 4.4 Then implement in this firmware
-- Replace `HID_REPORT_DESCRIPTOR` (currently a 21-byte stub in `src/main.rs`) with
+- Replace `HID_REPORT_DESCRIPTOR` (currently a 21-byte stub in `t114/src/main.rs`) with
   the real 289-byte descriptor(s) for IF2 and IF3.
 - Replace the rolling-counter heartbeat with the mic's real IF2 telemetry report(s).
 - Handle the IF3 `A5 5A` config writes and emit the correct ACK/status on IF3.

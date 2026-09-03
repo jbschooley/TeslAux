@@ -1,262 +1,151 @@
 # TeslAux
 
-Pipe audio from a phone into a Tesla's cabin speakers, by emulating the USB
-microphone the car already accepts.
+**Play audio from a phone through a Tesla's speakers, over USB.**
 
-The car exposes no aux input, but it does accept Tesla's own cabin microphone
-over USB. This project clones that device — descriptors and all — and feeds it
-real audio instead of a microphone, so anything that can play into a USB audio
-output can play through the car.
+A Tesla has no aux input. It does have a USB port that accepts Tesla's own
+cabin microphone — the CaraokeMic — and routes whatever that microphone hears
+into the cabin speakers. TeslAux clones that microphone precisely enough that the
+car accepts it, then feeds it real audio instead of a microphone.
 
-Two hardware paths, both documented in `rp2040/FLASHING.md`:
+The result is a wired audio input: anything that can play into a USB audio
+output can play through the car. Wired, so unlike Bluetooth it is not
+resampled, not re-encoded, and not subject to codec latency.
 
-* **Two RP2040 boards** — one presents a USB audio output to the phone, the
-  other presents the TeslaMic to the car, joined by I2S.
-* **A PCM2706 USB-to-I2S bridge plus one RP2040** — fewer parts, and the clock
-  recovery happens in hardware.
-
-The original nRF52840 (Heltec T114) firmware is still here and still works; it is
-what the descriptor cloning was worked out on.
-
-## TeslaMic emulator (Heltec T114 / nRF52840)
-
-Firmware that makes a **Heltec Mesh Node T114** enumerate over USB as Tesla's
-cabin microphone, to test whether the car will show its **MIC overlay icon**.
-
-Identity + descriptors are cloned from the TeslaMic dump in the [r/hardwarehacking
-thread](https://www.reddit.com/r/hardwarehacking/comments/1ok256p/going_down_a_rabbit_hole_wondering_where_to_start/):
-
-| Field | Value |
-|-------|-------|
-| VID:PID | `1235:0002` |
-| Manufacturer | `TeslaMic_T004_OTA_231008` |
-| Product | `TeslaMic` |
-| Max power | 500 mA |
-| Audio | USB Audio Class 1.0 — 48 kHz, 16-bit, **stereo**, 192 B/1 ms iso IN |
-
-## Status — WORKING ✅ (popup solved 2026-07-14)
-
-`teslamic-hid.uf2` runs in the car with the **mic icon, working audio, and no
-"unsupported USB microphone" popup / disconnect**. The HID interfaces are a
-byte-exact clone of a real TeslaMic (dumped over libusb — see `real_mic_dump.md`):
-IF2 is a HID keyboard, IF3 is an endpoint-less vendor HID (Usage 0x55AA) whose
-report descriptor + Feature report the car validates. It also enumerates on macOS
-as a 2-channel / 48 kHz input named `TeslaMic`.
-
-Remaining work is product polish (an I²S line-in front-end to stream real audio)
-and the ~100 ms **Tesla-side** latency (not fixable on the device — our end is
-~1–2 ms; it's the car's audio pipeline).
-
-Four flashable builds:
-
-| File | Behaviour |
-|------|-----------|
-| **`teslamic.uf2`** | Enumerates **and streams silence** — 192 B of zeros per USB frame out the iso endpoint, so it looks like a mic that's actively capturing. Try this in the car. |
-| **`teslamic-sine.uf2`** | Same, but emits a **1 kHz sine while the USER button (P1_10) is held**, silence when released. Each new press **alternates the channel**: press 1 = LEFT, press 2 = RIGHT, press 3 = LEFT, … (other channel silent). Good for confirming the audio path and checking L/R routing. |
-| **`teslamic-hid.uf2`** | Everything: the button-triggered L/R sine **plus a HID interface (IF2) streaming an 8-byte heartbeat** — an attempt to defeat the ~60 s "unsupported USB microphone" popup (see [The popup](#the-popup-hid-heartbeat)). Built with `--features hid-heartbeat,sine-button`. |
-| `teslamic-enum-only.uf2` | Enumerates only (no iso data). Fallback if a streaming build misbehaves. Tested to enumerate on macOS. |
-
-## The popup (HID heartbeat)
-
-The genuine TeslaMic exposes two HID interfaces (an 8-byte interrupt-IN status
-stream + a control/feature "settings" interface) that this project's audio-only
-builds don't. The car shows the mic icon and plays audio, but after ~60 s pops
-"unsupported USB microphone" — most likely a **keepalive/telemetry watchdog**
-timing out (a static descriptor check would fail instantly, not after a minute).
-
-`teslamic-hid.uf2` adds **IF2** (8-byte interrupt IN, `poll_ms = 1`, matching the
-dump) and streams a report continuously, with a rolling counter in byte 0 so a
-liveness watchdog sees changing data.
-
-**This is a blind guess.** The dump doesn't include the HID report descriptors or
-the report *contents*, so if the car validates specific values (rather than just
-"is something reporting"), this won't be enough — it would need a `usbhid-dump` +
-USB trace from a real or clone TeslaMic. The IF3 "settings" interface is also not
-implemented yet. Combine with the tone build via
-`--features hid-heartbeat,sine-button` if you want to test audio and the popup
-together.
-
-Tesla: Sees the device as a microphone input and shows the mic icon. The sine wave plays through the car's audio system.
-
-However, there is a noticeable delay (estimating around 100ms) between pressing the button and hearing the sine wave. This is much better than Bluetooth, but not instantaneous enough for real-time audio (like playing an instrument). The only way to fix this would be to get Tesla's engineers to reduce the buffering. I'm surprised they haven't done this already because the delay is noticeable when using the official Tesla Caraoke Mic.
-
-After a minute, it disconnects and the car shows an unsupported USB microphone popup. I assume this is because the TeslaMic firmware is sending some telemetry over the HID interface that this firmware does not implement. I don't have an official or clone mic to use to reverse engineer this interface yet.
-
-## USB spy — on-screen request logger (`teslamic-spy.uf2`)
-
-To reverse-engineer the popup without a real mic, this build turns the T114 into
-its own USB analyzer. It's the full mic + HID device (`--features usb-spy`, which
-implies `hid-heartbeat`), plus a spy that **logs every USB control request the car
-sends to the onboard ST7789 TFT in real time**. Flash it, plug into the car, and
-watch the screen (it lights ~1.5 s after boot).
-
-Each line is one control request/event:
+## How it works
 
 ```
-CONFIGURED=1            device configured
-SET_IF if1 alt1         host selected AudioStreaming alt-1 (starts audio)
-O 21 r09 v0200 i2 l8 d05   ctrl-OUT bmReqType=0x21 bReq=0x09(SET_REPORT)
-                            wValue=0x0200 iface=2 len=8 firstbyte=0x05
-I a1 r01 v0100 i2 l8       ctrl-IN  bmReqType=0xA1 bReq=0x01(GET_REPORT) ...
+phone ──USB──> [source board] ──I²S──> [car board] ──USB──> Tesla
+               a USB audio output      a clone of the CaraokeMic
 ```
 
-`bmReqType` decodes as: `0x21` = host→device, class, interface; `0xA1` = the
-device→host read. Anything the car sends to **interface 2** (our HID) — especially
-`SET_REPORT`/`GET_REPORT` with their `wValue` and data byte — is the handshake
-we're missing. Read those off the screen (or photograph it) right up to the popup,
-and we can implement the HID interface to match instead of guessing.
+Two boards, because the phone and the car are both USB *hosts* — a device has to
+be a USB *peripheral* to each, and one USB controller cannot do both. They are
+joined by I²S, which carries the audio between them as plain PCM with no
+conversion at any point.
 
-Notes/limits: the spy observes **class/vendor** requests (the interesting ones) plus
-config + alt-setting changes; it doesn't see plain standard requests. The screen
-shows the most recent ~11 events; the ring buffer holds 32.
+The source board's clock is steered to follow the phone, so the phone and the
+I²S link run on one clock. The only remaining clock difference — against the
+car — is absorbed by varying the size of each USB packet, which loses no samples
+at all.
 
-## Format test builds
+## Build and flash
 
-The audio format is a **build-time parameter** (`build.rs` reads env vars), so any
-feasible rate / channel count / bit depth is one build away. All these use
-`sine-button`, so the tone plays while the USER button is held; each press steps
-the tone to the **next channel** (at 2ch = L/R; at 4ch = cycles all four), which
-is how you check the car's channel mapping.
+Two identical **RP2040-Zero** boards, about $3 each. Wire three signals and a
+ground between them:
 
-| File | Format | Car result | Env |
-|------|--------|-----------|-----|
-| `teslamic-48k-24bit.uf2` | 48 kHz / 2ch / 24   | ✅ clean | `TESLAMIC_BITS=24` |
-| `teslamic-96k.uf2`     | 96 kHz / 2ch / 16   | ✅ clean | `TESLAMIC_RATE=96000` |
-| `teslamic-96k-24bit.uf2` | 96 kHz / 2ch / 24   | ✅ clean | `TESLAMIC_RATE=96000 TESLAMIC_BITS=24` |
-| `teslamic-mono.uf2`    | 48 kHz / 1ch / 16   | ✅ works | `TESLAMIC_CHANNELS=1` |
-| `teslamic-sweep.uf2`   | 48 kHz / 2ch / 24, **freq sweep** | ✅ full range, no obvious band-limiting | `--features sweep TESLAMIC_BITS=24` |
-| `teslamic-44k.uf2`     | 44.1 kHz / 2ch / 16 | ✅ **clean** (retested 2026-09-02) | `TESLAMIC_RATE=44100` |
-| `teslamic-32k.uf2`     | 32 kHz / 2ch / 16   | ✅ clean (retested 2026-09-02) | `TESLAMIC_RATE=32000` |
-| `teslamic-44k-24bit.uf2` | 44.1 kHz / 2ch / 24 | ❔ not retested since the fixes | `TESLAMIC_RATE=44100 TESLAMIC_BITS=24` |
-| `teslamic-4ch.uf2`     | 48 kHz / 4ch / 16   | ⚠️ only ch 1–2 play | `TESLAMIC_CHANNELS=4` |
-| `teslamic-96k-4ch.uf2` | 96 kHz / 4ch / 16   | ⚠️ only ch 1–2 play | `TESLAMIC_RATE=96000 TESLAMIC_CHANNELS=4` |
-| `teslamic-5ch.uf2`     | 48 kHz / **5.0 surround** / 16 | ⚠️ only ch 1–2 play | `TESLAMIC_CHANNELS=5 TESLAMIC_CHMASK=0x37` |
-| `teslamic-192k.uf2`    | 192 kHz / 2ch / 16  | ❔ "no output" in July; not retested since the fixes | `TESLAMIC_RATE=192000` |
+| source board | | car board |
+|---|---|---|
+| GPIO2 | → | GPIO2 (data) |
+| GPIO3 | → | GPIO3 (bit clock) |
+| GPIO4 | → | GPIO4 (word clock) |
+| GND | → | GND |
 
-Column key: ✅ works cleanly · ⚠️ works with a caveat · ❌ no audio.
-
-### What the results tell us
-
-> **Corrected 2026-09-02.** The original matrix was measured with two firmware
-> bugs present (an ISO-IN DMA race, and nRF52840 erratum 166 unapplied). Both
-> corrupted the audio *we* transmitted, so several "Tesla can't do this"
-> conclusions were actually our own faults. Rates marked ❔ were measured under
-> those bugs and have not been retested.
-
-- **Tesla is NOT 48 kHz-family only.** With the transport fixed, **32 kHz,
-  44.1 kHz, 48 kHz and 96 kHz all play cleanly.** The old "44.1 kHz buzzes"
-  finding was our bug: 44.1 is the one standard rate that doesn't divide into
-  1 ms frames, so it alternates 44/45 samples per packet, and varying the packet
-  size was exactly what the two bugs corrupted.
-- **Variable packet sizes are fine.** `teslamic-stress-variable.uf2` changes the
-  packet size on *every frame* — ~500x harsher than real clock drift — and plays
-  clean. Elastic pacing against a drifting source is therefore viable.
-- **Tesla is stereo-max.** Every multichannel build (4ch / 5ch) plays only the
-  first two channels. Measured before the fixes, but the fixes cannot plausibly
-  affect channel *mapping*, so this one still stands.
-- **Not heavily processed.** The 50 Hz–20 kHz sweep comes through full-range with
-  no obvious roll-off, so the car isn't aggressively band-limiting the mic input —
-  promising for piping real/music audio, not just voice.
-- **Recommended format: 48 kHz stereo 16-bit** — not because the others fail,
-  but because it is exactly what the real TeslaMic advertises.
-
-`TESLAMIC_CHMASK` overrides the `wChannelConfig` spatial-position bitmap (default =
-low `channels` bits). The **sweep** build ignores per-channel stepping: while the
-button is held it steps a tone through 50 Hz → 20 kHz on all channels (~0.35 s
-each, restarting each hold), so you can hear where the car's processing rolls off.
-
-Build any format: `TESLAMIC_RATE=… TESLAMIC_CHANNELS=… TESLAMIC_BITS=… cargo build --release --features sine-button` (defaults 48000 / 2 / 16).
-
-**Hardware limit:** the nRF52840 USB is full-speed, so one isochronous packet is
-≤ 1023 bytes/frame — i.e. `(rate/1000) × channels × (bits/8) ≤ 1023`. `build.rs`
-rejects anything over that at compile time. Consequences: 192 kHz caps at 2ch/16-bit,
-4ch caps at 96 kHz, and 24-bit caps at 96 kHz/2ch. (192 kHz/4ch, 96 kHz/8ch, and
-192 kHz/24-bit are impossible on this chip.)
-
-## Build
-
-Requires the Rust toolchain (pinned in `rust-toolchain.toml`) and
-`arm-none-eabi-objcopy` (from `arm-none-eabi-gcc` / `brew install arm-none-eabi-gcc`).
-
-Each build is a Cargo feature of the same source. Compile, then wrap the ELF
-into a UF2 at the app offset `0x26000`:
+Ground is not optional — the boards are powered from different USB ports.
 
 ```sh
-# pick ONE build:
-cargo build --release                          # -> silence  (teslamic.uf2)
-cargo build --release --features sine-button   # -> sine/button (teslamic-sine.uf2)
-cargo build --release --features hid-heartbeat,sine-button # -> button sine + HID heartbeat (teslamic-hid.uf2)
-cargo build --release --no-default-features     # -> enumerate only (teslamic-enum-only.uf2)
-
-# then package the resulting ELF:
-arm-none-eabi-objcopy -O binary \
-    target/thumbv7em-none-eabihf/release/teslamic teslamic.bin
-python3 tools/uf2conv.py teslamic.bin -c -b 0x26000 -f 0xADA52840 -o teslamic.uf2
+cd rp2040 && ./build-uf2.sh
 ```
 
-All four prebuilt `*.uf2` files are checked in.
+Then hold BOOTSEL while plugging each board into a computer and copy its image
+across. Use `cp`, not Finder: the bootloader reboots the instant the last block
+lands, which Finder treats as a disk being yanked out.
 
-## Flash it (no debug probe needed)
+```sh
+# the board the phone plugs into
+cp rp2040/teslamic-rp-source-ultralow.uf2 /Volumes/RPI-RP2/
 
-The T114 ships with the Adafruit/Nordic UF2 bootloader.
+# the board that plugs into the car
+cp rp2040/teslamic-rp-car-elastic-lowlat.uf2 /Volumes/RPI-RP2/
+```
 
-1. **Double-tap the RESET button** on the T114. A USB drive named something like
-   `T114BOOT` / `NRF52BOOT` appears on your Mac.
-2. **Drag `teslamic.uf2` onto that drive.** The board reboots into the firmware.
-3. Plug it into the car's USB port (the data port — glovebox or center console).
-   If the icon doesn't appear, try toggling the screen (scroll-wheel reboot) with
-   it plugged in.
+The phone will show a USB audio output called **TeslAux Bridge**. Plug the car
+board into the car's data port and the mic icon appears.
 
-To check enumeration on your Mac first: plug the board into the Mac and run
-`system_profiler SPUSBDataType | grep -A12 TeslaMic` — you should see
-`TeslaMic`, `0x1235`, `0x0002`, and an "Audio" interface.
+Each board has an onboard RGB LED: **green** streaming, **blue** waiting for
+audio, **red** a fault. [`rp2040/FLASHING.md`](rp2040/FLASHING.md) has every
+image, the LED codes in full, and the diagnostic builds.
 
-## Restore Meshtastic
+### A simpler version is coming
 
-The app lives at `0x26000` and never touches the bootloader or SoftDevice, so
-recovery is just flashing the stock image back:
+A **PCM2706** USB-to-I²S bridge chip can replace the source board entirely. It is
+a fixed-function part with no firmware, and it recovers the host's clock in
+hardware rather than in a software control loop — which should be both more
+reliable and about 5 ms lower latency than the two-board version. That leaves one
+RP2040 plus a ~$10 module. The car-side firmware already supports it and follows
+whatever sample rate it delivers; it has not been tested yet.
 
-1. Double-tap RESET → bootloader drive.
-2. Drag the **Meshtastic T114 UF2** back on (download from the Meshtastic web
-   flasher / releases). Done.
+## What the car accepts
 
-Nothing here erases the bootloader, so the board can't be bricked by a bad app
-UF2 — worst case you double-tap and flash something else.
+Findings from the car itself, not from documentation. Several contradict what
+this project believed for months — the corrections are noted.
 
-## How the silence stream works (and how to make it real audio)
+### The device must look like a CaraokeMic
 
-`embassy-nrf` 0.10 can *allocate* the nRF52840's isochronous endpoint (so the
-mic enumerates), but its `EndpointIn::write` asserts `len <= 64` and drives the
-regular EPIN registers — it **cannot** push 192-byte iso packets out of the ISO
-endpoint. So `iso_silence_pump()` in `src/main.rs` drives the `USBD.ISOIN`
-registers directly (via `embassy_nrf::pac`, behind the `unstable-pac` feature):
+The car runs a driver written for one specific device and checks for it. Getting
+the audio right is not enough; get the descriptors wrong and it shows
+"unsupported USB microphone" and disconnects after about 60 seconds.
 
-- Waits until the host selects AudioStreaming alt-1 (embassy sets `EPINEN` bit 8).
-- Arms `ISOIN.PTR`/`ISOIN.MAXCNT` with a 192-byte buffer and triggers
-  `TASKS_STARTISOIN` **exactly once per frame, right after `EVENTS_SOF`**.
-  This timing is critical: a full-speed 192-byte packet takes ~128 µs to clock
-  out, and firing `STARTISOIN` (which DMAs into the single ISO buffer) while
-  that transmission is in flight corrupts the packet — audible as scratchiness.
-  Arming just after SOF guarantees the DMA finishes before the host's IN token
-  and never during a transmission. embassy's USB driver never touches these
-  registers, so there's no conflict with its interrupt handler.
+What has to match, verified against a real unit dumped over libusb
+(see [`real_mic_dump.md`](real_mic_dump.md)):
 
-**To carry real audio** instead of silence: capture stereo 48 kHz/16-bit into a
-RAM ring buffer with the nRF52840's **I²S** (external ADC/line-in — cleanest),
-**PDM** (digital MEMS mics), or **SAADC** (analog line-in), and point the pump's
-`arm_iso` at the ring buffer's read cursor instead of the zero buffer. The USB
-side is already done; only the capture front-end and a few free header pins are
-needed. (`ISOINCONFIG.RESPONSE` is set to `ZERO_DATA` so any late frame sends a
-harmless zero-length packet rather than stalling.)
+* **VID `0x1235`, PID `0x0002`**, and the manufacturer, product and serial
+  strings. The serial is 40 bytes, which makes the string descriptor 162 bytes —
+  a 128-byte control buffer silently breaks enumeration.
+* **Four interfaces**: AudioControl, AudioStreaming, and *two* HID interfaces.
+* **IF2 is a HID keyboard** with the standard 65-byte boot-keyboard report
+  descriptor. Not telemetry, as was assumed for months — the mic's button sends
+  keystrokes.
+* **IF3 is an endpoint-less vendor HID**, usage page `0xFF00`, usage `0x55AA`,
+  with an exact 36-byte report descriptor and an 8-byte Feature report reading
+  `00 01 00 03 03 00 08 00`. **This is the one that matters.** The car writes
+  `A5 5A`-framed configuration to it and validates what comes back. Cloning it
+  byte for byte is what defeats the popup.
 
-## Design notes
+What does *not* have to match: the endpoint numbers, the audio topology (a plain
+microphone → USB-streaming terminal pair works, without the real mic's feature
+and selector units), `bcdUSB`, `bcdHID`, and `wMaxPacketSize`.
 
-- **No SoftDevice.** We never call `sd_softdevice_enable`, so the stock SD stays
-  dormant and the app owns CLOCK + POWER — letting us use embassy-nrf's ordinary
-  USB driver + `HardwareVbusDetect`. We force HFXO (external crystal) because the
-  USB peripheral needs the crystal-derived 48 MHz reference.
-- **Endpoint address.** The genuine device uses iso IN `0x84`; the nRF only has
-  one iso endpoint, so ours is `0x88`. Hosts key on interface class + audio
-  format, not the endpoint number.
-- All descriptor byte layouts are in `src/main.rs`, annotated against the USB
-  Audio Class 1.0 spec.
+### Audio formats
+
+Retested after fixing two transport bugs that had been corrupting everything we
+sent. The earlier conclusion that the car was "48 kHz-family only" was wrong —
+it was our own corruption, and 44.1 kHz was simply the rate most exposed to it.
+
+| | |
+|---|---|
+| 32 kHz, 44.1 kHz, 48 kHz | clean |
+| 96 kHz | clean |
+| 192 kHz | plays, with a click roughly every 2 s (not diagnosed) |
+| stereo | yes |
+| more than 2 channels | only the first two are ever played |
+| 16-bit | yes |
+
+### Variable packet sizes
+
+**The car accepts isochronous packets that change size from frame to frame.**
+Verified with a build that alternates 47 and 49 samples on *every* frame, ~500×
+harsher than real clock drift, playing cleanly for ten minutes.
+
+This is what makes the design work: the difference between our clock and the
+car's is absorbed by sending one more or one fewer sample when needed, so no
+sample is ever dropped, duplicated or resampled.
+
+### Latency
+
+About 8 ms through both boards — USB frame quantisation, and enough buffer to
+cover one packet at each hop.
+
+That is not what you will hear. **The car's own audio pipeline adds roughly
+100 ms**, measured in July and not reachable from the device, and the phone adds
+10–50 ms of its own buffering. Our share is a few percent of the total, which is
+worth knowing before optimising it further.
+
+## Repository layout
+
+| | |
+|---|---|
+| [`rp2040/`](rp2040) | the firmware to use — both boards build from one crate |
+| [`t114/`](t114) | the original nRF52840 prototype, where the descriptors and the transport bugs were worked out |
+| [`tools/`](tools) | UF2 packaging, and analysis scripts for recorded audio |
+| [`RESEARCH.md`](RESEARCH.md) | how the CaraokeMic was reverse engineered |
+| [`real_mic_dump.md`](real_mic_dump.md) | raw descriptor dump from a real unit |

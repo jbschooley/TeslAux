@@ -68,4 +68,4 @@ back `00 01 00 03 03 00 08 00`**.
 - Add a serial number string; return the IF3 Feature report `0001000303000800`.
 
 The car validates these descriptors (esp. IF3's), so matching them exactly is the
-path to defeating the popup. See the plan being implemented in `src/main.rs`.
+path to defeating the popup. See the plan being implemented in `t114/src/main.rs`.

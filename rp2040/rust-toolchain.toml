@@ -1,0 +1,5 @@
+# Pinned separately from t114/: sibling crates, different cores.
+# The RP2040 is a Cortex-M0+ (thumbv6m); the nRF52840 is a Cortex-M4F (thumbv7em).
+[toolchain]
+channel = "1.95.0"
+targets = ["thumbv6m-none-eabi"]
