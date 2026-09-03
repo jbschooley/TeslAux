@@ -92,17 +92,23 @@ const AS_GENERAL: [u8; 5] = [
     0x01, 0x00, // wFormatTag = PCM
 ];
 
-const AS_FORMAT_TYPE_I: [u8; 9] = [
-    0x02, // FORMAT_TYPE
-    0x01, // FORMAT_TYPE_I
-    CHANNELS as u8,
-    BYTES_PER_SAMPLE as u8,
-    16,   // bBitResolution
-    0x01, // one discrete frequency
-    (SAMPLE_RATE & 0xff) as u8,
-    ((SAMPLE_RATE >> 8) & 0xff) as u8,
-    ((SAMPLE_RATE >> 16) & 0xff) as u8,
-];
+/// Built at runtime because the advertised rate follows the source: the board
+/// re-enumerates at whatever the attached bridge is actually delivering, rather
+/// than muting when it is not 48 kHz. The real mic advertises two rates for the
+/// same reason.
+fn as_format_type_i(rate: u32) -> [u8; 9] {
+    [
+        0x02, // FORMAT_TYPE
+        0x01, // FORMAT_TYPE_I
+        CHANNELS as u8,
+        BYTES_PER_SAMPLE as u8,
+        16,   // bBitResolution
+        0x01, // one discrete frequency
+        (rate & 0xff) as u8,
+        ((rate >> 8) & 0xff) as u8,
+        ((rate >> 16) & 0xff) as u8,
+    ]
+}
 
 const AS_ISO_ENDPOINT: [u8; 5] = [
     0x01, // EP_GENERAL
@@ -222,6 +228,7 @@ pub fn build<'d, D: Driver<'d>>(
     kbd: &'d mut KeyboardHandler,
     if3: &'d mut If3Handler,
     ep_max_bytes: u16,
+    rate: u32,
 ) -> D::EndpointIn {
     // IF0 AudioControl + IF1 AudioStreaming.
     let mut func = builder.function(AUDIO_CLASS, SUBCLASS_AUDIOCONTROL, PROTO_UNDEFINED);
@@ -239,7 +246,7 @@ pub fn build<'d, D: Driver<'d>>(
         let mut alt1 =
             stream.alt_setting(AUDIO_CLASS, SUBCLASS_AUDIOSTREAMING, PROTO_UNDEFINED, None);
         alt1.descriptor(CS_INTERFACE, &AS_GENERAL);
-        alt1.descriptor(CS_INTERFACE, &AS_FORMAT_TYPE_I);
+        alt1.descriptor(CS_INTERFACE, &as_format_type_i(rate));
         let ep = alt1.endpoint_isochronous_in(
             None,
             ep_max_bytes,

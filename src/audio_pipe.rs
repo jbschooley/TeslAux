@@ -187,6 +187,23 @@ impl<const N: usize> Pipe<N> {
         self.off_target().unsigned_abs() as usize > self.hyst
     }
 
+    /// Change the sample rate the pacer is working to.
+    ///
+    /// Needed because the rate is not known until the source has been measured,
+    /// but the pipe lives in a `static` and so must be const-constructed with a
+    /// provisional one. Resets the fractional accumulator: a rate change makes
+    /// any partial frame meaningless.
+    pub fn set_rate(&mut self, rate: u32) {
+        self.rate = rate;
+        self.accum = 0;
+        self.hyst = (rate as usize / 1000) * 2;
+    }
+
+    /// The rate currently being paced to.
+    pub fn rate(&self) -> u32 {
+        self.rate
+    }
+
     /// True when the buffer has run completely dry.
     ///
     /// Distinct from an underrun statistic: this means the source has stopped
@@ -856,6 +873,30 @@ mod tests {
             }
         }
         assert_eq!(p.stats.adj_up + p.stats.adj_down, 0, "slipped on 3-packet bursts");
+    }
+
+    #[test]
+    fn set_rate_repaces_and_clears_the_accumulator() {
+        let mut p = Pipe::<512>::new(48000);
+        let mut out = [0u8; 1024];
+        while !p.primed() {
+            p.push([0, 0]);
+        }
+        assert_eq!(p.take(&mut out, PaceMode::Locked) / 4, 48);
+
+        p.set_rate(44100);
+        assert_eq!(p.rate(), 44100);
+        // 44.1 kHz must now pace 44/45, averaging exactly 44100 over a second.
+        let mut total = 0;
+        for _ in 0..1000 {
+            for _ in 0..45 {
+                p.push([0, 0]);
+            }
+            let n = p.take(&mut out, PaceMode::Locked) / 4;
+            assert!(n == 44 || n == 45, "unexpected frame size {n} at 44.1 kHz");
+            total += n;
+        }
+        assert_eq!(total, 44_100);
     }
 
     #[test]

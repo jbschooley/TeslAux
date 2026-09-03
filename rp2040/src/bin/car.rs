@@ -133,9 +133,38 @@ const SINE256: [i16; 256] = [
 /// Phase step per sample for the diagnostic tone.
 #[cfg(feature = "packet-stress")]
 const TONE_PHASE_INC: u32 = ((997u64 << 32) / 48_000u64) as u32;
-/// The one rate we advertise to the car. A source running anything else is
-/// muted rather than played at the wrong pitch.
-const RATE: u32 = teslamic::SAMPLE_RATE;
+/// Default advertised rate. The board follows the source instead of insisting on
+/// this — see `boot_rate` and the renegotiation in `pump`.
+const DEFAULT_RATE: u32 = teslamic::SAMPLE_RATE;
+
+/// Rates we are willing to advertise to the car.
+///
+/// Retested in the car after the ISO transport fixes: 32 k, 44.1 k, 48 k and
+/// 96 k all play cleanly, so following the source's rate is safe. The July
+/// finding that 44.1 kHz buzzed was our own bug, not the car's.
+const SUPPORTED_RATES: [u32; 4] = [32_000, 44_100, 48_000, 96_000];
+
+/// Marks scratch1 as holding a rate we put there, rather than power-on garbage.
+const RATE_MAGIC: u32 = 0x5453_4C41; // "TSLA"
+
+/// Bytes per audio frame: 2 channels x 2 bytes.
+const CHANNELS_X_BYTES: usize = 4;
+
+/// Read the rate chosen by a previous run before it reset itself.
+///
+/// embassy-usb builds its descriptors once, at startup, so changing the
+/// advertised sample rate means re-enumerating. The watchdog scratch registers
+/// survive a watchdog reset, which makes them the natural place to carry the
+/// decision across.
+fn boot_rate(wd: &mut embassy_rp::watchdog::Watchdog) -> u32 {
+    if wd.get_scratch(0) == RATE_MAGIC {
+        let r = wd.get_scratch(1);
+        if SUPPORTED_RATES.contains(&r) {
+            return r;
+        }
+    }
+    DEFAULT_RATE
+}
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -156,12 +185,16 @@ bind_interrupts!(struct Pio1Irqs {
 
 /// Shared between the capture task (producer) and the USB pump (consumer).
 static PIPE: Mutex<CriticalSectionRawMutex, RefCell<Pipe<RING>>> =
-    Mutex::new(RefCell::new(Pipe::new_with_hysteresis(RATE, HYSTERESIS)));
+    Mutex::new(RefCell::new(Pipe::new_with_hysteresis(DEFAULT_RATE, HYSTERESIS)));
 
 /// Set once the measured source rate disagrees with what we told the car. The
 /// pump then emits silence: wrong-pitch audio is worse than none, and it makes
 /// a misconfigured source obvious instead of mysterious.
 static MUTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The rate currently advertised to the car, set at boot.
+static ADVERTISED: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(DEFAULT_RATE);
 
 /// Latched if a packet was ever rejected for exceeding wMaxPacketSize — a
 /// firmware bug, shown as a fault rather than left to look like an audio glitch.
@@ -187,6 +220,13 @@ static SOURCE_LIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicB
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
+
+    // Which rate did a previous run decide to advertise? Defaults to 48 kHz on
+    // a cold boot.
+    let mut wd = embassy_rp::watchdog::Watchdog::new(p.WATCHDOG);
+    let rate = boot_rate(&mut wd);
+    ADVERTISED.store(rate, core::sync::atomic::Ordering::Relaxed);
+    PIPE.lock(|p| p.borrow_mut().set_rate(rate));
 
     // ── USB: the TeslaMic ───────────────────────────────────────────────────
     let driver = Driver::new(p.USB, Irqs);
@@ -223,13 +263,21 @@ async fn main(spawner: Spawner) {
         msos_desc,
         control_buf,
     );
-    // Clock-locked always sends exactly 48 frames, so it can advertise the real
-    // mic's 192. Everything else varies the packet size and needs room for 49.
+    // wMaxPacketSize must be computed from the rate we are about to advertise,
+    // not fixed. A fractional rate needs the ceiling (44.1 kHz sends 44 or 45
+    // frames), and elastic pacing adds one more when shedding drift.
+    //
+    // Getting this wrong is silent and destructive: embassy-rp rejects a write
+    // longer than the endpoint's max, so an undersized endpoint drops every
+    // oversized packet and the audio degrades with no error anywhere. A fixed
+    // 196 would have been right for 48 kHz and wrong for 96 kHz, which needs 388.
+    let frames_max = rate.div_ceil(1000) as usize;
     #[cfg(feature = "clock-locked")]
-    let ep_max = teslamic::BYTES_PER_FRAME as u16;
+    let ep_max = (frames_max * CHANNELS_X_BYTES) as u16;
     #[cfg(not(feature = "clock-locked"))]
-    let ep_max = teslamic::BYTES_PER_FRAME_ELASTIC as u16;
-    let iso_in = teslamic::build(&mut builder, hid_state, kbd, if3, ep_max);
+    let ep_max = ((frames_max + 1) * CHANNELS_X_BYTES) as u16;
+    debug_assert!(ep_max <= 1023, "over the full-speed isochronous limit");
+    let iso_in = teslamic::build(&mut builder, hid_state, kbd, if3, ep_max, rate);
     let usb = builder.build();
 
     // ── I2S capture ─────────────────────────────────────────────────────────
@@ -248,7 +296,7 @@ async fn main(spawner: Spawner) {
         p.PIN_3,
         p.PIN_4,
         embassy_rp::clocks::clk_sys_freq(),
-        RATE,
+        ADVERTISED.load(core::sync::atomic::Ordering::Relaxed),
     );
     #[cfg(not(feature = "packet-stress"))]
     sm0.set_enable(true);
@@ -279,7 +327,7 @@ async fn main(spawner: Spawner) {
     #[cfg(not(feature = "packet-stress"))]
     spawner.spawn(capture(sm0, p.DMA_CH0).unwrap());
     spawner.spawn(status_task(led).unwrap());
-    pump(iso_in).await;
+    pump(iso_in, wd).await;
 }
 
 type UsbDevice = embassy_usb::UsbDevice<'static, Driver<'static, USB>>;
@@ -348,8 +396,9 @@ async fn capture(
                 win_sofs = 0;
                 let off = PIPE.lock(|p| p.borrow().off_target()) as i64;
                 // Buffer filling => I2S is outrunning the car => command slower.
-                let cmd = ((RATE as i64) * 1000 - off * 2000)
-                    .clamp((RATE as i64 - 2000) * 1000, (RATE as i64 + 2000) * 1000);
+                let r = ADVERTISED.load(Ordering::Relaxed) as i64;
+                let cmd = (r * 1000 - off * 2000)
+                    .clamp((r - 2000) * 1000, (r + 2000) * 1000);
                 i2s_pio::set_master_rate(
                     &mut sm,
                     embassy_rp::clocks::clk_sys_freq(),
@@ -382,8 +431,12 @@ async fn capture(
 /// need not advance, and the loop span forever without ever sending a packet —
 /// the device enumerated fine and then blocked any host that tried to open the
 /// stream.
-async fn pump(mut iso_in: impl EndpointIn) -> ! {
+async fn pump(
+    mut iso_in: impl EndpointIn,
+    mut wd: embassy_rp::watchdog::Watchdog,
+) -> ! {
     use core::sync::atomic::Ordering;
+    let (mut agree_rate, mut agree_count) = (0u32, 0u32);
 
     let mut buf = [0u8; teslamic::BYTES_PER_FRAME + 8];
     let mut detect = RateDetect::new(1000);
@@ -459,13 +512,41 @@ async fn pump(mut iso_in: impl EndpointIn) -> ! {
                 detect.on_capture(c.wrapping_sub(last_captured));
                 last_captured = c;
                 if let Some(hz) = detect.on_usb_frame() {
-                    // Only mute on a rate we can actually identify as wrong. An
-                    // unclassifiable reading means the source is absent or still
-                    // starting, which is not a reason to latch silence.
+                    let advertised = ADVERTISED.load(Ordering::Relaxed);
                     match classify(hz) {
-                        Some(r) => MUTED.store(r != RATE, Ordering::Relaxed),
-                        None if hz > 1000 => MUTED.store(true, Ordering::Relaxed),
-                        None => MUTED.store(false, Ordering::Relaxed),
+                        // The source is running a rate we can advertise, but not
+                        // the one we are advertising. Re-enumerate at it rather
+                        // than muting: the car handles 32k/44.1k/48k/96k, so
+                        // following the source beats refusing it.
+                        //
+                        // Require several consecutive agreeing measurements —
+                        // each is a one-second window — so a transient never
+                        // triggers a reset, and never re-enumerate to the rate
+                        // we are already on.
+                        Some(r) if r != advertised && SUPPORTED_RATES.contains(&r) => {
+                            if agree_rate == r {
+                                agree_count += 1;
+                            } else {
+                                agree_rate = r;
+                                agree_count = 1;
+                            }
+                            if agree_count >= 3 {
+                                wd.set_scratch(0, RATE_MAGIC);
+                                wd.set_scratch(1, r);
+                                wd.trigger_reset();
+                            }
+                            MUTED.store(true, Ordering::Relaxed);
+                        }
+                        Some(_) => {
+                            agree_count = 0;
+                            MUTED.store(false, Ordering::Relaxed);
+                        }
+                        // Unclassifiable means absent or still starting, which is
+                        // not a reason to latch silence.
+                        None => {
+                            agree_count = 0;
+                            MUTED.store(hz > 1000, Ordering::Relaxed);
+                        }
                     }
                 }
             }
