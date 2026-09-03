@@ -1,5 +1,25 @@
 # Builds, pairings, and the two open questions
 
+> ## Status 2026-09-03
+>
+> **The RP2040 car board is accepted by the car.** `teslamic-rp-car-STRESS-TEST.uf2`
+> played a 997 Hz tone for **10 minutes with no dropout and no popup** — well past
+> the ~60 s threshold at which the "unsupported USB microphone" popup used to
+> fire. That validates, on real hardware in the real car:
+>
+> * the TeslaMic descriptor clone works from an RP2040 (the three descriptors the
+>   car validates are byte-identical to the real mic — verified over libusb);
+> * variable packet sizes are accepted, and this build changes size on *every*
+>   frame, ~500x harsher than real clock drift.
+>
+> **The two-board I2S chain works on the bench**: source board as I2S master ->
+> car board as I2S slave -> USB, clean audio, correct bit alignment. Resetting the
+> source board cuts audio for about a second and recovers, which is the stall
+> detection in `capture` doing its job.
+>
+> **Not yet tested: the two-board rig in the car.** Bench and car have each been
+> proven separately, never together.
+
 ## Pairings (flash one image per board)
 
 | Build | Boards | Notes |
