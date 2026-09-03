@@ -55,11 +55,27 @@ use audio_pipe::{classify, PaceMode, Pipe, RateDetect};
 /// ~10 ms of slack at 48 kHz, half in each direction. Comfortably larger than
 /// the I2S DMA block so burst delivery never trips the pacer (see the deadband
 /// note in `audio_pipe`).
+#[cfg(not(feature = "low-latency"))]
 const RING: usize = 512;
+/// Half the cushion. Target 128 must exceed deadband (64) + producer burst (16)
+/// = 80, leaving 48 frames of margin.
+#[cfg(feature = "low-latency")]
+const RING: usize = 256;
+/// Deadband. Must exceed the larger of the two burst sizes: the I2S DMA block
+/// coming in, and one USB frame going out.
+#[cfg(not(feature = "low-latency"))]
+const HYSTERESIS: usize = 96;
+#[cfg(feature = "low-latency")]
+const HYSTERESIS: usize = 64;
 
 /// Frames per I2S DMA block. Must stay under the pipe's deadband (96 frames at
 /// 48 kHz) or the pacer chases its own sampling phase.
+#[cfg(not(feature = "low-latency"))]
 const I2S_BLOCK: usize = 64;
+/// Smaller blocks mean a smaller producer burst, which is what lets the cushion
+/// shrink. Costs more frequent DMA completions, which the RP2040 absorbs easily.
+#[cfg(feature = "low-latency")]
+const I2S_BLOCK: usize = 16;
 
 #[cfg(all(not(feature = "clock-locked"), not(feature = "packet-stress")))]
 const MODE: PaceMode = PaceMode::Elastic;
@@ -140,7 +156,7 @@ bind_interrupts!(struct Pio1Irqs {
 
 /// Shared between the capture task (producer) and the USB pump (consumer).
 static PIPE: Mutex<CriticalSectionRawMutex, RefCell<Pipe<RING>>> =
-    Mutex::new(RefCell::new(Pipe::new(RATE)));
+    Mutex::new(RefCell::new(Pipe::new_with_hysteresis(RATE, HYSTERESIS)));
 
 /// Set once the measured source rate disagrees with what we told the car. The
 /// pump then emits silence: wrong-pitch audio is worse than none, and it makes

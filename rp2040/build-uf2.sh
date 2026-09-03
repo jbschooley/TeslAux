@@ -16,6 +16,7 @@ build() { # <bin> <features> <out>
 }
 # --- recommended pairing: 2x RP2040, adaptive source + elastic car ---
 build car    ""              teslamic-rp-car-elastic
+build car    low-latency     teslamic-rp-car-elastic-lowlat
 build source ""              teslamic-rp-source-adaptive
 build source low-latency     teslamic-rp-source-lowlat
 build source clock-steered   teslamic-rp-source-steered
