@@ -51,6 +51,13 @@ rp2040-zero = []
 # the HOST bunches packets, and running closer to the floor leaves less room for
 # a host that bunches more than iOS did on the day it was measured.
 low-latency = []
+# Steer the source board's I2S clock to follow the HOST, so the phone and the
+# I2S link share one clock and there is only one clock crossing in the whole
+# chain (at the car, absorbed losslessly by varying the packet size). This is
+# what the design always intended; the default build gave it up to avoid
+# unproven PIO. Uses `i2s_pio::master_tx` instead of upstream's fixed-rate
+# driver, because upstream cannot retune its divider at runtime.
+clock-steered = []
 # Car board drives the I2S clock from the car's SOF and emits fixed-size
 # packets (PaceMode::Locked). Requires the `source` board on the other end.
 # Without it, the car board is an I2S slave to a PCM2706 and paces elastically.

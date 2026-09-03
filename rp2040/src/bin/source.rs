@@ -36,6 +36,7 @@ use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{PIO0, USB};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
+#[cfg(not(feature = "clock-steered"))]
 use embassy_rp::pio_programs::i2s::{PioI2sOut, PioI2sOutProgram};
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -389,22 +390,35 @@ async fn main(spawner: Spawner) {
          against the car board's outputs. See the comment here."
     );
 
-    // Upstream embassy-rp I2S master, not my own PIO.
+    // Two ways to drive the I2S link, and they differ in how many clock
+    // domains the chain has.
     //
-    // `i2stest` + `i2srx` already proved this exact configuration end to end:
-    // bit_depth = 32 puts BCK at 64x fs, which is the framing `slave_rx` on the
-    // car board expects and the same the PCM2706 produces, with the 16-bit
-    // sample in the top half of each word. My hand-written `master_tx` has never
-    // run on hardware and had a bit-clock-ratio bug as recently as yesterday, so
-    // there is no reason to prefer it here.
+    // `clock-steered` (what the design intends): our I2S clock is trimmed to
+    // follow the host, so the phone and the I2S link share one clock. The only
+    // crossing left is at the car, and that one is absorbed losslessly by
+    // varying the USB packet size — no sample is ever dropped or repeated.
     //
-    // The cost is that upstream exposes no runtime clock retuning (its state
-    // machine is private), so this board runs at its own crystal rate instead of
-    // steering to the phone. The phone-vs-us difference is absorbed by
-    // `Pipe::slip` — one duplicated or dropped frame every half second or so at
-    // typical crystal error, inaudible in practice. Steering would remove even
-    // that, and needs `master_tx` proven first.
+    // Default: upstream's fixed-rate master. Proven, but it cannot retune its
+    // divider, so this board free-runs on its crystal and *creates* a second
+    // crossing between the host and us. That crossing is what the elastic
+    // buffer, the slips and the 10.7 ms cushion are paying for.
+    #[cfg(feature = "clock-steered")]
+    let mut i2s_sm = {
+        i2s_pio::master_tx(
+            &mut common,
+            &mut sm0,
+            p.PIN_2,
+            p.PIN_3,
+            p.PIN_4,
+            embassy_rp::clocks::clk_sys_freq(),
+            RATE,
+        );
+        sm0.set_enable(true);
+        sm0
+    };
+    #[cfg(not(feature = "clock-steered"))]
     let program = PioI2sOutProgram::new(&mut common);
+    #[cfg(not(feature = "clock-steered"))]
     let mut i2s = PioI2sOut::new(
         &mut common,
         sm0,
@@ -440,7 +454,10 @@ async fn main(spawner: Spawner) {
     led.set(smart_leds::RGB8::new(8, 0, 8));
 
     spawner.spawn(usb_task(usb).unwrap());
+    #[cfg(not(feature = "clock-steered"))]
     spawner.spawn(i2s_out(i2s).unwrap());
+    #[cfg(feature = "clock-steered")]
+    spawner.spawn(i2s_out_steered(i2s_sm, p.DMA_CH0).unwrap());
     spawner.spawn(status_task(led).unwrap());
     #[cfg(feature = "clock-locked")]
     spawner.spawn(feedback(feedback_ep).unwrap());
@@ -514,12 +531,75 @@ async fn sink(mut ep: impl EndpointOut) -> ! {
     }
 }
 
+/// Consumer: clock frames out over I2S, steering our clock to follow the host.
+///
+/// The pipe level *is* the phase error between the host's rate and ours, so
+/// holding it at target locks our I2S clock to the host. That collapses the
+/// phone/I2S crossing entirely — the only one left is at the car, where varying
+/// the packet size absorbs it without dropping a sample.
+///
+/// Steering on level rather than on a measured rate is deliberate, and the same
+/// reasoning as the car board's loop: the PIO divider is 8.8 fixed point, so
+/// most rates are not reachable exactly and a rate-locked loop would limit-cycle
+/// forever. Level is the integral of rate error, so proportional control on it
+/// is immune to that quantisation — the divider dithers between adjacent values
+/// and the level settles at a small offset.
+///
+/// Sign check: the pipe fills from USB and drains to I2S, so a *rising* level
+/// means our clock is too slow and we command a higher rate. That is inverted
+/// relative to the car board, where the pipe fills from I2S and drains to USB.
+#[cfg(feature = "clock-steered")]
+#[embassy_executor::task]
+async fn i2s_out_steered(
+    mut sm: embassy_rp::pio::StateMachine<'static, PIO0, 0>,
+    dma: embassy_rp::Peri<'static, embassy_rp::peripherals::DMA_CH0>,
+) -> ! {
+    let mut dma = dma;
+    let mut raw = [0u32; I2S_BLOCK * 2];
+    let mut ticks = 0u32;
+
+    loop {
+        let live = PIPE.lock(|p| {
+            let mut pipe = p.borrow_mut();
+            if pipe.starved() {
+                pipe.reset();
+            }
+            if !pipe.primed() {
+                raw = [0u32; I2S_BLOCK * 2];
+                return false;
+            }
+            for i in 0..I2S_BLOCK {
+                let f = pipe.pop();
+                // 16-bit sample in the top half of a 32-bit slot.
+                raw[i * 2] = (f[0] as u16 as u32) << 16;
+                raw[i * 2 + 1] = (f[1] as u16 as u32) << 16;
+            }
+            true
+        });
+        CLOCK_LIVE.store(live, core::sync::atomic::Ordering::Relaxed);
+
+        // Retune roughly every 100 ms. Kp = 2000 mHz per frame off target,
+        // simulated stable across +/-2000 ppm of crystal error.
+        ticks += 1;
+        if ticks >= 75 {
+            ticks = 0;
+            let off = PIPE.lock(|p| p.borrow().off_target()) as i64;
+            let cmd = ((RATE as i64) * 1000 + off * 2000)
+                .clamp((RATE as i64 - 2000) * 1000, (RATE as i64 + 2000) * 1000);
+            i2s_pio::set_master_rate(&mut sm, embassy_rp::clocks::clk_sys_freq(), cmd as u64);
+        }
+
+        sm.tx().dma_push(dma.reborrow(), &raw, false).await;
+    }
+}
+
 /// Consumer: clock frames out over I2S.
 ///
 /// The I2S clock is ours (upstream `PioI2sOut` is the controller), so the
 /// phone's rate and ours differ by whatever the two crystals disagree on.
 /// `Pipe::slip` absorbs that: one frame duplicated or dropped when the buffer
 /// wanders off target, roughly twice a second at 20-50 ppm.
+#[cfg(not(feature = "clock-steered"))]
 #[embassy_executor::task]
 async fn i2s_out(
     mut i2s: PioI2sOut<'static, PIO0, 0>,

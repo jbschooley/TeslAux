@@ -224,13 +224,19 @@ pub fn slave_tx<'d, P: Instance, const SM: usize>(
     sm.set_config(&cfg);
 }
 
-/// Set up a state machine to **transmit** I2S as master, generating BCK and
-/// LRCK. Used by the source board in adaptive mode, where its clock is steered
-/// to follow the phone's USB frame clock.
+/// Set up a state machine to **transmit** I2S as master, generating BCK and LRCK,
+/// with a divider that can be retuned at runtime by [`set_master_rate`].
 ///
-/// Mirror of [`master_rx`], but each bit-clock period is ordered (low, high) so
-/// data changes while BCK is low and is stable across the rising edge the
-/// receiver samples on. Same 1 + 16 + 15 = 32 BCK per slot, 64 per frame.
+/// The program is embassy-rp's own `PioI2sOutProgram`, with `mov x, y` replaced
+/// by a literal `set x, 30` so no Y preload is needed. Using their proven
+/// framing rather than my own is deliberate: `i2stest` demonstrated this exact
+/// timing working into `slave_rx`. What this adds is a *retunable* clock, which
+/// upstream's driver does not expose — it keeps its state machine private — and
+/// which is the entire point of steering to the host.
+///
+/// 32-bit slots: 32 BCK per channel, 64 per frame, matching `slave_rx` and the
+/// PCM2706. The 16-bit sample goes in the **top half** of each word, because
+/// the shift direction is left and the MSB clocks out first.
 pub fn master_tx<'d, P: Instance, const SM: usize>(
     common: &mut Common<'d, P>,
     sm: &mut StateMachine<'d, P, SM>,
@@ -241,47 +247,35 @@ pub fn master_tx<'d, P: Instance, const SM: usize>(
     rate: u32,
 ) {
     let prg = pio::pio_asm!(
-        ".side_set 2",
-        ".wrap_target",
-        // ---- left slot: LRCK low ----
-        "    set x, 15          side 0b00",
-        "    nop                side 0b01",
-        "ltx:",
-        "    out pins, 1        side 0b00",
-        "    jmp x-- ltx        side 0b01",
-        "    set y, 14          side 0b00",
-        "lpad:",
-        "    nop                side 0b00",
-        "    jmp y-- lpad       side 0b01",
-        // ---- right slot: LRCK high ----
-        "    set x, 15          side 0b10",
-        "    nop                side 0b11",
-        "rtx:",
-        "    out pins, 1        side 0b10",
-        "    jmp x-- rtx        side 0b11",
-        "    set y, 14          side 0b10",
-        "rpad:",
-        "    nop                side 0b10",
-        "    jmp y-- rpad       side 0b11",
-        ".wrap",
+        ".side_set 2",               // side 0bWB - W = word clock, B = bit clock
+        "    set x, 30      side 0b01",
+        "left_data:",
+        "    out pins, 1    side 0b00",
+        "    jmp x-- left_data side 0b01",
+        "    out pins, 1    side 0b10", // word clock flips one bit early: I2S
+        "    set x, 30      side 0b11",
+        "right_data:",
+        "    out pins, 1    side 0b10",
+        "    jmp x-- right_data side 0b11",
+        "    out pins, 1    side 0b00",
     );
 
     let data = common.make_pio_pin(data);
     let bck = common.make_pio_pin(bck);
     let lrck = common.make_pio_pin(lrck);
-    sm.set_pin_dirs(Direction::Out, &[&data, &bck, &lrck]);
 
     let mut cfg = Config::default();
     cfg.use_program(&common.load_program(&prg.program), &[&bck, &lrck]);
     cfg.set_out_pins(&[&data]);
     cfg.shift_out = ShiftConfig {
         auto_fill: true,
-        threshold: 16,
+        threshold: 32,
         direction: ShiftDirection::Left,
     };
     cfg.fifo_join = FifoJoin::TxOnly;
     cfg.clock_divider = master_divider(sys_hz, rate).to_fixed();
     sm.set_config(&cfg);
+    sm.set_pin_dirs(Direction::Out, &[&data, &bck, &lrck]);
 }
 
 /// Clock divider that makes a master state machine produce `rate` Hz.
