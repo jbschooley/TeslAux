@@ -206,7 +206,7 @@ powered.
 | Blinks | Meaning | What it means |
 |---|---|---|
 | none | clean run | — |
-| 1 | peak level excursion passed half the cushion | margin being used up; nothing audible yet |
+| 1 | peak level excursion passed `PEAK_WARN` | margin being used up; nothing audible yet |
 | 2 | sample slips occurred | audible: the steering loop fell behind |
 
 Code 2 is the one that matters. This board's consumer is a fixed I2S clock, so
@@ -215,8 +215,23 @@ value, which is why it was audible on bass and not when quiet. On a
 `clock-steered` build the loop should hold the level and `slip()` should return
 0, so any slip at all means steering lost the plot.
 
+`PEAK_WARN` sits halfway between the slip deadband and a dry buffer — 224 frames
+on the low-latency build, where the deadband is 192 and the target 256. It has to
+be **above** the deadband: inside it the level wanders freely by design and the
+pacer does nothing, so a threshold there reports ordinary operation. A `const`
+assertion enforces that now, because the first version used `RING / 4` = 128 and
+flagged every run.
+
 Both counters are gated on `HOST_LIVE` rather than `CLOCK_LIVE`, and slips are
 rebased per streaming session. The difference matters: after the host stops, the
 buffer keeps draining, the level dives toward empty and `slip()` fires on the way
 down. Counting that would make every pause look like a fault — which is exactly
 how the car board's latch twice reported nothing but its own shutdown.
+
+The peak latch additionally requires **fresh frames from the host** in the same
+block, because `HOST_LIVE` stays true through the gap between the host stopping
+and the endpoint reporting it — and the level falls ~48 frames per millisecond in
+that window.
+
+Neither counter is cleared by resuming playback: they are a record of the whole
+run. **Power-cycle the board for a fresh reading.**

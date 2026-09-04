@@ -278,6 +278,44 @@ static CLOCK_LIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 /// manufactured its own faults, so every counter below is gated on this instead.
 static HOST_LIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Steady-state fill level the pacer holds.
+const TARGET: usize = RING / 2;
+
+/// Peak excursion worth reporting: three quarters of the way from target to a
+/// dry buffer.
+///
+/// It must sit **above** `HYSTERESIS`, because the level is allowed to wander
+/// anywhere inside the deadband without the pacer doing a thing — that is
+/// normal operation, not a warning. An earlier version used `RING / 4`, which on
+/// the low-latency build is 128 against a deadband of 192, so it flagged every
+/// ordinary run.
+const PEAK_WARN: usize = if TARGET > HYSTERESIS {
+    // Halfway from where the pacer starts correcting to where the buffer runs
+    // dry. Below the deadband it would report normal operation; above the
+    // target it could never fire.
+    HYSTERESIS + (TARGET - HYSTERESIS) / 2
+} else {
+    // `ultra-low` runs a deadband wider than the target, which is legitimate
+    // because a steered clock never slips. Fall back to a plain margin.
+    TARGET * 3 / 4
+};
+
+const _: () = {
+    assert!(
+        PEAK_WARN < TARGET,
+        "peak warning is at or past a dry buffer, so it can never usefully fire"
+    );
+    assert!(
+        TARGET <= HYSTERESIS || PEAK_WARN > HYSTERESIS,
+        "peak warning sits inside the slip deadband, where the level is free to \
+         wander by design — it would flag every ordinary run"
+    );
+};
+
+/// Frames the host has delivered, ever. The consumer watches this for change to
+/// tell "streaming" from "draining because the host stopped".
+static PUSHED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// Latched record of what went wrong, for reading back without a laptop.
 ///
 /// Unlike the car board's, this one **cannot** be read after unplugging: this
@@ -298,7 +336,7 @@ mod faults {
     pub fn worst() -> Option<u8> {
         if SLIPS.load(Ordering::Relaxed) > 2 {
             Some(2)
-        } else if PEAK_OFF_LATCH.load(Ordering::Relaxed) > (super::RING / 4) as u32 {
+        } else if PEAK_OFF_LATCH.load(Ordering::Relaxed) > super::PEAK_WARN as u32 {
             Some(1)
         } else {
             None
@@ -613,6 +651,14 @@ async fn sink(mut ep: impl EndpointOut) -> ! {
                         core::sync::atomic::Ordering::Relaxed,
                     );
                     HOST_LIVE.store(true, core::sync::atomic::Ordering::Relaxed);
+                    // Plain load/store: thumbv6m has no atomic RMW, and this is
+                    // the only writer.
+                    PUSHED.store(
+                        PUSHED
+                            .load(core::sync::atomic::Ordering::Relaxed)
+                            .wrapping_add((n / 4) as u32),
+                        core::sync::atomic::Ordering::Relaxed,
+                    );
                     PIPE.lock(|p| {
                     let mut pipe = p.borrow_mut();
                     for f in buf[..n].chunks_exact(4) {
@@ -666,6 +712,7 @@ async fn i2s_out_steered(
     // stops trips `slip()` a few times on its way to empty, and counting that
     // would make a couple of pauses look like a fault.
     let (mut slip_base, mut slip_acc, mut was_host_live) = (0u32, 0u32, false);
+    let mut last_pushed = 0u32;
 
     loop {
         let live = PIPE.lock(|p| {
@@ -735,7 +782,24 @@ async fn i2s_out_steered(
                     slip_acc.saturating_add(slips.saturating_sub(slip_base)),
                     Ordering::Relaxed,
                 );
-                if primed && settle >= SETTLE_BLOCKS && off > faults::PEAK_OFF_LATCH.load(Ordering::Relaxed) {
+                // Latch only on blocks where the host actually delivered.
+                //
+                // `HOST_LIVE` is not enough on its own: it stays true through
+                // the gap between the host stopping and the endpoint reporting
+                // it, and the level dives ~48 frames per millisecond in that
+                // window. Requiring fresh frames means a stall stops the latch
+                // immediately instead of recording its own drain. Some blocks
+                // legitimately see no new packet (a block is shorter than a USB
+                // frame), which costs nothing — a real excursion persists across
+                // many blocks.
+                let pushed = PUSHED.load(Ordering::Relaxed);
+                let delivered = pushed != last_pushed;
+                last_pushed = pushed;
+                if delivered
+                    && primed
+                    && settle >= SETTLE_BLOCKS
+                    && off > faults::PEAK_OFF_LATCH.load(Ordering::Relaxed)
+                {
                     faults::PEAK_OFF_LATCH.store(off, Ordering::Relaxed);
                 }
             }
