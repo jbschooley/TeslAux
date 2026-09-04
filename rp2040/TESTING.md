@@ -337,7 +337,7 @@ then names what it finds:
 | repeated frame | a slip down: the pacer padded a starved batch |
 | dropped frame | a slip up: the pacer discarded to shed drift |
 | run of zeros | a dropout: muted, or the pipe reset |
-| channels swapped | the I2S slot mapping is inverted |
+| channels swapped **and** one sample skewed | the capture lost frame alignment — see below |
 | every sample off by 1 LSB | a truncating int16 -> float -> int16 round-trip; nothing lost |
 | N frames missing at a point | a discrete discard — lost audio, located to the frame |
 | nearly everything differs | a chain problem, not a firmware fault — and it says which |
@@ -404,3 +404,28 @@ The car board's LED reported an underrun on the clean run. Nothing in the audio
 supports it: an underrun repeats the previous frame, and there are none. Trust
 the comparison over the latch — it is self-tested against synthesised faults,
 and it measures the audio rather than a counter's opinion of it.
+
+### Frame alignment, and why a channel swap is not what it looks like
+
+A recording that appears to have its channels exchanged is worth checking
+carefully: exchanged channels alone means a slot-mapping error, but exchanged
+channels **plus a one-sample skew** is the whole stream rotated by half a frame,
+which has a different cause.
+
+The DMA moves blocks of samples, and nothing ties a block boundary to a frame
+boundary. The state machine runs from the moment it is enabled, while the first
+DMA is not armed until the capture task first runs — after USB setup and task
+spawning. Samples pile up in the 8-word RX FIFO in the meantime, and **if an odd
+number are sitting there when the first transfer starts, every frame afterwards
+is rotated by one sample.** It lasts the whole session, and which way it lands
+depends on timing at reset, so it appears and disappears between boots.
+
+`capture` therefore disables the state machine, clears the FIFO and restarts the
+program before arming the first transfer of a session. Restarting guarantees the
+next push is a LEFT sample, because the program's first instruction waits for
+LRCK low.
+
+This was found by bit-comparison, not by ear or by an LED: the audio sounds
+essentially normal, and every fault counter reads clean, because no sample is
+lost — they are merely all in the wrong half of a frame. `tools/bitcompare.py`
+detects it by testing a one-sample shift.
