@@ -259,7 +259,9 @@ static FEEDBACK: core::sync::atomic::AtomicU32 =
 
 /// Blocks to ignore after the pipe primes, while the steering loop pulls the
 /// level to target. ~1500 blocks at one per 1.33 ms is about two seconds.
-#[cfg(feature = "measure-excursion")]
+/// Blocks to ignore after the pipe primes, while the steering loop pulls the
+/// level to target. Believing the level before then measures the startup
+/// transient, not the host.
 const SETTLE_BLOCKS: u32 = 1500;
 
 /// `measure-excursion` only: the largest |off_target| seen while streaming.
@@ -268,6 +270,41 @@ static PEAK_OFF: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::
 
 /// False while the car board's I2S clock is absent (car asleep or restarting).
 static CLOCK_LIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// True while the host is actually handing us iso OUT packets.
+///
+/// Distinct from [`CLOCK_LIVE`], which stays true while the buffer drains after
+/// the host stops. That gap is exactly where the car board's latch twice
+/// manufactured its own faults, so every counter below is gated on this instead.
+static HOST_LIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Latched record of what went wrong, for reading back without a laptop.
+///
+/// Unlike the car board's, this one **cannot** be read after unplugging: this
+/// board is powered by the host, so pulling the cable takes the latch with it.
+/// Read it at a pause instead — stop playback and the LED reports while the
+/// board stays powered.
+mod faults {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    /// Largest |off_target| seen while the host was actually delivering.
+    pub static PEAK_OFF_LATCH: AtomicU32 = AtomicU32::new(0);
+    /// Sample slips — a real discontinuity, since this board's consumer is a
+    /// fixed I2S clock. On a steered build the control loop should hold the
+    /// level and `slip()` should return 0, so any slip means it fell behind.
+    pub static SLIPS: AtomicU32 = AtomicU32::new(0);
+
+    /// Worst thing seen, as a blink count. `None` means a clean run.
+    pub fn worst() -> Option<u8> {
+        if SLIPS.load(Ordering::Relaxed) > 2 {
+            Some(2)
+        } else if PEAK_OFF_LATCH.load(Ordering::Relaxed) > (super::RING / 4) as u32 {
+            Some(1)
+        } else {
+            None
+        }
+    }
+}
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -575,6 +612,7 @@ async fn sink(mut ep: impl EndpointOut) -> ! {
                         USB_FRAMES.load(core::sync::atomic::Ordering::Relaxed).wrapping_add(1),
                         core::sync::atomic::Ordering::Relaxed,
                     );
+                    HOST_LIVE.store(true, core::sync::atomic::Ordering::Relaxed);
                     PIPE.lock(|p| {
                     let mut pipe = p.borrow_mut();
                     for f in buf[..n].chunks_exact(4) {
@@ -590,6 +628,7 @@ async fn sink(mut ep: impl EndpointOut) -> ! {
                 Err(_) => break,
             }
         }
+        HOST_LIVE.store(false, core::sync::atomic::Ordering::Relaxed);
         PIPE.lock(|p| p.borrow_mut().reset());
     }
 }
@@ -622,8 +661,11 @@ async fn i2s_out_steered(
     let mut ticks = 0u32;
     #[cfg(feature = "pan-test")]
     let mut pan_phase: u32 = 0;
-    #[cfg(feature = "measure-excursion")]
     let mut settle: u32 = 0;
+    // Slip accounting, rebased per streaming session: the drain after the host
+    // stops trips `slip()` a few times on its way to empty, and counting that
+    // would make a couple of pauses look like a fault.
+    let (mut slip_base, mut slip_acc, mut was_host_live) = (0u32, 0u32, false);
 
     loop {
         let live = PIPE.lock(|p| {
@@ -665,26 +707,60 @@ async fn i2s_out_steered(
         // Record how far the level actually wanders. The cushion has to exceed
         // this; every figure used to size it so far has been inferred rather
         // than measured.
-        #[cfg(feature = "measure-excursion")]
         {
             use core::sync::atomic::Ordering;
-            let (off, primed) = PIPE.lock(|p| {
+            let (off, primed, slips) = PIPE.lock(|p| {
                 let b = p.borrow();
-                (b.off_target().unsigned_abs(), b.primed())
+                (
+                    b.off_target().unsigned_abs(),
+                    b.primed(),
+                    b.stats.adj_up.saturating_add(b.stats.adj_down),
+                )
             });
+            // Everything below is evidence only while the host is delivering.
+            // Once it stops, the level dives toward empty and `slip()` fires on
+            // the way down — neither is a fault, both are the buffer draining.
+            let host = HOST_LIVE.load(Ordering::Relaxed);
+            if !host {
+                if was_host_live {
+                    slip_acc = faults::SLIPS.load(Ordering::Relaxed);
+                    was_host_live = false;
+                }
+            } else {
+                if !was_host_live {
+                    slip_base = slips;
+                    was_host_live = true;
+                }
+                faults::SLIPS.store(
+                    slip_acc.saturating_add(slips.saturating_sub(slip_base)),
+                    Ordering::Relaxed,
+                );
+                if primed && settle >= SETTLE_BLOCKS && off > faults::PEAK_OFF_LATCH.load(Ordering::Relaxed) {
+                    faults::PEAK_OFF_LATCH.store(off, Ordering::Relaxed);
+                }
+            }
+            #[cfg(feature = "measure-excursion")]
             if !primed {
                 // Not streaming: an empty pipe reads a full target's worth off
                 // target, which is the startup transient rather than anything
                 // about the host. Hold the peak cleared until audio is flowing,
                 // and clear it again on pause so each run measures fresh.
                 PEAK_OFF.store(0, Ordering::Relaxed);
-                settle = 0;
             } else if settle < SETTLE_BLOCKS {
                 // Give the steering loop time to pull the level to target before
                 // believing anything it does.
                 settle += 1;
             } else if off > PEAK_OFF.load(Ordering::Relaxed) {
                 PEAK_OFF.store(off, Ordering::Relaxed);
+            }
+
+            // The settle counter is shared by both, and belongs to the session:
+            // an empty pipe reads a full target off target, which is the startup
+            // transient rather than anything about the host.
+            if !primed {
+                settle = 0;
+            } else if settle < SETTLE_BLOCKS {
+                settle += 1;
             }
         }
 
@@ -832,7 +908,13 @@ fn current_state() -> status::State {
 
     #[cfg(not(feature = "measure-excursion"))]
     if !CLOCK_LIVE.load(Ordering::Relaxed) {
-        return status::State::Waiting;
+        // Idle, so the LED is free to report the run. Note this board is
+        // host-powered: read it at a PAUSE, because unplugging removes the
+        // power that holds the latch.
+        return match faults::worst() {
+            Some(code) => status::State::Report(code),
+            None => status::State::Waiting,
+        };
     }
     if SLIPPING.load(Ordering::Relaxed) {
         status::State::Slipping

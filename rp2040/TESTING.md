@@ -195,3 +195,28 @@ The counts come from the pipe's own `Stats` rather than being tallied separately
 so the LED and the pipe cannot disagree. The rate-change count is carried through
 the watchdog scratch registers, since the reset it records would otherwise clear
 it.
+
+## Reading the source board after a run
+
+The source board has its own latch, with an important difference: **it is
+powered by the host**, so unplugging the phone takes the latch with it. Read it
+at a **pause** — stop playback and the LED reports while the board stays
+powered.
+
+| Blinks | Meaning | What it means |
+|---|---|---|
+| none | clean run | — |
+| 1 | peak level excursion passed half the cushion | margin being used up; nothing audible yet |
+| 2 | sample slips occurred | audible: the steering loop fell behind |
+
+Code 2 is the one that matters. This board's consumer is a fixed I2S clock, so
+correcting means `slip()` — a real discontinuity whose size scales with sample
+value, which is why it was audible on bass and not when quiet. On a
+`clock-steered` build the loop should hold the level and `slip()` should return
+0, so any slip at all means steering lost the plot.
+
+Both counters are gated on `HOST_LIVE` rather than `CLOCK_LIVE`, and slips are
+rebased per streaming session. The difference matters: after the host stops, the
+buffer keeps draining, the level dives toward empty and `slip()` fires on the way
+down. Counting that would make every pause look like a fault — which is exactly
+how the car board's latch twice reported nothing but its own shutdown.
