@@ -375,9 +375,9 @@ async fn capture(
 ) -> ! {
     use core::sync::atomic::Ordering;
 
-    // Each PIO push is one 16-bit sample in the low half of a word; a block is
-    // I2S_BLOCK stereo frames.
-    let mut raw = [0u32; I2S_BLOCK * 2];
+    // Each PIO push is one whole frame: left sample in the top half of the
+    // word, right in the bottom. A block is I2S_BLOCK frames.
+    let mut raw = [0u32; I2S_BLOCK];
     // Double buffer. `raw` is what the DMA is filling now; `work` is the block
     // handed to the pipe, so the two never contend.
     //
@@ -386,7 +386,7 @@ async fn capture(
     // discarded. Doing the pipe push before awaiting means it overlaps a
     // running transfer, and the window where the FIFO is unattended shrinks to
     // a memcpy plus the DMA setup.
-    let mut work = [0u32; I2S_BLOCK * 2];
+    let mut work = [0u32; I2S_BLOCK];
     let mut have_work = false;
     let mut dma = dma;
     let mut last_block = Instant::now();
@@ -399,31 +399,6 @@ async fn capture(
         // a timeout this task blocks forever and the pipe keeps whatever it last
         // held — which the pump then streams to the car as DC, or as noise if
         // the floating inputs picked any up.
-        // Re-establish frame alignment before the first transfer of a session.
-        //
-        // The DMA moves blocks of samples, and nothing ties a block boundary to
-        // a *frame* boundary. The state machine runs from the moment it is
-        // enabled while the first DMA is not armed until this task first runs,
-        // so samples accumulate in the RX FIFO — and if an odd number are
-        // sitting there when the transfer starts, every frame afterwards is
-        // rotated by one sample. That reads as exchanged channels plus a
-        // one-sample skew, it lasts the whole session, and which way it lands
-        // depends on timing at reset, so it comes and goes between boots.
-        //
-        // Restarting the program guarantees the next push is a LEFT sample,
-        // because its first instruction waits for LRCK low. Clearing the FIFO
-        // discards whatever was mid-frame.
-        //
-        // Nothing is lost when this goes wrong, so no counter can see it and it
-        // passes by ear. It was found by comparing a recording sample for
-        // sample against the file that was played.
-        if !have_work {
-            sm.set_enable(false);
-            sm.clear_fifos();
-            sm.restart();
-            sm.set_enable(true);
-        }
-
         // Arm the next transfer FIRST; the work below overlaps it.
         let xfer = sm.rx().dma_pull(dma.reborrow(), &mut raw, false);
 
@@ -431,8 +406,8 @@ async fn capture(
         if have_work {
             PIPE.lock(|p| {
                 let mut pipe = p.borrow_mut();
-                for f in work.chunks_exact(2) {
-                    pipe.push([f[0] as u16 as i16, f[1] as u16 as i16]);
+                for w in work.iter() {
+                    pipe.push([(w >> 16) as u16 as i16, *w as u16 as i16]);
                 }
             });
             CAPTURED.store(
