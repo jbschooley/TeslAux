@@ -64,6 +64,35 @@ car is a USB-C host and will not supply VBUS to a port that does not present Rd.
 If it powers up, the resistors are fitted. If it only works with the bundled
 A-to-C cable, they are missing and the car will not power it.
 
+## Why the car is on the onboard port
+
+Neither port can do high speed, so the assignment is decided by power, not speed.
+`OTG_FS` (PA11/PA12, the onboard connector) is full-speed-only silicon.
+`OTG_HS` (PB14/PB15) is the high-speed-capable core, but only with an external
+ULPI PHY; we use its internal PHY, which is full speed. Real high speed would
+cut the packet quantum from 48 frames to 6 and take end-to-end well under a
+millisecond, but it needs a PHY chip on a PCB.
+
+Given that, the onboard connector's VBUS decides it: it is hardwired to the +5V
+rail with no protection, so whatever is plugged in there powers the board. Car
+on the onboard port means the car powers the bridge and the phone's VBUS stays
+disconnected. Phone there instead would drain the phone, leave the bridge dead
+whenever the phone is unplugged, and offer no way to feed car power in without
+bridging the two hosts' rails.
+
+The one argument the other way is capacity — the busier device is on the smaller
+core:
+
+| Core | Endpoints | FIFO | Carries |
+|---|---|---|---|
+| OTG_FS | 4 | 1.25 KB | TeslaMic: EP0 + iso IN (196 B) + HID IN |
+| OTG_HS | 6 | 4 KB | speaker: EP0 + iso OUT |
+
+Three of four endpoints fits, and if the FIFO does not, embassy panics at init —
+a loud failure on the bench, not a subtle artifact in the car. If that happens,
+the fix is to swap the ports *and* cut the onboard VBUS trace. Do not take on the
+power problem pre-emptively.
+
 ## Build
 
 ```sh
