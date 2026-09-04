@@ -545,6 +545,15 @@ async fn capture(
     let mut pio_hits = 0u32;
     // Blocks since the last publish. Publishing lags deliberately — see below.
     let mut publish_ticks = 0u32;
+    // Consecutive blocks for which the stream has been settled. The gate is a
+    // dwell, not an instant: "settled" is true the moment the level first lands
+    // in the deadband, which on a freshly opened stream is while the USB stack
+    // is still configuring endpoints and the capture task is waiting its turn
+    // for the CPU. Counting from that instant attributes the opening of the
+    // stream to the stream itself, which is what every code this latch has shown
+    // turned out to be.
+    let mut settled_blocks = 0u32;
+    const SETTLED_DWELL: u32 = 3 * (teslamic::SAMPLE_RATE as usize / I2S_BLOCK) as u32;
     const PUBLISH_EVERY: u32 = (teslamic::SAMPLE_RATE as usize / I2S_BLOCK) as u32;
 
     #[cfg(feature = "clock-locked")]
@@ -584,10 +593,15 @@ async fn capture(
             hit
         };
 
-        // One gate for every counter below: the stream is open AND the pacer
-        // has the level under control. See `SETTLED`.
-        let streaming =
-            STREAMING.load(Ordering::Relaxed) && SETTLED.load(Ordering::Relaxed);
+        // One gate for every counter below: the stream is open, the pacer has
+        // the level under control, and it has stayed that way for a few seconds.
+        // See `SETTLED` and `settled_blocks`.
+        if STREAMING.load(Ordering::Relaxed) && SETTLED.load(Ordering::Relaxed) {
+            settled_blocks = settled_blocks.saturating_add(1);
+        } else {
+            settled_blocks = 0;
+        }
+        let streaming = settled_blocks >= SETTLED_DWELL;
 
         // Hand the previous block to the pipe while the DMA fills the next one.
         if have_work {
