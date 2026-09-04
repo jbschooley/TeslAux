@@ -246,6 +246,25 @@ impl<const N: usize> Pipe<N> {
         true
     }
 
+    /// Discard the oldest frames until the level is back at target.
+    ///
+    /// For use when a stream starts or restarts. Nothing drains the pipe while
+    /// the host sits on alt 0, so it pegs at capacity; the pacer then sheds only
+    /// one frame per packet and *stops as soon as the level is inside the
+    /// deadband*, so it never returns to target. The level parks at the deadband
+    /// edge and stays there for the rest of the session, carrying extra latency
+    /// that depends on nothing but the order things were plugged in — and the
+    /// first thing the host hears is a backlog rather than live audio.
+    ///
+    /// Dropping it in one step is a single splice, at the one moment the stream
+    /// is starting anyway. Not counted as overruns: this is deliberate.
+    pub fn trim_to_target(&mut self) {
+        while self.len > self.target {
+            self.tail = (self.tail + 1) % N;
+            self.len -= 1;
+        }
+    }
+
     /// Push interleaved stereo samples straight from an I2S DMA buffer.
     /// An odd trailing sample is ignored.
     pub fn push_interleaved(&mut self, samples: &[i16]) {
@@ -694,6 +713,33 @@ mod tests {
         assert_eq!(p.plan_batch(64, PaceMode::Elastic), 65);
         // Locked mode never corrects, however far off it is.
         assert_eq!(p.plan_batch(64, PaceMode::Locked), 64);
+    }
+
+    #[test]
+    fn trim_drops_a_backlog_and_keeps_the_newest() {
+        let mut p = Pipe::<512>::new(48000);
+        // Fill past target, as an alt-0 period does.
+        for i in 0..512 {
+            p.push([i as i16, i as i16]);
+        }
+        assert_eq!(p.off_target(), 512 - p.target() as i32);
+        p.trim_to_target();
+        assert_eq!(p.off_target(), 0, "trim did not reach target");
+        // The oldest go, so what remains is the most recent audio.
+        assert_eq!(p.pop(), [256, 256], "trim kept the wrong end");
+        // Deliberate, so not counted as a fault.
+        assert_eq!(p.stats.overruns, 0, "trim counted as overruns");
+    }
+
+    #[test]
+    fn trim_is_a_no_op_below_target() {
+        let mut p = Pipe::<512>::new(48000);
+        for _ in 0..10 {
+            p.push([1, 1]);
+        }
+        let before = p.off_target();
+        p.trim_to_target();
+        assert_eq!(p.off_target(), before, "trim removed frames it should not have");
     }
 
     #[test]
