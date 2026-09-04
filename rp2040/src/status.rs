@@ -106,6 +106,7 @@ mod imp {
             State::Report(2) => RGB8::new(0, 6, 16),  // I2S link: blue
             State::Report(3) => RGB8::new(10, 0, 14), // rate change: purple
             State::Report(4) => RGB8::new(16, 0, 0),  // buffer over/underrun: red
+            State::Report(6) => RGB8::new(0, 12, 12), // level ran too empty: cyan
             _ => RGB8::new(14, 14, 14),               // PIO overflow: white
         }
     }

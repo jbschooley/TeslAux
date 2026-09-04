@@ -278,6 +278,11 @@ mod faults {
     /// the pacer doing its job; what predicts a dropout is the level drifting
     /// toward an end of the cushion.
     pub static PEAK_OFF: AtomicU32 = AtomicU32::new(0);
+    /// Same, but only excursions toward a **full** buffer. Split from
+    /// [`PEAK_OFF`] because the two have opposite causes — too full means the
+    /// source is outrunning the car or the stream just restarted after alt 0,
+    /// too empty means the opposite — and a single number cannot say which.
+    pub static PEAK_HIGH: AtomicU32 = AtomicU32::new(0);
     /// Buffer ran dry or overflowed, likewise sampled from the pipe. The
     /// cushion was not big enough.
     pub static STARVED: AtomicU32 = AtomicU32::new(0);
@@ -315,8 +320,12 @@ mod faults {
             Some(3)
         } else if I2S_STALLS.load(Ordering::Relaxed) > 0 {
             Some(2)
-        } else if PEAK_OFF.load(Ordering::Relaxed) > super::PEAK_WARN as u32 {
+        } else if PEAK_HIGH.load(Ordering::Relaxed) > super::PEAK_WARN as u32 {
+            // Buffer ran too FULL.
             Some(1)
+        } else if PEAK_OFF.load(Ordering::Relaxed) > super::PEAK_WARN as u32 {
+            // Buffer ran too EMPTY.
+            Some(6)
         } else {
             None
         }
@@ -636,8 +645,13 @@ async fn capture(
         }
         if settled && streaming {
             let mag = off.unsigned_abs();
-            if mag > faults::PEAK_OFF.load(Ordering::Relaxed) {
-                faults::PEAK_OFF.store(mag, Ordering::Relaxed);
+            let slot = if off > 0 {
+                &faults::PEAK_HIGH
+            } else {
+                &faults::PEAK_OFF
+            };
+            if mag > slot.load(Ordering::Relaxed) {
+                slot.store(mag, Ordering::Relaxed);
             }
         }
         faults::STARVED.store(
@@ -719,6 +733,16 @@ async fn pump(
 
     loop {
         iso_in.wait_enabled().await;
+
+        // Start the rate measurement afresh. The detector counts captured I2S
+        // frames against USB frames, and USB frames only tick while the pump is
+        // writing — so across a gap it holds a large capture count against no
+        // frames at all, and its first window after the stream reopens reports
+        // an absurd rate. That failed to classify, which muted audio for a
+        // second every single time the host selected alt 1.
+        detect = RateDetect::new(1000);
+        last_captured = CAPTURED.load(Ordering::Relaxed);
+        MUTED.store(false, Ordering::Relaxed);
 
         // The car toggles AudioStreaming alt1/alt0 constantly (seen in the
         // on-screen USB spy capture), so do NOT tear anything down when the
