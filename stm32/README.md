@@ -67,9 +67,12 @@ A-to-C cable, they are missing and the car will not power it.
 ## Build
 
 ```sh
-cargo build --release                        # ring 512, 5.33 ms cushion
-cargo build --release --features low-latency # ring 256, 2.67 ms cushion
+cargo build --release
 ```
+
+No feature flags. The two-board build has them because its cushion is a guess
+that different situations want sized differently; here the cushion is measured,
+so there is one configuration.
 
 ## Flash
 
@@ -107,37 +110,62 @@ live status. Park, unplug the phone, and count:
 
 | Blinks | Cause |
 |---|---|
-| 1 | more than 8 pacer slips |
+| 1 | buffer wandered past half the cushion — margin being used up |
 | 2 | the phone's stream dropped mid-run |
 | 3 | buffer over/underran — the cushion was too small |
 
+Code 1 reports **peak excursion**, not a count of corrections. Corrections here
+are lossless packet-size changes and are supposed to happen; counting them would
+flag healthy operation as a fault. What predicts a dropout is the level drifting
+toward the end of its cushion, so that is what gets reported.
+
 ## Latency
 
-Computed from the constants, not measured:
+Computed from the constants, not measured end to end:
 
 | Stage | ms |
 |---|---:|
 | Phone USB OUT, 1 ms frame quantisation | 1.00 |
-| Pipe cushion (`RING`/2 frames at 48 kHz) | 5.33 (2.67 with `low-latency`) |
+| Pipe cushion (128 frames at 48 kHz) | 2.67 |
 | Car USB IN, 1 ms frame quantisation | 1.00 |
-| **Total** | **≈7.3** (**≈4.7**) |
+| **Total** | **≈4.7** |
 
 against ≈8.0 ms for the two-board rig. The two 1 ms terms are irreducible at
 full speed.
 
-**The cushion is the whole spread, and it is set by the phone, not the chip.**
-The producer here is a 48-frame USB packet from the host, and hosts bunch
-packets; on the RP2040 car board the producer was a 16-frame I2S DMA block. So
-collapsing two boards into one removes an entire cushion but does not shrink the
-one that remains. `HYSTERESIS = 192` is the figure the RP2040 source board runs
-and has been proven with an iPhone. `low-latency` drops it to 64, which the
-measured peak excursion (<64 frames, from the `MEASURE` build) suggests is
-reachable — but that was measured with the I2S chain in place, so **run
-`source-MEASURE` against your own phone before trusting it.**
+The cushion is set by the phone, not the chip: the producer is a 48-frame USB
+packet and hosts bunch several together. `RING = 256` comes from the
+`measure-excursion` build on the RP2040 source board, which stayed green — peak
+excursion under 64 frames — for a full session with an iPhone and again with an
+Android. The cushion is twice that.
 
-The deadband rule that was violated three times during the RP2040 bring-up — the
-deadband must exceed the producer's burst, and both must fit in the cushion — is
-now a `const` assertion in `main.rs`, checked at compile time.
+## Why this is simpler than the two-board build
+
+Removing the I2S link removes more than the wire.
+
+**No lossy corrections, ever.** The pipe has two ways to absorb a clock
+difference. `plan_batch()` varies how many frames go in the next packet — free,
+lossless, invisible. `slip()` duplicates or discards a frame — a real
+discontinuity whose size scales with the sample value, which is why loud bass
+was where it was audible. `slip()` exists for a sink whose rate cannot be
+varied, i.e. a fixed I2S clock, and it is called only from the RP2040 source
+board for exactly that reason. **This design has no fixed-rate sink**, so the
+only consumer is the car's iso IN endpoint whose packet size we choose, and
+`slip()` is never reached.
+
+That is also why the deadband can be tight here without the caution the source
+board needs: correcting often costs a byte rather than a click.
+
+What else went away, and why it was only ever there for the link:
+
+| Gone | Was for |
+|---|---|
+| PIO I2S driver, pull-downs, DMA timeout | driving and receiving the wire |
+| One of two ring buffers | each board needed its own |
+| Clock-steering control loop | pulling the I2S clock onto the host's |
+| `RateDetect` + watchdog-scratch re-enumeration | a PCM2706 upstream could pick any rate |
+| Two of three clock domains | phone, I2S, car — now just phone and car |
+| `slip()` | a fixed-rate I2S sink |
 
 ## Shared code
 

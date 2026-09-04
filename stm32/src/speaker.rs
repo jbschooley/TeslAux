@@ -13,9 +13,10 @@ use embassy_usb::descriptor::{SynchronizationType, UsageType};
 use embassy_usb::driver::Driver;
 use embassy_usb::{Builder, Config, Handler, UsbVersion};
 
-/// One rate, and only one. The car is stereo-48k, so advertising anything else
-/// to the phone would only create a rate we then have to refuse downstream.
-pub const RATE: u32 = 48_000;
+/// One rate, and only one, and it is the car's — advertising anything else to
+/// the phone would only create a rate we then have to refuse downstream. Taken
+/// from `teslamic` rather than restated, so the two ends cannot disagree.
+pub const RATE: u32 = crate::teslamic::SAMPLE_RATE;
 pub const CHANNELS: usize = 2;
 /// 48 frames * 2ch * 2B.
 pub const BYTES_PER_FRAME: usize = 192;

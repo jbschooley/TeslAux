@@ -65,26 +65,33 @@ use teslamic::{If3Handler, KeyboardHandler};
 
 /// Frames in one USB packet at 48 kHz. This is the producer's burst size, and
 /// the deadband below has to exceed it.
-const FRAMES_PER_PACKET: usize = (speaker::RATE / 1000) as usize;
+const FRAMES_PER_PACKET: usize = (teslamic::SAMPLE_RATE / 1000) as usize;
 
 /// Ring capacity in frames. The pipe steers toward `RING / 2`, so half of this
-/// is the steady-state latency: 256 frames = 5.33 ms at 48 kHz.
+/// is the steady-state latency: 128 frames = 2.67 ms at 48 kHz.
 ///
-/// Sized by the phone, not by the chip. The producer is a USB packet from the
-/// host — 48 frames, and hosts bunch several together — where on the RP2040 car
-/// board the producer was a 16-frame I2S DMA block. So collapsing two boards
-/// into one removes a whole cushion but does not shrink the remaining one.
-#[cfg(not(feature = "low-latency"))]
-const RING: usize = 512;
-#[cfg(feature = "low-latency")]
+/// **Sized from measurement, not inference.** The `measure-excursion` build on
+/// the RP2040 source board reported peak buffer excursion under 64 frames for a
+/// whole session with an iPhone and again with an Android. The cushion is twice
+/// that, which is the margin that actually prevents dropouts.
+///
+/// There is deliberately no "low latency" variant. On the two-board rig the
+/// cushion was a guess with a safety factor bolted on, so a second, tighter
+/// build made sense; here the number is measured, and a single configuration is
+/// one less thing to get wrong.
 const RING: usize = 256;
 
-/// Slip deadband. 192 = four USB frames, tolerating a host that bunches up to
-/// three packets; this is the figure the RP2040 source board runs and has been
-/// proven with an iPhone.
-#[cfg(not(feature = "low-latency"))]
-const HYSTERESIS: usize = 192;
-#[cfg(feature = "low-latency")]
+/// Deadband: how far off target the level must drift before the packet size
+/// changes. Must exceed the measured excursion, or corrections fire on sampling
+/// phase rather than on real drift.
+///
+/// A tight deadband is safe *here* in a way it was not on the source board.
+/// There the consumer was a fixed I2S clock, so correcting meant `slip()` —
+/// duplicating or discarding a frame, a real discontinuity that scales with
+/// sample value and was audible on bass. This design has no fixed-rate sink at
+/// all: the only consumer is the car's iso IN endpoint, whose packet size we
+/// choose, so every correction is `plan_batch()` and is lossless. Correcting
+/// often costs nothing but a byte.
 const HYSTERESIS: usize = 64;
 
 /// The rule that was violated three separate times during the RP2040 bring-up:
@@ -101,6 +108,12 @@ const _: () = {
         HYSTERESIS + FRAMES_PER_PACKET < RING / 2,
         "deadband plus one producer burst does not fit in the cushion; grow RING"
     );
+    // The cushion is what prevents dropouts, so it carries the safety factor:
+    // at least 2x the deadband, i.e. 2x the excursion we expect to see.
+    assert!(
+        RING / 2 >= 2 * HYSTERESIS,
+        "cushion has under 2x margin over the deadband; grow RING"
+    );
 };
 
 /// Elastic: absorb the phone-vs-car clock difference by varying how many frames
@@ -110,7 +123,7 @@ const MODE: PaceMode = PaceMode::Elastic;
 
 static PIPE: Mutex<CriticalSectionRawMutex, RefCell<Pipe<RING>>> =
     Mutex::new(RefCell::new(Pipe::new_with_hysteresis(
-        speaker::RATE,
+        teslamic::SAMPLE_RATE,
         HYSTERESIS,
     )));
 
@@ -129,8 +142,14 @@ static OVERSIZE: AtomicBool = AtomicBool::new(false);
 mod faults {
     use core::sync::atomic::{AtomicU32, Ordering};
 
-    /// Pacer corrected drift, sampled from the pipe's own counters.
-    pub static SLIPS: AtomicU32 = AtomicU32::new(0);
+    /// Largest |off_target| seen while streaming, in frames.
+    ///
+    /// This, not the correction count, is what predicts a dropout. Corrections
+    /// here are lossless packet-size changes and are supposed to happen; a
+    /// buffer wandering toward the end of its cushion is the thing that
+    /// eventually runs dry. The `measure-excursion` build put this under 64 on
+    /// both an iPhone and an Android, against a cushion of 128.
+    pub static PEAK_OFF: AtomicU32 = AtomicU32::new(0);
     /// The phone's stream went away mid-run.
     pub static SOURCE_DROPS: AtomicU32 = AtomicU32::new(0);
     /// Buffer ran dry or overflowed; the cushion was not big enough.
@@ -150,7 +169,9 @@ mod faults {
             Some(3)
         } else if SOURCE_DROPS.load(Ordering::Relaxed) > 1 {
             Some(2)
-        } else if SLIPS.load(Ordering::Relaxed) > 8 {
+        } else if PEAK_OFF.load(Ordering::Relaxed) > (super::RING / 4) as u32 {
+            // Past half the cushion. Nothing has gone wrong yet, but the margin
+            // that measurement established is being used up.
             Some(1)
         } else {
             None
@@ -294,7 +315,7 @@ async fn main(spawner: Spawner) {
             kbd,
             if3,
             teslamic::BYTES_PER_FRAME_ELASTIC as u16,
-            speaker::RATE,
+            teslamic::SAMPLE_RATE,
         );
         spawner.spawn(usb_car_task(builder.build()).unwrap());
         ep
@@ -396,9 +417,15 @@ async fn pump(mut iso_in: impl EndpointIn) -> ! {
             // exactly, so the LED and the pipe can never disagree.
             frames = frames.wrapping_add(1);
             if frames % 1000 == 0 {
-                let st = PIPE.lock(|p| p.borrow().stats);
-                faults::SLIPS.store(st.adj_up + st.adj_down, Ordering::Relaxed);
+                let (st, off) = PIPE.lock(|p| {
+                    let pipe = p.borrow();
+                    (pipe.stats, pipe.off_target())
+                });
                 faults::STARVED.store(st.overruns + st.underruns, Ordering::Relaxed);
+                let mag = off.unsigned_abs();
+                if mag > faults::PEAK_OFF.load(Ordering::Relaxed) {
+                    faults::PEAK_OFF.store(mag, Ordering::Relaxed);
+                }
             }
         }
     }

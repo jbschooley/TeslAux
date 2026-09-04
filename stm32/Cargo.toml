@@ -11,18 +11,9 @@ description = "Single-chip TeslAux bridge: phone and car both attach to one STM3
 name = "bridge"
 path = "src/main.rs"
 
-[features]
-default = []
-# Halve the cushion: ring 256 (2.67 ms) with a 64-frame deadband, instead of
-# ring 512 (5.33 ms) with 192.
-#
-# The deadband is set by how much the PHONE bunches packets, not by the chip.
-# The default 192 is the figure the RP2040 source board uses and has been proven
-# with an iPhone; 64 is the tighter bound that the measured peak excursion
-# (<64 frames, from the MEASURE build) suggests is reachable. Measure before
-# trusting it: this is the one number that decides whether the single-chip
-# design lands near 4.7 ms or near 7.3 ms end to end.
-low-latency = []
+# No feature flags. The two-board build needs them because its cushion is a
+# guess that different situations want sized differently; here the cushion is
+# measured, so there is one configuration.
 
 [dependencies]
 # embassy-usb is the same 0.6 the RP2040 build uses, which is why
