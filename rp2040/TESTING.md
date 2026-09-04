@@ -379,7 +379,32 @@ gained or lost in between — so the pacing is doing its job and a discard is a
 discrete event somewhere, not drift. A clock problem in the bridge would show as
 a steady ramp instead.
 
-### Measured result, 2026-09-04
+### BIT-EXACT, 2026-09-04
+
+The full chain — Android (USB Audio Player Pro, bit-perfect) -> source RP2040 ->
+I2S -> car RP2040 -> USB -> Mac, recorded in the DAW at **32-bit float** — was
+compared against the file on the phone:
+
+```
+max fractional error: 0.0
+compared 2,784,000 frames (58.0 s)
+PASS  bit-exact: every sample matches
+```
+
+Every sample arrived identical. No loss, no repetition, no drift, no rescaling,
+correct channel mapping, correct frame alignment.
+
+Three things had to be right at once, and each was found by this test after
+looking fine by every other measure:
+
+* the pipe must not pace an unprimed buffer (it was emitting short packets)
+* the capture must re-establish frame alignment before the first DMA (frames
+  were being rotated by one sample, which no counter can see)
+* the DAW must record 32-bit float — recording 16-bit adds a truncating
+  conversion that leaves ~9% of samples one LSB low, which is inaudible and has
+  nothing to do with the bridge
+
+### Earlier result, 2026-09-04
 
 A 60 s bit-comparison through the two-board rig (Android -> source -> I2S ->
 car -> Mac) came back **lossless**: 2,880,000 frames with no splice, no dropped
