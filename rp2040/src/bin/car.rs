@@ -730,6 +730,15 @@ async fn pump(
         last_captured = CAPTURED.load(Ordering::Relaxed);
         MUTED.store(false, Ordering::Relaxed);
 
+        // Drop whatever piled up while nobody was listening. Nothing drains the
+        // pipe on alt 0, so it pegs at capacity, and the pacer would shed that
+        // one frame per packet — stopping as soon as the level is inside the
+        // deadband, so it never gets back to target. The result was latency that
+        // depended on the order things were plugged in, and a backlog played out
+        // before live audio.
+        PIPE.lock(|p| p.borrow_mut().trim_to_target());
+        settled = false;
+
         // The car toggles AudioStreaming alt1/alt0 constantly (seen in the
         // on-screen USB spy capture), so do NOT tear anything down when the
         // stream goes idle — just stop writing and wait to be re-enabled.
