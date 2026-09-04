@@ -175,7 +175,19 @@ unplug the phone, and read the blink code:
 | 3 | purple | re-enumerated at a new rate | source changed sample rate mid-drive |
 | 4 | red | buffer over/underran | cushion too small for the observed drift |
 
-Codes 2 and 4 are individually audible. Code 2 pointing at a mechanical fault is
+**A stall is counted only when the link comes back.** A stall that never
+recovers is just you unplugging the phone to read the report, and one before the
+first capture is this board powering up before the source — neither is a fault.
+Counting stalls as they happen would also climb without limit, because the
+capture timeout re-fires every 250 ms for as long as the source is absent. So
+code 2 means the link dropped **and returned mid-drive**, which is the glitch you
+would have heard.
+
+Codes 2 and 4 are individually audible.
+
+One limit worth knowing: a rate change (code 3) re-enumerates via a watchdog
+reset, which clears RAM. Only the rate-change tally survives, carried in the
+scratch registers; any slip or stall counts from before it are lost. Code 2 pointing at a mechanical fault is
 the case a PCB fixes; the others are firmware and would follow the design onto
 any new board.
 

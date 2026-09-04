@@ -429,6 +429,9 @@ async fn capture(
     let mut raw = [0u32; I2S_BLOCK * 2];
     let mut dma = dma;
     let mut last_block = Instant::now();
+    // Stall bookkeeping. A stall is only worth reporting if the link came
+    // *back* — see the counting rule where these are used.
+    let (mut was_live, mut pending_stall) = (false, false);
     #[cfg(feature = "clock-locked")]
     let (mut win_sofs, mut last_sof) =
         (0u32, USB_FRAMES.load(core::sync::atomic::Ordering::Relaxed));
@@ -450,7 +453,21 @@ async fn capture(
             // comes back.
             PIPE.lock(|p| p.borrow_mut().reset());
             SOURCE_LIVE.store(false, Ordering::Relaxed);
-            faults::bump(&faults::I2S_STALLS);
+            // Note the stall; do NOT count it yet. Counting here would make the
+            // number meaningless three separate ways: this branch re-fires every
+            // 250 ms for as long as the source is absent, so it would climb
+            // without limit rather than reaching 1; it fires at boot whenever
+            // this board powers up before the source; and it fires when you
+            // unplug the phone at the end, which is how you ASK to read the
+            // report. Every run would show a stall.
+            //
+            // A stall is only evidence of a fault if the link came back — that
+            // is the mid-drive dropout you would have heard. One that never
+            // recovers is just the session ending.
+            if was_live {
+                pending_stall = true;
+                was_live = false;
+            }
             continue;
         }
         let now = Instant::now();
@@ -463,6 +480,12 @@ async fn capture(
         }
         last_block = now;
         SOURCE_LIVE.store(true, Ordering::Relaxed);
+        // The link recovered, so the stall that preceded it was real.
+        if pending_stall {
+            faults::bump(&faults::I2S_STALLS);
+            pending_stall = false;
+        }
+        was_live = true;
 
         // ── SOF-locked clock trim (clock-locked build only) ─────────────────
         // Steer the PIO divider so the I2S clock becomes a division of the
