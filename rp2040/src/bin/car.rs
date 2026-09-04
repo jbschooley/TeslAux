@@ -439,6 +439,16 @@ async fn capture(
     // Each PIO push is one 16-bit sample in the low half of a word; a block is
     // I2S_BLOCK stereo frames.
     let mut raw = [0u32; I2S_BLOCK * 2];
+    // Double buffer. `raw` is what the DMA is filling right now; `work` is the
+    // block we hand to the pipe, so the two never contend.
+    //
+    // The FIFO is only 8 words deep — about 83 us at 48 kHz — and `slave_rx`
+    // pushes with `noblock`, so anything arriving while no DMA is armed is
+    // silently discarded. Doing the pipe push and the bookkeeping *before*
+    // awaiting means all of it overlaps a running transfer, and the window
+    // where the FIFO is unattended shrinks to a memcpy plus the DMA setup.
+    let mut work = [0u32; I2S_BLOCK * 2];
+    let mut have_work = false;
     let mut dma = dma;
     let mut last_block = Instant::now();
     // Stall bookkeeping. A stall is only worth reporting if the link came
@@ -457,13 +467,41 @@ async fn capture(
         // a timeout this task blocks forever and the pipe keeps whatever it last
         // held — which the pump then streams to the car as DC, or as noise if
         // the floating inputs picked any up.
-        if embassy_time::with_timeout(
-            Duration::from_millis(250),
-            sm.rx().dma_pull(dma.reborrow(), &mut raw, false),
-        )
-        .await
-        .is_err()
+        // Arm the next transfer FIRST. Everything below runs while it is in
+        // flight, so the FIFO always has somewhere to go.
+        let xfer = sm.rx().dma_pull(dma.reborrow(), &mut raw, false);
+
+        // Hand the previous block to the pipe while the DMA fills the next one.
+        if have_work {
+            // `RXSTALL` latches on a push to a full RX FIFO, which for
+            // `push noblock` means a sample was discarded. Read and clear it
+            // each block, so this counts blocks that lost data.
+            use embassy_rp::pac;
+            let fdebug = pac::PIO0.fdebug();
+            if fdebug.read().rxstall() & 1 != 0 {
+                faults::bump(&faults::PIO_OVERFLOW);
+                let mut clear = pac::pio::regs::Fdebug(0);
+                clear.set_rxstall(1);
+                fdebug.write_value(clear);
+            }
+
+            PIPE.lock(|p| {
+                let mut pipe = p.borrow_mut();
+                for f in work.chunks_exact(2) {
+                    pipe.push([f[0] as u16 as i16, f[1] as u16 as i16]);
+                }
+            });
+            CAPTURED.store(
+                CAPTURED.load(Ordering::Relaxed).wrapping_add(I2S_BLOCK as u32),
+                Ordering::Relaxed,
+            );
+        }
+
+        if embassy_time::with_timeout(Duration::from_millis(250), xfer)
+            .await
+            .is_err()
         {
+            have_work = false;
             // Source gone. Reset clears the held sample to zero and un-primes,
             // so the pump emits real silence and re-primes cleanly when audio
             // comes back.
@@ -572,31 +610,10 @@ async fn capture(
             }
         }
 
-        // Did the FIFO overflow while we were away from it? `RXSTALL` latches
-        // on a push to a full RX FIFO, which for `push noblock` means a sample
-        // was discarded. Read and clear it every block, so the count is of
-        // blocks that lost data rather than of samples.
-        {
-            use embassy_rp::pac;
-            let fdebug = pac::PIO0.fdebug();
-            if fdebug.read().rxstall() & 1 != 0 {
-                faults::bump(&faults::PIO_OVERFLOW);
-                let mut clear = pac::pio::regs::Fdebug(0);
-                clear.set_rxstall(1);
-                fdebug.write_value(clear);
-            }
-        }
-
-        PIPE.lock(|p| {
-            let mut pipe = p.borrow_mut();
-            for f in raw.chunks_exact(2) {
-                pipe.push([f[0] as u16 as i16, f[1] as u16 as i16]);
-            }
-        });
-        CAPTURED.store(
-            CAPTURED.load(Ordering::Relaxed).wrapping_add(I2S_BLOCK as u32),
-            Ordering::Relaxed,
-        );
+        // Take a copy so the next transfer can start immediately; the push
+        // itself happens at the top of the next iteration, overlapping it.
+        work.copy_from_slice(&raw);
+        have_work = true;
     }
 }
 

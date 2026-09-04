@@ -193,9 +193,12 @@ only the 8-word FIFO — about 83 us at 48 kHz — is holding the stream. The `p
 task takes `PIPE` under a critical section in that window, and USB interrupts
 land in it too.
 
-If code 5 ever appears, the fix is double-buffering the capture DMA, which is
-the same fix the nRF firmware needed for the same reason. If it never appears
-across a long run, this hypothesis is closed and the artifact is elsewhere.
+**Code 5 was observed on a real run**, which is what prompted double-buffering
+the capture: the next DMA is now armed before the pipe push and the bookkeeping,
+so all of that overlaps a running transfer and the unattended window shrinks from
+the whole processing pass to a memcpy plus DMA setup. The counter is kept, so a
+clean run now *is* the evidence that the fix worked. This is the same fix the
+nRF firmware needed, for the same reason.
 
 Codes 2 and 4 are individually audible.
 
