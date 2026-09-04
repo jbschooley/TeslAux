@@ -196,6 +196,13 @@ What else went away, and why it was only ever there for the link:
 | Two of three clock domains | phone, I2S, car — now just phone and car |
 | `slip()` | a fixed-rate I2S sink |
 
+## Going faster
+
+≈4.7 ms is the full-speed floor, not a conservative choice — see
+[../HARDWARE.md](../HARDWARE.md) for the high-speed alternatives (STM32F72x with
+an integrated PHY, i.MX RT1062 with two of them) and for why Tesla's own ~100 ms
+makes none of them worth doing yet.
+
 ## Shared code
 
 `audio_pipe.rs` and `teslamic.rs` are compiled straight out of `../rp2040/src/`

@@ -177,6 +177,10 @@ holder, and `tools/uf2conv.py`, from Microsoft's uf2 project.
 "Tesla", "TeslaMic" and "CaraokeMic" are trademarks of Tesla, Inc. This project
 is independent and not affiliated with or endorsed by Tesla.
 
+See [HARDWARE.md](HARDWARE.md) for why the bridge needs two USB device
+controllers, what that rules out, and the high-speed options worth revisiting if
+Tesla's own ~100 ms delay is ever fixed.
+
 ## Single-chip variant (experimental)
 
 `stm32/` holds a port to one STM32F407, which has two USB device controllers and
