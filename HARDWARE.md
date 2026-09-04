@@ -113,6 +113,38 @@ TI AM335x (PocketBeagle) and Rockchip RK3399 both have two USB OTG controllers.
 Different project shape entirely — USB gadget mode, a kernel scheduler between
 you and the audio, and a boot time. Noted for completeness, not recommended.
 
+## Crystals: do not over-spec them
+
+A natural assumption is that the F407's 8 MHz crystal is what makes the
+single-chip build clean, and that the RP2040 needed workarounds because of its
+oscillator. Neither is true, and acting on it would waste money on a PCB.
+
+Both chips already derive an **exact** 48 MHz USB clock: 8 MHz on the F407 via
+`PLLQ` (8/4*168/7), and 12 MHz on the RP2040 (12*4) from its own USB PLL. The
+RP2040 crystal is not even a choice — the ROM bootloader requires 12 MHz.
+Neither chip has ever had a USB clock problem.
+
+The RP2040 workarounds were about a different clock entirely: the **I2S sample
+clock**. Its PIO divider is 8.8 fixed point, so at the default 125 MHz sysclk
+48 kHz quantises to 48003.07 Hz — a systematic +64 ppm, ~3.1 slips/sec forever,
+audible as crustiness on loud bass because a slip's discontinuity scales with
+sample value. Running at 124.8 MHz makes the divider land exactly. `source.rs`
+says it outright: *"USB is unaffected — it runs from its own PLL."*
+
+**The single-chip build needs none of that because it never synthesizes an audio
+clock.** No I2S, no divider, no quantisation — audio moves by memcpy between two
+USB endpoints, and the crystal only clocks the CPU and the transceivers.
+
+So for a PCB: any oscillator with an integer path to 48 MHz is sufficient, and a
+TCXO buys nothing. It would not help with the one clock difference that does
+remain — the phone's crystal against the car's — because that is inherent to
+bridging two independent hosts and is absorbed by varying the packet size.
+
+The exception is the **analog input**: driving a PCM1808 means generating an I2S
+clock again. The F4 has a dedicated `PLLI2S` with a fractional divider built for
+hitting audio rates exactly, so that is a solved problem there rather than a
+repeat of the PIO fight.
+
 ## External PHY route
 
 Any STM32 with `OTG_HS` and ULPI pins can reach true high speed with an external
