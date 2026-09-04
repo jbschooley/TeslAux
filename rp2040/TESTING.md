@@ -174,6 +174,7 @@ unplug the phone, and read the blink code:
 | 2 | blue | I2S link dropped for >250 ms | mechanical: jumpers, connector, vibration |
 | 3 | purple | re-enumerated at a new rate | source changed sample rate mid-drive |
 | 4 | red | buffer over/underran | cushion too small for the observed drift |
+| 5 | white | **PIO RX FIFO overflowed — samples silently lost** | the capture DMA is single-buffered |
 
 **A stall is counted only when the link comes back.** A stall that never
 recovers is just you unplugging the phone to read the report, and one before the
@@ -182,6 +183,19 @@ Counting stalls as they happen would also climb without limit, because the
 capture timeout re-fires every 250 ms for as long as the source is absent. So
 code 2 means the link dropped **and returned mid-drive**, which is the glitch you
 would have heard.
+
+Code 5 is the one to watch, because it is the only fault here that nothing else
+can see. `slave_rx` uses `push noblock`, so a full RX FIFO discards the sample
+instead of stalling the state machine, and downstream cannot tell the difference
+between lost samples and a source running slightly slow. The capture DMA is
+single-buffered, so between one `dma_pull` completing and the next being armed
+only the 8-word FIFO — about 83 us at 48 kHz — is holding the stream. The `pump`
+task takes `PIPE` under a critical section in that window, and USB interrupts
+land in it too.
+
+If code 5 ever appears, the fix is double-buffering the capture DMA, which is
+the same fix the nRF firmware needed for the same reason. If it never appears
+across a long run, this hypothesis is closed and the artifact is elsewhere.
 
 Codes 2 and 4 are individually audible.
 

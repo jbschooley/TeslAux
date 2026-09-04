@@ -265,6 +265,16 @@ mod faults {
     pub static STARVED: AtomicU32 = AtomicU32::new(0);
     /// Re-enumerated because the source changed sample rate. ~1 s of silence.
     pub static RATE_CHANGES: AtomicU32 = AtomicU32::new(0);
+    /// The PIO RX FIFO overflowed and samples were **silently discarded**.
+    ///
+    /// `slave_rx` uses `push noblock`, so a full FIFO drops the sample rather
+    /// than stalling the state machine, and nothing downstream can tell: the
+    /// pipe simply receives fewer frames, which looks like the source running
+    /// slow rather than like loss. The capture DMA is single-buffered, so there
+    /// is a window between one `dma_pull` completing and the next being armed
+    /// during which only the 8-word FIFO (~83 us at 48 kHz) is holding the
+    /// stream. This counts what that window costs.
+    pub static PIO_OVERFLOW: AtomicU32 = AtomicU32::new(0);
 
     /// Plain load/store: thumbv6m has no atomic read-modify-write, and each of
     /// these has a single writer.
@@ -279,7 +289,9 @@ mod faults {
     /// is not worth reporting, so that one has a threshold; the rest are
     /// individually audible and are reported on first occurrence.
     pub fn worst() -> Option<u8> {
-        if STARVED.load(Ordering::Relaxed) > 0 {
+        if PIO_OVERFLOW.load(Ordering::Relaxed) > 0 {
+            Some(5)
+        } else if STARVED.load(Ordering::Relaxed) > 0 {
             Some(4)
         } else if RATE_CHANGES.load(Ordering::Relaxed) > 0 {
             Some(3)
@@ -557,6 +569,21 @@ async fn capture(
                     embassy_rp::clocks::clk_sys_freq(),
                     cmd as u64,
                 );
+            }
+        }
+
+        // Did the FIFO overflow while we were away from it? `RXSTALL` latches
+        // on a push to a full RX FIFO, which for `push noblock` means a sample
+        // was discarded. Read and clear it every block, so the count is of
+        // blocks that lost data rather than of samples.
+        {
+            use embassy_rp::pac;
+            let fdebug = pac::PIO0.fdebug();
+            if fdebug.read().rxstall() & 1 != 0 {
+                faults::bump(&faults::PIO_OVERFLOW);
+                let mut clear = pac::pio::regs::Fdebug(0);
+                clear.set_rxstall(1);
+                fdebug.write_value(clear);
             }
         }
 
