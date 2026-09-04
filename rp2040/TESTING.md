@@ -207,7 +207,30 @@ sustained frame loss (a 5 s capture returned 4.499 s), which destroys sample
 alignment while leaving the spectrum intact — so it looks like a bridge fault.
 `tools/record-mac.sh` is kept only as a record of that.
 
-## Result: bit-exact, 2026-09-04
+## Result: bit-exact, three consecutive cold boots
+
+Android (USB Audio Player Pro, bit-perfect) -> source RP2040 -> I2S -> car
+RP2040 -> USB -> Mac, recorded at 32-bit float, compared against the file on the
+phone. Three runs with a reset of the car board between each:
+
+```
+RUN 1  aligned 1.420 s   2,784,000 frames   PASS bit-exact
+RUN 2  aligned 1.990 s   2,784,000 frames   PASS bit-exact
+RUN 3  aligned 1.878 s   2,784,000 frames   PASS bit-exact
+```
+
+**8,352,000 frames, every one identical.** No loss, no repetition, no drift, no
+rescaling, correct channel mapping, correct frame alignment — verifying the
+elastic pacing, the I2S framing, the channel order and the clock-domain crossing
+together.
+
+Repeating across resets is the point, not thoroughness for its own sake. Frame
+alignment used to be decided by the parity of whatever sat in the RX FIFO at
+startup, so roughly half of boots were rotated and a single pass proved only
+that the coin had landed the right way up. Pushing whole frames removed the
+coin. One pass would not have shown that; three across three boots does.
+
+## Earlier single-run result, 2026-09-04
 
 Android (USB Audio Player Pro) -> source RP2040 -> I2S -> car RP2040 -> USB ->
 Mac, recorded at 32-bit float, compared against the file on the phone:

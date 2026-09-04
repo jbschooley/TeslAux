@@ -76,9 +76,9 @@ whatever sample rate it delivers; it has not been tested yet.
 
 ## Verified bit-exact
 
-The two-board rig has been measured, not just listened to: **2,784,000
-consecutive frames delivered from an Android phone to a Mac through both boards,
-identical to the source file, sample for sample.** See `rp2040/TESTING.md` for
+The two-board rig has been measured, not just listened to: **8,352,000 frames
+across three consecutive cold boots, delivered from an Android phone to a Mac
+through both boards, identical to the source file, sample for sample.** See `rp2040/TESTING.md` for
 the method and `tools/bitcompare.py` for the tool.
 
 ## What the car accepts
