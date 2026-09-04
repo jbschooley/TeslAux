@@ -158,3 +158,28 @@ thing to be wrong on first power-up; a channel-swapped or distorted signal point
 there rather than at anything in this document. `teslamic-rp-car-STRESS-TEST.uf2`
 is the exception — it generates audio internally and touches no PIO at all, so it
 is the safest first thing to flash.
+
+## Reading the car board after a drive
+
+You cannot watch an LED while driving, and "it sounded weird once or twice" does
+not distinguish a loose wire from a firmware fault — they have opposite fixes.
+The car board therefore latches the worst thing it saw since boot and reports it
+on the LED **once the source goes away**, so live status is never affected. Park,
+unplug the phone, and read the blink code:
+
+| Blinks | Colour | Meaning | Where to look |
+|---|---|---|---|
+| none (solid blue) | blue | clean run | — |
+| 1 | amber | more than 8 pacer slips | source is free-running; try `source-steered-lowlat` |
+| 2 | blue | I2S link dropped for >250 ms | mechanical: jumpers, connector, vibration |
+| 3 | purple | re-enumerated at a new rate | source changed sample rate mid-drive |
+| 4 | red | buffer over/underran | cushion too small for the observed drift |
+
+Codes 2 and 4 are individually audible. Code 2 pointing at a mechanical fault is
+the case a PCB fixes; the others are firmware and would follow the design onto
+any new board.
+
+The counts come from the pipe's own `Stats` rather than being tallied separately,
+so the LED and the pipe cannot disagree. The rate-change count is carried through
+the watchdog scratch registers, since the reset it records would otherwise clear
+it.

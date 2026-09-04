@@ -188,6 +188,7 @@ const CHANNELS_X_BYTES: usize = 4;
 /// decision across.
 fn boot_rate(wd: &mut embassy_rp::watchdog::Watchdog) -> u32 {
     if wd.get_scratch(0) == RATE_MAGIC {
+        faults::RATE_CHANGES.store(wd.get_scratch(2), core::sync::atomic::Ordering::Relaxed);
         let r = wd.get_scratch(1);
         if SUPPORTED_RATES.contains(&r) {
             return r;
@@ -243,6 +244,54 @@ static OVERSIZE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool
 /// Plain load/store: thumbv6m has no atomic read-modify-write, and the capture
 /// task is the only writer.
 static CAPTURED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Latched record of what went wrong since boot, for reading back after a
+/// drive.
+///
+/// You cannot watch an LED while driving, and "it sounded weird once or twice"
+/// does not say whether the I2S link dropped, the pacer slipped, or the buffer
+/// ran dry — which have completely different fixes. One is a loose wire, one is
+/// firmware. These latch so the answer survives until you can look.
+mod faults {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    /// I2S clock vanished for >250 ms. Mechanical: a wire, a connector, EMI.
+    pub static I2S_STALLS: AtomicU32 = AtomicU32::new(0);
+    /// Pacer corrected drift, sampled from the pipe's own counters. Expected
+    /// occasionally; frequent means the clock steering is struggling.
+    pub static SLIPS: AtomicU32 = AtomicU32::new(0);
+    /// Buffer ran dry or overflowed, likewise sampled from the pipe. The
+    /// cushion was not big enough.
+    pub static STARVED: AtomicU32 = AtomicU32::new(0);
+    /// Re-enumerated because the source changed sample rate. ~1 s of silence.
+    pub static RATE_CHANGES: AtomicU32 = AtomicU32::new(0);
+
+    /// Plain load/store: thumbv6m has no atomic read-modify-write, and each of
+    /// these has a single writer.
+    pub fn bump(c: &AtomicU32) {
+        c.store(c.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
+    }
+
+    /// Worst thing seen, most serious first, as a blink count. `None` means a
+    /// clean run.
+    ///
+    /// A handful of slips over a drive is normal for a free-running source and
+    /// is not worth reporting, so that one has a threshold; the rest are
+    /// individually audible and are reported on first occurrence.
+    pub fn worst() -> Option<u8> {
+        if STARVED.load(Ordering::Relaxed) > 0 {
+            Some(4)
+        } else if RATE_CHANGES.load(Ordering::Relaxed) > 0 {
+            Some(3)
+        } else if I2S_STALLS.load(Ordering::Relaxed) > 0 {
+            Some(2)
+        } else if SLIPS.load(Ordering::Relaxed) > 8 {
+            Some(1)
+        } else {
+            None
+        }
+    }
+}
 
 /// True while I2S frames are actually arriving.
 static SOURCE_LIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -401,6 +450,7 @@ async fn capture(
             // comes back.
             PIPE.lock(|p| p.borrow_mut().reset());
             SOURCE_LIVE.store(false, Ordering::Relaxed);
+            faults::bump(&faults::I2S_STALLS);
             continue;
         }
         let now = Instant::now();
@@ -558,6 +608,13 @@ async fn pump(
                 let c = CAPTURED.load(Ordering::Relaxed);
                 detect.on_capture(c.wrapping_sub(last_captured));
                 last_captured = c;
+
+                // Mirror the pipe's own tallies into the latch. Sampling beats
+                // counting at each site: the pipe already counts these exactly,
+                // and this way the two can never disagree.
+                let st = PIPE.lock(|p| p.borrow().stats);
+                faults::SLIPS.store(st.adj_up + st.adj_down, Ordering::Relaxed);
+                faults::STARVED.store(st.overruns + st.underruns, Ordering::Relaxed);
                 if let Some(hz) = detect.on_usb_frame() {
                     let advertised = ADVERTISED.load(Ordering::Relaxed);
                     match classify(hz) {
@@ -578,8 +635,14 @@ async fn pump(
                                 agree_count = 1;
                             }
                             if agree_count >= 3 {
+                                // Carried across the reset so the count survives
+                                // the re-enumeration it is recording.
                                 wd.set_scratch(0, RATE_MAGIC);
                                 wd.set_scratch(1, r);
+                                wd.set_scratch(
+                                    2,
+                                    faults::RATE_CHANGES.load(Ordering::Relaxed) + 1,
+                                );
                                 wd.trigger_reset();
                             }
                             MUTED.store(true, Ordering::Relaxed);
@@ -620,6 +683,10 @@ fn current_state() -> status::State {
         status::State::Fault
     } else if SOURCE_LIVE.load(Ordering::Relaxed) {
         status::State::Ok
+    } else if let Some(code) = faults::worst() {
+        // The source has gone away, so the live status has nothing to say and
+        // the LED is free to report what went wrong while you were driving.
+        status::State::Report(code)
     } else {
         status::State::Waiting
     }

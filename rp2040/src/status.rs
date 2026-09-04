@@ -18,6 +18,12 @@ pub enum State {
     Fault,
     /// Streaming, but correcting drift more than expected (source not tracking).
     Slipping,
+    /// Idle, reporting the worst fault seen since boot as a blink count.
+    ///
+    /// 1 = slips, 2 = I2S link dropped, 3 = re-enumerated at a new rate,
+    /// 4 = buffer over/underran. This only shows when no source is connected,
+    /// so it never competes with live status: you read it after the drive.
+    Report(u8),
 }
 
 #[cfg(not(feature = "rp2040-zero"))]
@@ -26,7 +32,8 @@ mod imp {
     use embassy_rp::gpio::Output;
     use embassy_time::Timer;
 
-    /// Blink codes: solid = ok, slow = waiting, fast = fault, double = slipping.
+    /// Blink codes: solid = ok, slow = waiting, fast = fault, double =
+    /// slipping, and N-blinks-then-pause for a post-drive fault report.
     pub async fn run(led: &mut Output<'static>, state: impl Fn() -> State) -> ! {
         loop {
             match state() {
@@ -51,6 +58,17 @@ mod imp {
                     }
                     Timer::after_millis(160).await;
                 }
+                State::Report(n) => {
+                    // Long gap after the group so the count can be read off
+                    // without a stopwatch.
+                    for _ in 0..n {
+                        led.set_high();
+                        Timer::after_millis(150).await;
+                        led.set_low();
+                        Timer::after_millis(150).await;
+                    }
+                    Timer::after_millis(900).await;
+                }
             }
         }
     }
@@ -73,12 +91,22 @@ mod imp {
     /// so unlike a blinking GPIO it needs no timing and no task of its own.
     /// Callable from anywhere, including the pump loop.
     pub fn set(led: &mut Ws2812<'static, PIO1, 0>, s: State) {
-        led.set(match s {
+        led.set(colour(s));
+    }
+
+    /// Steady colour for a state. `Report` blinks instead, so it maps to the
+    /// colour of the fault it is reporting and the caller does the blinking.
+    fn colour(s: State) -> RGB8 {
+        match s {
             State::Ok => RGB8::new(0, 12, 0),
             State::Waiting => RGB8::new(0, 0, 12),
             State::Fault => RGB8::new(16, 0, 0),
             State::Slipping => RGB8::new(14, 6, 0),
-        });
+            State::Report(1) => RGB8::new(14, 6, 0),  // slips: amber
+            State::Report(2) => RGB8::new(0, 6, 16),  // I2S link: blue
+            State::Report(3) => RGB8::new(10, 0, 14), // rate change: purple
+            _ => RGB8::new(16, 0, 0),                 // buffer over/underrun: red
+        }
     }
 
     pub async fn run(led: &mut Ws2812<'static, PIO1, 0>, state: impl Fn() -> State) -> ! {
@@ -87,13 +115,19 @@ mod imp {
         // task is indistinguishable from a stable state — which is exactly the
         // ambiguity that made "the LED stays at its boot colour" hard to read.
         loop {
-            let c = match state() {
-                State::Ok => RGB8::new(0, 12, 0),
-                State::Waiting => RGB8::new(0, 0, 12),
-                State::Fault => RGB8::new(16, 0, 0),
-                State::Slipping => RGB8::new(14, 6, 0),
-            };
-            led.set(c);
+            let s = state();
+            if let State::Report(n) = s {
+                let c = colour(s);
+                for _ in 0..n {
+                    led.set(c);
+                    Timer::after_millis(150).await;
+                    led.set(RGB8::new(0, 0, 0));
+                    Timer::after_millis(150).await;
+                }
+                Timer::after_millis(900).await;
+                continue;
+            }
+            led.set(colour(s));
             Timer::after_millis(200).await;
         }
     }
