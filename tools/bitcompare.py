@@ -91,7 +91,7 @@ def read_wav(path):
         print(
             f"note: {path} is float32; samples are "
             + (
-                "exact integers -> reached the recorder untouched"
+                "exact integers -> nothing after the USB device altered them"
                 if integral
                 else f"NOT integral (max fractional error {err.max():.4f}) -> "
                 "something scaled or resampled them"
@@ -291,6 +291,26 @@ def compare(ref_path, rec_path):
         print("FAIL  could not align the two files; are they the same material?")
         return 1
     off -= anchor
+    # Confirm the alignment actually means something before trusting anything
+    # built on it. Correlation always returns a peak; on music it will happily
+    # match a musically similar passage. Without this check a recording of
+    # entirely different material was reported as one unresolved splice, which
+    # reads like a firmware fault instead of "wrong file".
+    probe_n = min(48000, len(ref) // 4)
+    a = ref[len(ref) // 3 : len(ref) // 3 + probe_n, 0].astype(np.float64)
+    bstart = len(ref) // 3 + off
+    b = rec[bstart : bstart + probe_n, 0].astype(np.float64)
+    if len(b) == len(a) and a.size:
+        a = a - a.mean()
+        b = b - b.mean()
+        den = np.sqrt((a * a).sum() * (b * b).sum())
+        ncc = float((a * b).sum() / den) if den else 0.0
+        if ncc < 0.9:
+            print(f"FAIL  these are not the same audio (correlation {ncc:+.3f})")
+            print("      The recording does not contain the reference material.")
+            print("      Check that the player was playing the reference file, and")
+            print("      that the capture covers it.")
+            return 1
     print(f"aligned at frame {off} of the recording ({off / ref_rate:.3f} s)")
 
     if off < 0:
