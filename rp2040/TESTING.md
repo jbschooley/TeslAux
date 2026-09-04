@@ -194,6 +194,24 @@ deadband edge reads `HYSTERESIS + 48` and trips any threshold set relative to th
 deadband. That is what produced a false code 1 after activating the host
 mid-playback.
 
+The report is also **held back until two seconds after audio last moved**. The
+car toggles AudioStreaming alt1/alt0 constantly, so reporting the instant a
+stream stops would blink codes throughout normal driving; and it keeps the
+report from appearing during the brownout that pulling a cable causes.
+
+### Startup order in the car
+
+Whether the car opens the mic stream before or after the source starts sending
+is not under our control — ScreenMate may boot and open its USB output first.
+That used to matter for the whole drive: nothing drains the pipe until the car
+polls, so it pegged at capacity, and the pacer sheds only until the level is
+inside the deadband and then stops. The level parked at the deadband edge and
+stayed there for the session, so boot order silently set the latency.
+
+`trim_to_target()` on stream open and on poll resume removes that: the board
+returns to target whichever way round it comes up. What remains is a transient
+at startup, not a persistent state.
+
 Counts are **published with a one-second lag**, and only from a block where the
 stream is healthy. Reading this report requires unplugging the source, and that
 is a violent event: the source board browns out rather than stopping cleanly, so

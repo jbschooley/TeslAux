@@ -337,6 +337,19 @@ mod faults {
     }
 }
 
+/// Milliseconds (from boot) when audio last actually moved.
+///
+/// The report is held back until this has been quiet for a while, for two
+/// reasons. The car toggles AudioStreaming alt1/alt0 constantly, so reporting
+/// the instant a stream stops would blink codes throughout normal driving. And
+/// unplugging the source to read the report is a violent event — the source
+/// board browns out rather than stopping cleanly — so the report should not
+/// appear until well after that has passed.
+static LAST_ACTIVE_MS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// How long everything must be quiet before the LED reports the run.
+const REPORT_AFTER_MS: u32 = 2_000;
+
 /// True once the pacer has the level under control in the current stream.
 ///
 /// **The single definition of "steady state" for every fault counter here.**
@@ -625,6 +638,7 @@ async fn capture(
         }
         last_block = now;
         SOURCE_LIVE.store(true, Ordering::Relaxed);
+        LAST_ACTIVE_MS.store(now.as_millis() as u32, Ordering::Relaxed);
         // The link recovered, so the stall that preceded it was real.
         if pending_stall {
             faults::bump(&faults::I2S_STALLS);
@@ -993,6 +1007,13 @@ fn current_state() -> status::State {
         status::State::Fault
     } else if SOURCE_LIVE.load(Ordering::Relaxed) {
         status::State::Ok
+    } else if (Instant::now().as_millis() as u32)
+        .wrapping_sub(LAST_ACTIVE_MS.load(Ordering::Relaxed))
+        < REPORT_AFTER_MS
+    {
+        // Recently active. Hold off: this covers both the car's constant alt
+        // toggling and the moments just after a cable is pulled.
+        status::State::Waiting
     } else if let Some(code) = faults::worst() {
         // The source has gone away, so the live status has nothing to say and
         // the LED is free to report what went wrong while you were driving.
