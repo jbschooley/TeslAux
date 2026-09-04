@@ -337,6 +337,21 @@ mod faults {
     }
 }
 
+/// True once the pacer has the level under control in the current stream.
+///
+/// **The single definition of "steady state" for every fault counter here.**
+///
+/// Each counter added to this latch was first written to count from the moment
+/// it could, and each in turn reported nothing but a stream opening: the level
+/// shedding an alt-0 backlog, the rate detector's first window, the USB stack
+/// setting up an endpoint while the capture task waits its turn. Those are all
+/// the same condition wearing different clothes — the stream has started but has
+/// not steadied — so they get one gate rather than one workaround each.
+///
+/// Written by `pump`, which measures the level at the pacer's own sampling
+/// point; read by `capture`.
+static SETTLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// True while the pump is actually handing packets to the car.
 ///
 /// Faults are only meaningful while audio is genuinely flowing end to end.
@@ -539,7 +554,10 @@ async fn capture(
             hit
         };
 
-        let streaming = STREAMING.load(Ordering::Relaxed);
+        // One gate for every counter below: the stream is open AND the pacer
+        // has the level under control. See `SETTLED`.
+        let streaming =
+            STREAMING.load(Ordering::Relaxed) && SETTLED.load(Ordering::Relaxed);
 
         // Hand the previous block to the pipe while the DMA fills the next one.
         if have_work {
@@ -740,6 +758,8 @@ async fn pump(
         detect = RateDetect::new(1000);
         last_captured = CAPTURED.load(Ordering::Relaxed);
         MUTED.store(false, Ordering::Relaxed);
+        settled = false;
+        SETTLED.store(false, Ordering::Relaxed);
 
         // Drop whatever piled up while nobody was listening. Nothing drains the
         // pipe on alt 0, so it pegs at capacity, and the pacer would shed that
@@ -795,6 +815,7 @@ async fn pump(
                 } else if off.unsigned_abs() <= HYSTERESIS as u32 {
                     settled = true;
                 }
+                SETTLED.store(settled, Ordering::Relaxed);
                 if settled {
                     let slot = if off > 0 {
                         &faults::PEAK_HIGH
@@ -829,6 +850,7 @@ async fn pump(
                     if now.duration_since(last_write) > Duration::from_millis(20) {
                         PIPE.lock(|p| p.borrow_mut().trim_to_target());
                         settled = false;
+                        SETTLED.store(false, Ordering::Relaxed);
                     }
                     last_write = now;
                 }

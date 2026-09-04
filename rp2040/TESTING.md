@@ -194,8 +194,15 @@ deadband edge reads `HYSTERESIS + 48` and trips any threshold set relative to th
 deadband. That is what produced a false code 1 after activating the host
 mid-playback.
 
-Every counter here is gated on the pump actually writing packets, and peak
-excursion additionally waits until the level has come inside the deadband at
+**Every counter here shares one gate**: the stream is open *and* the pacer has
+the level inside its deadband (`SETTLED`). That single condition replaced a
+series of per-counter workarounds. Each counter, as it was added, first reported
+nothing but a stream opening — the level shedding an alt-0 backlog, the rate
+detector's first window, the USB stack setting up an endpoint while the capture
+task waited its turn. Those are one condition wearing different clothes: the
+stream has started but has not steadied.
+
+Peak excursion additionally waits until the level has come inside the deadband at
 least once in the current session — which is exactly "the pacer has the level
 under control", and needs no time constant.
 
