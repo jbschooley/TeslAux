@@ -123,6 +123,34 @@ Use SWD for bring-up. Not for the flashing — for the visibility. This port has
 real unknowns and `probe-rs` gives you RTT and breakpoints; the RP2040 LED bug
 cost four wrong theories precisely because there was no way to see inside.
 
+## What the RP2040's bit-exact verification means here
+
+The two-board build was verified bit-exact — 8,352,000 frames across three cold
+boots, every sample identical to the source. Of the faults that had to be fixed
+to get there, three were in `audio_pipe.rs` or in behaviour this build shares,
+and are present here; the rest were specific to the I2S link and cannot occur:
+
+| Fault | Here? |
+|---|---|
+| unprimed pipe paced as drift, emitting short packets | **yes** — fixed |
+| pipe never trimmed back to target, latency set by boot order | **yes** — fixed |
+| I2S capture pushed samples, so frame alignment depended on FIFO parity | no — see below |
+| capture DMA single-buffered, FIFO unattended | no — no DMA in the audio path |
+| rate detector muted for a second at every stream start | no — no rate following |
+
+**Frame alignment cannot be lost here**, and it is worth being precise about
+why rather than assuming the absence of I2S is enough. A USB packet is
+self-delimiting and a frame is four bytes, so `chunks_exact(4)` drops a trailing
+partial frame and the next packet starts aligned again. The RP2040's capture had
+no such boundary: it pushed single samples into a FIFO, nothing tied a DMA word
+to a frame, and an odd number left in the FIFO rotated every frame for the whole
+session. That is a property of the transport, not of the chip.
+
+**None of this is a substitute for running the test here.** `tools/bitcompare.py`
+applies unchanged once there is hardware, and given that the RP2040's worst
+fault was invisible to every counter and passed by ear, it is the only thing
+that should be believed.
+
 ## Status LED
 
 D2 on PA1, wired in sink mode (lights when the pin is low).
@@ -132,21 +160,6 @@ D2 on PA1, wired in sink mode (lights when the pin is low).
 | Solid | Streaming |
 | Slow blink | Waiting for the phone to open the stream |
 | Fast blink | Fault: a packet exceeded wMaxPacketSize |
-| N blinks, pause | Post-drive fault report (below) |
-
-The report only appears once the phone disconnects, so it never competes with
-live status. Park, unplug the phone, and count:
-
-| Blinks | Cause |
-|---|---|
-| 1 | buffer wandered past half the cushion — margin being used up |
-| 2 | the phone's stream dropped mid-run |
-| 3 | buffer over/underran — the cushion was too small |
-
-Code 1 reports **peak excursion**, not a count of corrections. Corrections here
-are lossless packet-size changes and are supposed to happen; counting them would
-flag healthy operation as a fault. What predicts a dropout is the level drifting
-toward the end of its cushion, so that is what gets reported.
 
 ## Latency
 

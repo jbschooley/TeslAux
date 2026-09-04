@@ -134,51 +134,6 @@ static SOURCE_LIVE: AtomicBool = AtomicBool::new(false);
 /// at every boundary, which does not sound like a drift problem at all.
 static OVERSIZE: AtomicBool = AtomicBool::new(false);
 
-/// Latched record of what went wrong since boot, for reading back after a drive.
-///
-/// You cannot watch an LED while driving, and "it sounded weird once or twice"
-/// does not say whether the pacer slipped, the buffer ran dry, or the phone
-/// dropped the stream — which have different fixes.
-mod faults {
-    use core::sync::atomic::{AtomicU32, Ordering};
-
-    /// Largest |off_target| seen while streaming, in frames.
-    ///
-    /// This, not the correction count, is what predicts a dropout. Corrections
-    /// here are lossless packet-size changes and are supposed to happen; a
-    /// buffer wandering toward the end of its cushion is the thing that
-    /// eventually runs dry. The `measure-excursion` build put this under 64 on
-    /// both an iPhone and an Android, against a cushion of 128.
-    pub static PEAK_OFF: AtomicU32 = AtomicU32::new(0);
-    /// The phone's stream went away mid-run.
-    pub static SOURCE_DROPS: AtomicU32 = AtomicU32::new(0);
-    /// Buffer ran dry or overflowed; the cushion was not big enough.
-    pub static STARVED: AtomicU32 = AtomicU32::new(0);
-
-    pub fn bump(c: &AtomicU32) {
-        c.store(c.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
-    }
-
-    /// Worst thing seen, most serious first, as a blink count. `None` means a
-    /// clean run.
-    ///
-    /// A handful of slips over a drive is normal and not worth reporting, so
-    /// that one has a threshold. The other two are individually audible.
-    pub fn worst() -> Option<u8> {
-        if STARVED.load(Ordering::Relaxed) > 0 {
-            Some(3)
-        } else if SOURCE_DROPS.load(Ordering::Relaxed) > 1 {
-            Some(2)
-        } else if PEAK_OFF.load(Ordering::Relaxed) > (super::RING / 4) as u32 {
-            // Past half the cushion. Nothing has gone wrong yet, but the margin
-            // that measurement established is being used up.
-            Some(1)
-        } else {
-            None
-        }
-    }
-}
-
 bind_interrupts!(struct Irqs {
     OTG_FS => usb::InterruptHandler<peripherals::USB_OTG_FS>;
     OTG_HS => usb::InterruptHandler<peripherals::USB_OTG_HS>;
@@ -217,10 +172,6 @@ fn current_state() -> status::State {
         status::State::Fault
     } else if SOURCE_LIVE.load(Ordering::Relaxed) {
         status::State::Ok
-    } else if let Some(code) = faults::worst() {
-        // The phone has gone away, so live status has nothing to say and the LED
-        // is free to report what went wrong while you were driving.
-        status::State::Report(code)
     } else {
         status::State::Waiting
     }
@@ -357,16 +308,22 @@ async fn main(spawner: Spawner) {
 /// Producer: iso OUT packets from the phone into the pipe.
 async fn sink(mut ep: impl EndpointOut) -> ! {
     let mut buf = [0u8; speaker::BYTES_PER_FRAME + 8];
-    let mut ever_live = false;
     loop {
         ep.wait_enabled().await;
         loop {
             match ep.read(&mut buf).await {
                 Ok(n) => {
                     SOURCE_LIVE.store(true, Ordering::Relaxed);
-                    ever_live = true;
                     PIPE.lock(|p| {
                         let mut pipe = p.borrow_mut();
+                        // `chunks_exact` is what makes a frame-alignment error
+                        // impossible here, and it is worth saying why: a USB
+                        // packet is self-delimiting and a frame is four bytes,
+                        // so a short or malformed packet loses its trailing
+                        // partial frame and the next packet starts aligned
+                        // again. The RP2040's I2S capture had no such boundary —
+                        // it pushed single samples into a FIFO, so an odd number
+                        // left there rotated every frame for the whole session.
                         for f in buf[..n].chunks_exact(4) {
                             pipe.push([
                                 i16::from_le_bytes([f[0], f[1]]),
@@ -381,11 +338,6 @@ async fn sink(mut ep: impl EndpointOut) -> ! {
             }
         }
         SOURCE_LIVE.store(false, Ordering::Relaxed);
-        // Only count a drop that interrupted a stream that had actually started,
-        // so the idle period before the first play does not register as a fault.
-        if ever_live {
-            faults::bump(&faults::SOURCE_DROPS);
-        }
         PIPE.lock(|p| p.borrow_mut().reset());
     }
 }
@@ -394,7 +346,6 @@ async fn sink(mut ep: impl EndpointOut) -> ! {
 /// target.
 async fn pump(mut iso_in: impl EndpointIn) -> ! {
     let mut buf = [0u8; teslamic::BYTES_PER_FRAME + 8];
-    let mut frames: u32 = 0;
     let mut last_write = embassy_time::Instant::now();
     loop {
         iso_in.wait_enabled().await;
@@ -435,22 +386,6 @@ async fn pump(mut iso_in: impl EndpointIn) -> ! {
                 Err(EndpointError::BufferOverflow) => {
                     OVERSIZE.store(true, Ordering::Relaxed);
                     break;
-                }
-            }
-
-            // Mirror the pipe's own tallies into the latch about once a second.
-            // Sampling beats counting at each site: the pipe already counts these
-            // exactly, so the LED and the pipe can never disagree.
-            frames = frames.wrapping_add(1);
-            if frames % 1000 == 0 {
-                let (st, off) = PIPE.lock(|p| {
-                    let pipe = p.borrow();
-                    (pipe.stats, pipe.off_target())
-                });
-                faults::STARVED.store(st.overruns + st.underruns, Ordering::Relaxed);
-                let mag = off.unsigned_abs();
-                if mag > faults::PEAK_OFF.load(Ordering::Relaxed) {
-                    faults::PEAK_OFF.store(mag, Ordering::Relaxed);
                 }
             }
         }

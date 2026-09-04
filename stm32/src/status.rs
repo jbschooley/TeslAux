@@ -17,23 +17,13 @@ pub enum State {
     Waiting,
     /// Something is wrong and audio is muted.
     Fault,
-    /// Idle, reporting the worst fault seen since boot as a blink count.
-    ///
-    /// 1 = slips, 2 = the phone's stream dropped, 3 = buffer over/underran.
-    /// This only shows when no source is connected, so it never competes with
-    /// live status: you read it after the drive.
-    Report(u8),
 }
 
 /// D2 on this board is wired to sink current, so it lights when the pin is LOW.
-/// Naming the two ends rather than calling `set_high`/`set_low` at each site
-/// keeps that inversion in exactly one place.
+/// Naming it rather than calling `set_low` at each site keeps that inversion in
+/// exactly one place.
 fn on(led: &mut Output<'static>) {
     led.set_low();
-}
-
-fn off(led: &mut Output<'static>) {
-    led.set_high();
 }
 
 pub async fn run(led: &mut Output<'static>, state: impl Fn() -> State) -> ! {
@@ -50,17 +40,6 @@ pub async fn run(led: &mut Output<'static>, state: impl Fn() -> State) -> ! {
             State::Fault => {
                 led.toggle();
                 Timer::after_millis(100).await;
-            }
-            State::Report(n) => {
-                // Long gap after the group so the count can be read off without
-                // a stopwatch.
-                for _ in 0..n {
-                    on(led);
-                    Timer::after_millis(150).await;
-                    off(led);
-                    Timer::after_millis(150).await;
-                }
-                Timer::after_millis(900).await;
             }
         }
     }
