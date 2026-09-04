@@ -350,6 +350,18 @@ static LAST_ACTIVE_MS: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomi
 /// How long everything must be quiet before the LED reports the run.
 const REPORT_AFTER_MS: u32 = 2_000;
 
+/// Quiet time within which audio still counts as flowing.
+///
+/// A packet moves every millisecond while streaming, so any real gap is
+/// enormous by comparison. This is generous enough to ride out the car's alt
+/// toggling without the LED flickering.
+const ACTIVE_WITHIN_MS: u32 = 500;
+
+/// False until audio has moved at least once, so a freshly booted board does
+/// not read as active.
+static EVER_ACTIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// True once the pacer has the level under control in the current stream.
 ///
 /// **The single definition of "steady state" for every fault counter here.**
@@ -891,6 +903,7 @@ async fn pump(
                         Instant::now().as_millis() as u32,
                         Ordering::Relaxed,
                     );
+                    EVER_ACTIVE.store(true, Ordering::Relaxed);
 
                     // A host that stops *polling* never changes the alt setting,
                     // so `wait_enabled()` above does not come back around and the
@@ -1012,22 +1025,30 @@ static USB_FRAMES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32
 fn current_state() -> status::State {
     use core::sync::atomic::Ordering;
     if MUTED.load(Ordering::Relaxed) || OVERSIZE.load(Ordering::Relaxed) {
-        status::State::Fault
-    } else if SOURCE_LIVE.load(Ordering::Relaxed) && STREAMING.load(Ordering::Relaxed) {
+        return status::State::Fault;
+    }
+    // Liveness is measured as *recency of a delivered packet*, never as a flag.
+    //
+    // A latched "streaming" flag cannot work: a host that stops polling without
+    // changing its alt setting never produces an error, so `write()` simply
+    // blocks and the flag stays set forever. That is exactly what closing the
+    // host application does, and it left the LED green with nothing happening.
+    if !EVER_ACTIVE.load(Ordering::Relaxed) {
+        return status::State::Waiting;
+    }
+    let quiet =
+        (Instant::now().as_millis() as u32).wrapping_sub(LAST_ACTIVE_MS.load(Ordering::Relaxed));
+    if quiet < ACTIVE_WITHIN_MS {
         status::State::Ok
-    } else if (Instant::now().as_millis() as u32)
-        .wrapping_sub(LAST_ACTIVE_MS.load(Ordering::Relaxed))
-        < REPORT_AFTER_MS
-    {
-        // Recently active. Hold off: this covers both the car's constant alt
-        // toggling and the moments just after a cable is pulled.
+    } else if quiet < REPORT_AFTER_MS {
+        // Recently stopped. Hold off: this covers the car's constant alt
+        // toggling, and the moments just after a cable is pulled.
         status::State::Waiting
-    } else if let Some(code) = faults::worst() {
-        // The source has gone away, so the live status has nothing to say and
-        // the LED is free to report what went wrong while you were driving.
-        status::State::Report(code)
     } else {
-        status::State::Waiting
+        match faults::worst() {
+            Some(code) => status::State::Report(code),
+            None => status::State::Waiting,
+        }
     }
 }
 
