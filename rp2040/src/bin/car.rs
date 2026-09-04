@@ -378,6 +378,16 @@ async fn capture(
     // Each PIO push is one 16-bit sample in the low half of a word; a block is
     // I2S_BLOCK stereo frames.
     let mut raw = [0u32; I2S_BLOCK * 2];
+    // Double buffer. `raw` is what the DMA is filling now; `work` is the block
+    // handed to the pipe, so the two never contend.
+    //
+    // The RX FIFO is 8 words — about 83 us at 48 kHz — and `slave_rx` pushes
+    // with `noblock`, so anything arriving while no DMA is armed is silently
+    // discarded. Doing the pipe push before awaiting means it overlaps a
+    // running transfer, and the window where the FIFO is unattended shrinks to
+    // a memcpy plus the DMA setup.
+    let mut work = [0u32; I2S_BLOCK * 2];
+    let mut have_work = false;
     let mut dma = dma;
     let mut last_block = Instant::now();
     #[cfg(feature = "clock-locked")]
@@ -389,13 +399,28 @@ async fn capture(
         // a timeout this task blocks forever and the pipe keeps whatever it last
         // held — which the pump then streams to the car as DC, or as noise if
         // the floating inputs picked any up.
-        if embassy_time::with_timeout(
-            Duration::from_millis(250),
-            sm.rx().dma_pull(dma.reborrow(), &mut raw, false),
-        )
-        .await
-        .is_err()
+        // Arm the next transfer FIRST; the work below overlaps it.
+        let xfer = sm.rx().dma_pull(dma.reborrow(), &mut raw, false);
+
+        // Hand the previous block to the pipe while the DMA fills the next one.
+        if have_work {
+            PIPE.lock(|p| {
+                let mut pipe = p.borrow_mut();
+                for f in work.chunks_exact(2) {
+                    pipe.push([f[0] as u16 as i16, f[1] as u16 as i16]);
+                }
+            });
+            CAPTURED.store(
+                CAPTURED.load(Ordering::Relaxed).wrapping_add(I2S_BLOCK as u32),
+                Ordering::Relaxed,
+            );
+        }
+
+        if embassy_time::with_timeout(Duration::from_millis(250), xfer)
+            .await
+            .is_err()
         {
+            have_work = false;
             // Source gone. Reset clears the held sample to zero and un-primes,
             // so the pump emits real silence and re-primes cleanly when audio
             // comes back.
@@ -454,16 +479,10 @@ async fn capture(
             }
         }
 
-        PIPE.lock(|p| {
-            let mut pipe = p.borrow_mut();
-            for f in raw.chunks_exact(2) {
-                pipe.push([f[0] as u16 as i16, f[1] as u16 as i16]);
-            }
-        });
-        CAPTURED.store(
-            CAPTURED.load(Ordering::Relaxed).wrapping_add(I2S_BLOCK as u32),
-            Ordering::Relaxed,
-        );
+        // Copy out so the next transfer can start immediately; the push happens
+        // at the top of the next iteration, overlapping it.
+        work.copy_from_slice(&raw);
+        have_work = true;
     }
 }
 
