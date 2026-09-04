@@ -162,6 +162,67 @@ def explain_bulk(ref, rec):
     )
 
 
+def walk(ref, rec, off, tol=1, blk=2400, search=8000):
+    """Walk both streams from `off`, tolerating small sample error, and return
+    (stats, edits).
+
+    Two things have to be separated, because they mean completely different
+    things:
+
+      * a **level error** — every sample off by a fixed small amount, typically
+        one LSB from a float round-trip that truncates instead of rounding.
+        Nothing is lost; the values are just not identical.
+      * a **splice** — a run of frames missing outright, after which the streams
+        realign perfectly. That is lost audio.
+
+    Comparing exactly cannot tell them apart: a one-LSB level error makes every
+    frame "differ", which buries the splices in noise and reports a healthy
+    stream as total corruption.
+    """
+    edits = []
+    worst = 0
+    diffs = 0
+    total = 0
+    i, j = 0, off
+    while i + blk < len(ref) and j + blk < len(rec):
+        d = np.abs(ref[i : i + blk].astype(np.int32) - rec[j : j + blk].astype(np.int32))
+        if d.max() <= tol:
+            worst = max(worst, int(d.max()))
+            diffs += int(np.count_nonzero(d))
+            total += d.size
+            i += blk
+            j += blk
+            continue
+        # Find where it stops matching, then how far to skip to resync.
+        #
+        # Which stream to advance depends on which way the edit went. Frames
+        # missing from the recording means the *reference* has to skip ahead to
+        # catch up; extra frames in the recording means the opposite. Searching
+        # only one of them finds neither.
+        bad = int(np.argmax(d.max(axis=1) > tol))
+        pos = i + bad
+        jb = j + bad
+        found = None
+        for sh in range(1, search):
+            a = ref[pos + sh : pos + sh + 512].astype(np.int32)
+            b = rec[jb : jb + 512].astype(np.int32)
+            if a.shape == b.shape and a.size and np.abs(a - b).max() <= tol:
+                found = -sh
+                i, j = pos + sh, jb
+                break
+            a = ref[pos : pos + 512].astype(np.int32)
+            b = rec[jb + sh : jb + sh + 512].astype(np.int32)
+            if a.shape == b.shape and a.size and np.abs(a - b).max() <= tol:
+                found = sh
+                i, j = pos, jb + sh
+                break
+        if found is None:
+            edits.append((pos, "unresolved", 0))
+            break
+        edits.append((pos, "missing" if found < 0 else "extra", abs(found)))
+    return {"worst_lsb": worst, "diff_samples": diffs, "compared": total}, edits
+
+
 def compare(ref_path, rec_path):
     ref, ref_rate = read_wav(ref_path)
     rec, rec_rate = read_wav(rec_path)
@@ -170,19 +231,64 @@ def compare(ref_path, rec_path):
         print("\n" + PRECONDITIONS)
         return 1
 
-    off = find_offset(ref, rec)
+    # Anchor a little way in. The first moments are the least representative
+    # part of any recording: the recorder's own lead-in silence, the stream
+    # opening, the buffer priming. Aligning on them can leave the comparison
+    # starting inside a region that exists in one file and not the other, which
+    # no shift can reconcile.
+    anchor = min(2 * ref_rate, len(ref) // 4)
+    off = find_offset(ref[anchor:], rec)
     if off is None:
         print("FAIL  could not align the two files; are they the same material?")
         return 1
+    off -= anchor
     print(f"aligned at frame {off} of the recording ({off / ref_rate:.3f} s)")
 
     if off < 0:
         ref = ref[-off:]
     else:
         rec = rec[off:]
+    # Start comparing from the anchor, not from the very beginning.
+    ref = ref[anchor:]
+    rec = rec[anchor:]
     n = min(len(ref), len(rec))
     if n == 0:
         print("FAIL  no overlap after alignment")
+        return 1
+
+    if np.array_equal(ref[:n], rec[:n]):
+        print(f"compared {n} frames ({n / ref_rate:.1f} s)")
+        print("PASS  bit-exact: every sample matches")
+        return 0
+
+    # Not identical. Separate a small level error from actual lost audio before
+    # saying anything, because one is harmless and the other is not.
+    stats, edits = walk(ref, rec, 0)
+    lost = sum(e[2] for e in edits if e[1] == "missing")
+    gained = sum(e[2] for e in edits if e[1] == "extra")
+    print(f"compared {stats['compared'] // CHANNELS} frames between edits")
+    if stats["worst_lsb"]:
+        pct = 100.0 * stats["diff_samples"] / max(stats["compared"], 1)
+        print(
+            f"      level: {pct:.1f}% of samples differ by at most "
+            f"{stats['worst_lsb']} LSB"
+        )
+        print("      A truncating float round-trip does this — an audio stack that")
+        print("      converts int16 -> float -> int16 without rounding. It loses no")
+        print("      audio, but it is not bit-exact, so fix it before trusting a pass.")
+    if edits:
+        print(f"      {len(edits)} splice(s): {lost} frames missing, {gained} extra")
+        for pos, kind, cnt in edits[:12]:
+            print(
+                f"        ref frame {pos:>9} ({pos / ref_rate:7.3f}s)  "
+                f"{kind} {cnt} frames ({1000.0 * cnt / ref_rate:.1f} ms)"
+            )
+        if len(edits) > 12:
+            print(f"        ... and {len(edits) - 12} more")
+        print("      Between splices the streams stay aligned exactly, so nothing is")
+        print("      drifting: each is a discrete discard, not a clock mismatch.")
+        return 1
+    if stats["worst_lsb"]:
         return 1
 
     notes = classify(ref[:n], rec[:n])
@@ -273,6 +379,24 @@ def _self_test():
     swap = ref.copy()
     swap[25000] = swap[25000][::-1]
     check("channel swap", swap, False, "channels swapped")
+
+    # A one-LSB level error must not be reported as lost audio, and a splice
+    # must still be found underneath one.
+    lsb = np.clip(ref.astype(np.int32) - (ref > 0), -32768, 32767).astype(np.int16)
+    st, ed = walk(ref, lsb, 0)
+    if st["worst_lsb"] == 1 and not ed:
+        print("  ok   one-LSB level error -> named as level, no splices invented")
+    else:
+        print(f"  FAIL one-LSB level error: worst={st['worst_lsb']} edits={ed}")
+        ok = False
+
+    spliced = np.vstack([lsb[:20000], lsb[20384:]])
+    st, ed = walk(ref, spliced, 0)
+    if len(ed) == 1 and ed[0][1] == "missing" and ed[0][2] == 384:
+        print("  ok   384-frame splice under a level error -> found exactly")
+    else:
+        print(f"  FAIL splice under level error: {ed[:3]}")
+        ok = False
 
     # Bulk explanations: qualifying the player matters as much as the firmware.
     quiet = (ref.astype(np.float64) * 0.98).astype(np.int16)

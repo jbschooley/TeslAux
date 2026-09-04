@@ -338,6 +338,8 @@ then names what it finds:
 | dropped frame | a slip up: the pacer discarded to shed drift |
 | run of zeros | a dropout: muted, or the pipe reset |
 | channels swapped | the I2S slot mapping is inverted |
+| every sample off by 1 LSB | a truncating int16 -> float -> int16 round-trip; nothing lost |
+| N frames missing at a point | a discrete discard — lost audio, located to the frame |
 | nearly everything differs | a chain problem, not a firmware fault — and it says which |
 
 **The setup is the hard part, and most failures will be the chain rather than
@@ -355,3 +357,24 @@ player is fine and the volume is not.
 
 The tool self-tests against synthesised versions of each fault it names, so a
 result from it means something before it is pointed at real audio.
+
+### Reading a near-miss
+
+Two results look identical to an exact comparison and mean opposite things, so
+the tool separates them before saying anything:
+
+* **A level error.** Every sample off by one LSB, nothing lost. An audio stack
+  that converts `int16 -> float -> int16` by truncating rather than rounding
+  does exactly this. Harmless to listen to, but it is not bit-exact, so it has
+  to be fixed before a pass means anything — and it buries everything else,
+  because with every frame "differing" an exact comparison reports total
+  corruption.
+* **A splice.** A run of frames gone outright, after which the streams realign
+  perfectly and stay aligned. That is lost audio, and its size and position are
+  reported.
+
+The distinction also identifies *where* a fault is. Between splices the
+alignment holds exactly for tens of seconds, which means no sample is being
+gained or lost in between — so the pacing is doing its job and a discard is a
+discrete event somewhere, not drift. A clock problem in the bridge would show as
+a steady ramp instead.
