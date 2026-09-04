@@ -146,6 +146,15 @@ no such boundary: it pushed single samples into a FIFO, nothing tied a DMA word
 to a frame, and an odd number left in the FIFO rotated every frame for the whole
 session. That is a property of the transport, not of the chip.
 
+One fault the port did miss, found by re-reading rather than by hardware: the
+phone-side `ep.read()` had no timeout. A host that stops sending without
+disabling its endpoint produces no error, so the read blocks forever, the pipe
+drains, and `pop()` holds its last sample — feeding the car DC instead of
+silence, with nothing noticing the source is gone. The two-board build hit
+exactly this on its I2S input and fixed it with a 250 ms timeout; removing the
+I2S link removed that failure's usual cause, not the failure. **Any producer can
+stop without saying so.**
+
 **None of this is a substitute for running the test here.** `tools/bitcompare.py`
 applies unchanged once there is hardware, and given that the RP2040's worst
 fault was invisible to every counter and passed by ear, it is the only thing

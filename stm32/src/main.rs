@@ -311,8 +311,33 @@ async fn sink(mut ep: impl EndpointOut) -> ! {
     loop {
         ep.wait_enabled().await;
         loop {
-            match ep.read(&mut buf).await {
-                Ok(n) => {
+            // Bound the wait.
+            //
+            // A host that stops sending without disabling its endpoint produces
+            // no error at all — this read simply blocks forever. The pipe then
+            // drains and `pop()` holds its last sample, so the car is fed DC
+            // rather than silence, and nothing here ever notices the source is
+            // gone.
+            //
+            // The two-board build hit exactly this on its I2S input and fixed it
+            // with a timeout of the same length. Removing the I2S link removed
+            // the symptom's usual cause, not the failure: any producer can stop
+            // without saying so.
+            match embassy_time::with_timeout(
+                embassy_time::Duration::from_millis(250),
+                ep.read(&mut buf),
+            )
+            .await
+            {
+                // Timed out: the source stopped without disabling the endpoint.
+                // Reset clears the held sample and un-primes, so the pump emits
+                // real silence and re-primes cleanly when audio returns. The
+                // endpoint is still enabled, so keep waiting on it.
+                Err(_) => {
+                    SOURCE_LIVE.store(false, Ordering::Relaxed);
+                    PIPE.lock(|p| p.borrow_mut().reset());
+                }
+                Ok(Ok(n)) => {
                     SOURCE_LIVE.store(true, Ordering::Relaxed);
                     PIPE.lock(|p| {
                         let mut pipe = p.borrow_mut();
@@ -334,7 +359,7 @@ async fn sink(mut ep: impl EndpointOut) -> ! {
                 }
                 // Endpoint disabled (host went to alt 0). Normal between tracks
                 // and on pause; wait to be re-enabled rather than tearing down.
-                Err(_) => break,
+                Ok(Err(_)) => break,
             }
         }
         SOURCE_LIVE.store(false, Ordering::Relaxed);
