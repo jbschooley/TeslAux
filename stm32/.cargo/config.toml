@@ -4,5 +4,5 @@ target = "thumbv7em-none-eabihf"
 [target.thumbv7em-none-eabihf]
 # `memory.x` comes from embassy-stm32's `memory-x` feature, which derives the
 # F407VE's 512K flash / 128K RAM layout from the chip name. Nothing to hand-write.
-rustflags = ["-C", "link-arg=--nmagic", "-C", "link-arg=-Tlink.x"]
+rustflags = ["-C", "link-arg=--nmagic", "-C", "link-arg=-Tlink.x", "-C", "link-arg=-Tdefmt.x"]
 runner = "probe-rs run --chip STM32F407VETx"

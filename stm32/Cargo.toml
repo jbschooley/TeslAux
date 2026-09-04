@@ -18,14 +18,18 @@ path = "src/main.rs"
 [dependencies]
 # embassy-usb is the same 0.6 the RP2040 build uses, which is why
 # `teslamic.rs` compiles here unchanged.
-embassy-stm32    = { version = "0.6", features = ["stm32f407ve", "time-driver-any", "memory-x", "unstable-pac"] }
-embassy-usb      = { version = "0.6", default-features = false }
+embassy-stm32    = { version = "0.6", features = ["stm32f407ve", "time-driver-any", "memory-x", "unstable-pac", "defmt"] }
+embassy-usb      = { version = "0.6", default-features = false, features = ["defmt"] }
 embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread"] }
 embassy-time     = { version = "0.5" }
 embassy-futures  = { version = "0.1" }
 embassy-sync     = { version = "0.7" }
 
 cortex-m    = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
+# Bring-up visibility over the ST-Link. Costs nothing when DEFMT_LOG is off.
+defmt       = "1"
+defmt-rtt   = "1"
+
 cortex-m-rt = "0.7"
 
 [profile.release]

@@ -191,6 +191,6 @@ Tesla's own ~100 ms delay is ever fixed.
 ## Single-chip variant (experimental)
 
 `stm32/` holds a port to one STM32F407, which has two USB device controllers and
-so needs no I2S link between the two halves. It builds but has never been run on
-hardware — see `stm32/README.md`. The two-board RP2040 rig in `rp2040/` is the
-version that works in a car.
+so needs no I2S link between the two halves. It now runs on hardware and has
+passed the same bit-exact test as the two-board rig — 2,784,000 frames, every
+sample identical — but has not yet been tried in a car. See `stm32/README.md`.

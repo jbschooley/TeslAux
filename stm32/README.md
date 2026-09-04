@@ -1,9 +1,18 @@
 # TeslAux on a single STM32F407
 
-> **Status: builds, never run on hardware.** Nothing in this directory has been
-> tested on a board or in a car. The two-board RP2040 rig in `../rp2040/` is the
-> version that works. Treat everything here as a port to be brought up, not as a
-> drop-in replacement.
+> **Status: runs on hardware, verified bit-exact on the bench. Not yet tested in
+> a car.**
+>
+> ```
+> compared 2,784,000 frames (58.0 s)
+> PASS  bit-exact: every sample matches
+> ```
+>
+> Android (USB Audio Player Pro, bit-perfect) -> OTG_HS -> pipe -> OTG_FS -> Mac,
+> recorded at 32-bit float and compared against the file on the phone. Every
+> sample identical: no loss, no repetition, no drift, no rescaling, correct
+> channels and framing. One run so far; the two-board rig was repeated across
+> three cold boots and this deserves the same before it is trusted.
 
 The two-board rig puts the phone on one RP2040 and the car on another, joined by
 an I2S link. That link is the reason the RP2040 build needs a PIO driver, two
@@ -122,6 +131,26 @@ header, then `cargo run --release` (the runner is already configured for
 Use SWD for bring-up. Not for the flashing — for the visibility. This port has
 real unknowns and `probe-rs` gives you RTT and breakpoints; the RP2040 LED bug
 cost four wrong theories precisely because there was no way to see inside.
+
+## Bring-up notes
+
+What was unknown before hardware, and how each turned out:
+
+| Question | Answer |
+|---|---|
+| 8 MHz crystal, RCC config, exact 48 MHz USB clock | correct — enumerates first try |
+| Board's USB-C has its own CC resistors | **yes** — comes up on a USB-C host, so the car can power it |
+| OTG_FS's 4 endpoints and 1.25 KB FIFO fit the four-interface TeslaMic | yes |
+| Two independent USB device stacks on one chip | yes |
+| PB14/PB15 free | yes — they reach only the TFT header, unpopulated |
+
+`defmt-rtt` logging over the ST-Link is compiled in and costs nothing unless
+`DEFMT_LOG` is set at build time. It reports, once a second, packets in, whether
+they are silent, the pipe level and packets out — which resolved the one bring-up
+puzzle immediately. The board appeared to produce silence; the log showed the
+phone had been streaming silence at first, and separately that nothing on the Mac
+had the input open, so `wait_enabled()` had correctly never returned. Two
+independent causes, neither guessable from an LED.
 
 ## What the RP2040's bit-exact verification means here
 

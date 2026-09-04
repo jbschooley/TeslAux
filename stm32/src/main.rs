@@ -47,9 +47,19 @@ mod teslamic;
 mod speaker;
 mod status;
 
+use defmt_rtt as _;
+
+/// Counters for bring-up. Written by one task each, read by the reporter.
+static PUSHED: AtomicU32 = AtomicU32::new(0);
+static PACKETS_IN: AtomicU32 = AtomicU32::new(0);
+static LAST_N: AtomicU32 = AtomicU32::new(0);
+static NONZERO_IN: AtomicU32 = AtomicU32::new(0);
+static WRITTEN: AtomicU32 = AtomicU32::new(0);
+static LAST_OUT: AtomicU32 = AtomicU32::new(0);
+
 use audio_pipe::{PaceMode, Pipe};
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_stm32::gpio::{Level, Output, Speed};
@@ -160,6 +170,29 @@ async fn usb_car_task(mut d: UsbDevice<'static, CarDriver>) -> ! {
 #[embassy_executor::task]
 async fn usb_phone_task(mut d: UsbDevice<'static, PhoneDriver>) -> ! {
     d.run().await
+}
+
+/// Report where the audio actually stops, once a second.
+#[embassy_executor::task]
+async fn report_task() -> ! {
+    loop {
+        embassy_time::Timer::after_millis(1000).await;
+        let (level, primed) = PIPE.lock(|p| {
+            let b = p.borrow();
+            (b.off_target(), b.primed())
+        });
+        defmt::info!(
+            "in: {} pkts (last {} B, {} non-silent) {} frames | pipe: off {} primed {} | out: {} pkts (last {} B)",
+            PACKETS_IN.load(Ordering::Relaxed),
+            LAST_N.load(Ordering::Relaxed),
+            NONZERO_IN.load(Ordering::Relaxed),
+            PUSHED.load(Ordering::Relaxed),
+            level,
+            primed,
+            WRITTEN.load(Ordering::Relaxed),
+            LAST_OUT.load(Ordering::Relaxed),
+        );
+    }
 }
 
 #[embassy_executor::task]
@@ -297,6 +330,7 @@ async fn main(spawner: Spawner) {
     };
 
     spawner.spawn(status_task(led).unwrap());
+    spawner.spawn(report_task().unwrap());
 
     // Producer and consumer both live here rather than in spawned tasks: an
     // `#[embassy_executor::task]` cannot be generic over the endpoint type, and
@@ -339,6 +373,21 @@ async fn sink(mut ep: impl EndpointOut) -> ! {
                 }
                 Ok(Ok(n)) => {
                     SOURCE_LIVE.store(true, Ordering::Relaxed);
+                    PACKETS_IN.store(
+                        PACKETS_IN.load(Ordering::Relaxed).wrapping_add(1),
+                        Ordering::Relaxed,
+                    );
+                    LAST_N.store(n as u32, Ordering::Relaxed);
+                    if buf[..n].iter().any(|&b| b != 0) {
+                        NONZERO_IN.store(
+                            NONZERO_IN.load(Ordering::Relaxed).wrapping_add(1),
+                            Ordering::Relaxed,
+                        );
+                    }
+                    PUSHED.store(
+                        PUSHED.load(Ordering::Relaxed).wrapping_add((n / 4) as u32),
+                        Ordering::Relaxed,
+                    );
                     PIPE.lock(|p| {
                         let mut pipe = p.borrow_mut();
                         // `chunks_exact` is what makes a frame-alignment error
@@ -395,6 +444,11 @@ async fn pump(mut iso_in: impl EndpointIn) -> ! {
             let n = PIPE.lock(|p| p.borrow_mut().take(&mut buf, MODE));
             match iso_in.write(&buf[..n]).await {
                 Ok(()) => {
+                    WRITTEN.store(
+                        WRITTEN.load(Ordering::Relaxed).wrapping_add(1),
+                        Ordering::Relaxed,
+                    );
+                    LAST_OUT.store(n as u32, Ordering::Relaxed);
                     // `wait_enabled()` above only returns on an alt-setting
                     // change. A host that keeps the interface selected but stops
                     // polling produces no error at all — the write simply blocks
