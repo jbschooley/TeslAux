@@ -269,6 +269,14 @@ impl<const N: usize> Pipe<N> {
         if mode == PaceMode::Locked || n == 0 {
             return n;
         }
+        // Nothing to pace until the buffer has filled once. An unprimed pipe is
+        // empty by definition, so the drift test below would fire on every
+        // packet and log a correction per frame — which is what a car board
+        // streaming to a host with no source connected did: ~1000 "slips" a
+        // second, none of them real.
+        if !self.primed {
+            return n;
+        }
         if mode == PaceMode::Stress {
             // Alternate -1/+1 so the long-run average stays exact and the buffer
             // does not walk; only the packet size moves.
@@ -686,6 +694,37 @@ mod tests {
         assert_eq!(p.plan_batch(64, PaceMode::Elastic), 65);
         // Locked mode never corrects, however far off it is.
         assert_eq!(p.plan_batch(64, PaceMode::Locked), 64);
+    }
+
+    #[test]
+    fn unprimed_pipe_does_not_pace() {
+        // A host can be streaming before any source is connected. That is an
+        // empty buffer, not drift, and must not be counted as corrections.
+        let mut p = Pipe::<512>::new(48000);
+        let mut out = [0u8; 256];
+        for _ in 0..100 {
+            p.take(&mut out, PaceMode::Elastic);
+        }
+        assert_eq!(p.stats.adj_up, 0, "paced up while unprimed");
+        assert_eq!(p.stats.adj_down, 0, "paced down while unprimed");
+    }
+
+    #[test]
+    fn primed_pipe_still_paces() {
+        // The guard above must not disable pacing once audio is flowing.
+        let mut p = Pipe::<512>::new(48000);
+        for _ in 0..600 {
+            p.push([0, 0]);
+        }
+        assert!(p.primed());
+        let mut out = [0u8; 256];
+        for _ in 0..10 {
+            p.take(&mut out, PaceMode::Elastic);
+        }
+        assert!(
+            p.stats.adj_up > 0,
+            "an over-full primed pipe must still shed"
+        );
     }
 
     #[test]

@@ -585,11 +585,21 @@ async fn capture(
         //
         // Rebasing at each session start discards exactly that drain, because
         // the total is only ever sampled at a moment the source is known good.
-        let total = PIPE.lock(|p| {
-            let st = p.borrow().stats;
-            st.overruns.saturating_add(st.underruns)
+        let (total, off) = PIPE.lock(|p| {
+            let b = p.borrow();
+            (
+                b.stats.overruns.saturating_add(b.stats.underruns),
+                b.off_target(),
+            )
         });
-        if !was_live || !streaming {
+        // Also rebase while the buffer is still above its operating band.
+        //
+        // Nothing drains the pipe while the host sits on alt 0, so it pegs at
+        // capacity; the moment the host selects alt 1 the level is a full
+        // cushion too high and sheds back to target over the next quarter
+        // second, overrunning on the way. That is the stream starting, not a
+        // fault, and it happens every time the car toggles alt settings.
+        if !was_live || !streaming || off > HYSTERESIS as i32 {
             starve_base = total;
         }
         faults::STARVED.store(
