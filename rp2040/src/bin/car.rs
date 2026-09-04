@@ -532,6 +532,8 @@ async fn pump(
     let mut buf = [0u8; teslamic::BYTES_PER_FRAME + 8];
     let mut detect = RateDetect::new(1000);
     let mut last_captured = CAPTURED.load(Ordering::Relaxed);
+    // When the host last actually took a packet.
+    let mut last_write = Instant::now();
     #[cfg(feature = "packet-stress")]
     let (mut phase, mut stress_hi) = (0u32, false);
 
@@ -548,6 +550,15 @@ async fn pump(
         detect = RateDetect::new(1000);
         last_captured = CAPTURED.load(Ordering::Relaxed);
         MUTED.store(false, Ordering::Relaxed);
+
+        // Drop whatever piled up while nobody was listening. Nothing drains the
+        // pipe on alt 0, so it pegs at capacity, and the pacer sheds only one
+        // frame per packet — stopping as soon as the level is inside the
+        // deadband, so it never gets back to target. The level then parks at the
+        // deadband edge for the rest of the session, which made latency depend
+        // on nothing but whether the source or the host came up first, and meant
+        // the host was served a backlog before live audio.
+        PIPE.lock(|p| p.borrow_mut().trim_to_target());
 
         // The car toggles AudioStreaming alt1/alt0 constantly (seen in the
         // on-screen USB spy capture), so do NOT tear anything down when the
@@ -586,7 +597,19 @@ async fn pump(
                 buf[..n].fill(0);
             }
             match iso_in.write(&buf[..n]).await {
-                Ok(()) => {}
+                Ok(()) => {
+                    // `wait_enabled()` only returns on an alt-setting change. A
+                    // host that keeps the interface selected but stops polling
+                    // produces no error at all — the write just blocks — so the
+                    // trim above never re-runs while the pipe fills. Catch it
+                    // where it actually shows: a gap between delivered packets
+                    // far longer than the one-frame polling interval.
+                    let now = Instant::now();
+                    if now.duration_since(last_write) > Duration::from_millis(20) {
+                        PIPE.lock(|p| p.borrow_mut().trim_to_target());
+                    }
+                    last_write = now;
+                }
                 // The host deselected the stream; normal, just wait to be
                 // re-enabled.
                 Err(EndpointError::Disabled) => break,
