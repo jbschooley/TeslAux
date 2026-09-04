@@ -375,9 +375,19 @@ async fn capture(
 ) -> ! {
     use core::sync::atomic::Ordering;
 
-    // Each PIO push is one 16-bit sample in the low half of a word; a block is
-    // I2S_BLOCK stereo frames.
-    let mut raw = [0u32; I2S_BLOCK * 2];
+    // Each PIO push is one whole frame: left sample in the top half of the
+    // word, right in the bottom. A block is I2S_BLOCK frames.
+    let mut raw = [0u32; I2S_BLOCK];
+    // Double buffer. `raw` is what the DMA is filling now; `work` is the block
+    // handed to the pipe, so the two never contend.
+    //
+    // The RX FIFO is 8 words — about 83 us at 48 kHz — and `slave_rx` pushes
+    // with `noblock`, so anything arriving while no DMA is armed is silently
+    // discarded. Doing the pipe push before awaiting means it overlaps a
+    // running transfer, and the window where the FIFO is unattended shrinks to
+    // a memcpy plus the DMA setup.
+    let mut work = [0u32; I2S_BLOCK];
+    let mut have_work = false;
     let mut dma = dma;
     let mut last_block = Instant::now();
     #[cfg(feature = "clock-locked")]
@@ -389,13 +399,28 @@ async fn capture(
         // a timeout this task blocks forever and the pipe keeps whatever it last
         // held — which the pump then streams to the car as DC, or as noise if
         // the floating inputs picked any up.
-        if embassy_time::with_timeout(
-            Duration::from_millis(250),
-            sm.rx().dma_pull(dma.reborrow(), &mut raw, false),
-        )
-        .await
-        .is_err()
+        // Arm the next transfer FIRST; the work below overlaps it.
+        let xfer = sm.rx().dma_pull(dma.reborrow(), &mut raw, false);
+
+        // Hand the previous block to the pipe while the DMA fills the next one.
+        if have_work {
+            PIPE.lock(|p| {
+                let mut pipe = p.borrow_mut();
+                for w in work.iter() {
+                    pipe.push([(w >> 16) as u16 as i16, *w as u16 as i16]);
+                }
+            });
+            CAPTURED.store(
+                CAPTURED.load(Ordering::Relaxed).wrapping_add(I2S_BLOCK as u32),
+                Ordering::Relaxed,
+            );
+        }
+
+        if embassy_time::with_timeout(Duration::from_millis(250), xfer)
+            .await
+            .is_err()
         {
+            have_work = false;
             // Source gone. Reset clears the held sample to zero and un-primes,
             // so the pump emits real silence and re-primes cleanly when audio
             // comes back.
@@ -454,16 +479,10 @@ async fn capture(
             }
         }
 
-        PIPE.lock(|p| {
-            let mut pipe = p.borrow_mut();
-            for f in raw.chunks_exact(2) {
-                pipe.push([f[0] as u16 as i16, f[1] as u16 as i16]);
-            }
-        });
-        CAPTURED.store(
-            CAPTURED.load(Ordering::Relaxed).wrapping_add(I2S_BLOCK as u32),
-            Ordering::Relaxed,
-        );
+        // Copy out so the next transfer can start immediately; the push happens
+        // at the top of the next iteration, overlapping it.
+        work.copy_from_slice(&raw);
+        have_work = true;
     }
 }
 
@@ -488,11 +507,33 @@ async fn pump(
     let mut buf = [0u8; teslamic::BYTES_PER_FRAME + 8];
     let mut detect = RateDetect::new(1000);
     let mut last_captured = CAPTURED.load(Ordering::Relaxed);
+    // When the host last actually took a packet.
+    let mut last_write = Instant::now();
     #[cfg(feature = "packet-stress")]
     let (mut phase, mut stress_hi) = (0u32, false);
 
     loop {
         iso_in.wait_enabled().await;
+
+        // Start the rate measurement afresh. The detector counts captured I2S
+        // frames against USB frames, and USB frames only tick while the pump is
+        // writing — so across a gap it holds a large capture count against no
+        // frames at all, and its first window after the stream reopens reports
+        // an absurd rate. An unclassifiable rate mutes, so this cost a full
+        // second of silence every time the host selected alt 1 — which the car
+        // does constantly.
+        detect = RateDetect::new(1000);
+        last_captured = CAPTURED.load(Ordering::Relaxed);
+        MUTED.store(false, Ordering::Relaxed);
+
+        // Drop whatever piled up while nobody was listening. Nothing drains the
+        // pipe on alt 0, so it pegs at capacity, and the pacer sheds only one
+        // frame per packet — stopping as soon as the level is inside the
+        // deadband, so it never gets back to target. The level then parks at the
+        // deadband edge for the rest of the session, which made latency depend
+        // on nothing but whether the source or the host came up first, and meant
+        // the host was served a backlog before live audio.
+        PIPE.lock(|p| p.borrow_mut().trim_to_target());
 
         // The car toggles AudioStreaming alt1/alt0 constantly (seen in the
         // on-screen USB spy capture), so do NOT tear anything down when the
@@ -531,7 +572,19 @@ async fn pump(
                 buf[..n].fill(0);
             }
             match iso_in.write(&buf[..n]).await {
-                Ok(()) => {}
+                Ok(()) => {
+                    // `wait_enabled()` only returns on an alt-setting change. A
+                    // host that keeps the interface selected but stops polling
+                    // produces no error at all — the write just blocks — so the
+                    // trim above never re-runs while the pipe fills. Catch it
+                    // where it actually shows: a gap between delivered packets
+                    // far longer than the one-frame polling interval.
+                    let now = Instant::now();
+                    if now.duration_since(last_write) > Duration::from_millis(20) {
+                        PIPE.lock(|p| p.borrow_mut().trim_to_target());
+                    }
+                    last_write = now;
+                }
                 // The host deselected the stream; normal, just wait to be
                 // re-enabled.
                 Err(EndpointError::Disabled) => break,

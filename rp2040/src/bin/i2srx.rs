@@ -80,7 +80,12 @@ async fn main(_spawner: Spawner) {
             Either::Second(_) => false,
         };
 
-        let nonzero = raw.iter().filter(|&&w| (w & 0xFFFF) != 0).count();
+        // Each word is a whole frame now: left in the top half, right in the
+        // bottom. Count a frame as live if either channel is non-zero.
+        let nonzero = raw
+            .iter()
+            .filter(|&&w| (w >> 16) as u16 != 0 || w as u16 != 0)
+            .count();
         led.set(if !got {
             RGB8::new(16, 0, 0) // stalled
         } else if nonzero < 4 {

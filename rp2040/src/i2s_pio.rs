@@ -69,7 +69,19 @@ pub fn slave_rx<'d, P: Instance, const SM: usize>(
         "    wait 1 pin 1",
         "    in pins, 1",
         "    jmp x-- left",
-        "    push noblock",
+        // No push here. Both channels are shifted into the ISR and pushed as a
+        // single 32-bit word, so one FIFO word is one whole FRAME.
+        //
+        // Pushing each sample separately makes frame alignment depend on the
+        // parity of the FIFO: the DMA moves words, nothing ties a word boundary
+        // to a frame boundary, and an odd number of samples left in the FIFO
+        // when a transfer starts rotates every frame after it by one sample —
+        // exchanged channels plus a one-sample skew, for the whole session, and
+        // dependent on timing at reset. Nothing is lost when that happens, so no
+        // counter can see it and it passes by ear.
+        //
+        // Pushing whole frames removes the parity entirely: there is no way to
+        // be half a frame out.
         "    wait 1 pin 2",
         "    wait 1 pin 1",
         "    set x, 15",
@@ -103,9 +115,10 @@ pub fn slave_rx<'d, P: Instance, const SM: usize>(
     cfg.use_program(&common.load_program(&prg.program), &[]);
     cfg.set_in_pins(&[&data, &bck, &lrck]);
     // MSB first: the first bit sampled must end up in bit 15.
+    // 32 bits per push: left sample in the top half, right in the bottom.
     cfg.shift_in = ShiftConfig {
         auto_fill: false,
-        threshold: 16,
+        threshold: 32,
         direction: ShiftDirection::Left,
     };
     cfg.fifo_join = FifoJoin::RxOnly;
@@ -178,9 +191,10 @@ pub fn master_rx<'d, P: Instance, const SM: usize>(
     let mut cfg = Config::default();
     cfg.use_program(&common.load_program(&prg.program), &[&bck, &lrck]);
     cfg.set_in_pins(&[&data]);
+    // 32 bits per push: left sample in the top half, right in the bottom.
     cfg.shift_in = ShiftConfig {
         auto_fill: false,
-        threshold: 16,
+        threshold: 32,
         direction: ShiftDirection::Left,
     };
     cfg.fifo_join = FifoJoin::RxOnly;
