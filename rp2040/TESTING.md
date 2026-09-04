@@ -158,3 +158,95 @@ thing to be wrong on first power-up; a channel-swapped or distorted signal point
 there rather than at anything in this document. `teslamic-rp-car-STRESS-TEST.uf2`
 is the exception — it generates audio internally and touches no PIO at all, so it
 is the safest first thing to flash.
+
+## Bit-exact end-to-end verification
+
+`tools/bitcompare.py` compares a recording made through the bridge against the
+file that was played. It is a far stronger test than listening or than any
+status LED, because it proves a negative those cannot: that no sample was lost,
+repeated, truncated, reordered, rescaled or mis-framed anywhere between the
+source and the recorder.
+
+```sh
+tools/bitcompare.py reference.wav recording.wav
+tools/bitcompare.py --self-test
+```
+
+It aligns the two by correlation, checks that alignment is real, then names what
+it finds:
+
+| Result | Means |
+|---|---|
+| bit-exact | nothing lost, repeated, rescaled or reordered |
+| every sample off by 1 LSB | a truncating `int16 -> float -> int16` round-trip; nothing lost |
+| N frames missing at a point | a discrete discard, located to the frame |
+| repeated frame | a slip down: a starved batch was padded |
+| channels swapped **and** one sample skewed | the capture lost frame alignment |
+| a constant gain | a volume not at unity — the chain, not the bridge |
+| not the same audio | wrong file, or the capture missed it |
+
+The tool self-tests against synthesised versions of every fault it names, so a
+result from it means something before it is pointed at real audio.
+
+### Setting up a bit-exact chain
+
+Most failures will be the chain rather than the bridge:
+
+* The source file must **already** be 48 kHz, 16-bit. Anything else is resampled
+  or dithered before it reaches us.
+* The player needs a bit-perfect path to USB audio, volume at 100%, with every
+  effect and normalisation off. On Android, USB Audio Player Pro does this;
+  the stock mixer rescales and may drop buffers.
+* **Record 32-bit float.** Recording 16-bit adds a truncating conversion that
+  leaves ~9% of samples one LSB low. Harmless to listen to, but it hides
+  everything else, because with every frame differing an exact comparison
+  reports total corruption.
+
+`ffmpeg -f avfoundation` is **not** a usable capture path: measured at about 10%
+sustained frame loss (a 5 s capture returned 4.499 s), which destroys sample
+alignment while leaving the spectrum intact — so it looks like a bridge fault.
+`tools/record-mac.sh` is kept only as a record of that.
+
+## Result: bit-exact, three consecutive cold boots
+
+Android (USB Audio Player Pro, bit-perfect) -> source RP2040 -> I2S -> car
+RP2040 -> USB -> Mac, recorded at 32-bit float, compared against the file on the
+phone. Three runs with a reset of the car board between each:
+
+```
+RUN 1  aligned 1.420 s   2,784,000 frames   PASS bit-exact
+RUN 2  aligned 1.990 s   2,784,000 frames   PASS bit-exact
+RUN 3  aligned 1.878 s   2,784,000 frames   PASS bit-exact
+```
+
+**8,352,000 frames, every one identical.** No loss, no repetition, no drift, no
+rescaling, correct channel mapping, correct frame alignment — verifying the
+elastic pacing, the I2S framing, the channel order and the clock-domain crossing
+together.
+
+Repeating across resets is the point, not thoroughness for its own sake. Frame
+alignment used to be decided by the parity of whatever sat in the RX FIFO at
+startup, so roughly half of boots were rotated and a single pass proved only
+that the coin had landed the right way up. Pushing whole frames removed the
+coin. One pass would not have shown that; three across three boots does.
+
+## Earlier single-run result, 2026-09-04
+
+Android (USB Audio Player Pro) -> source RP2040 -> I2S -> car RP2040 -> USB ->
+Mac, recorded at 32-bit float, compared against the file on the phone:
+
+```
+max fractional error: 0.0
+compared 2,784,000 frames (58.0 s)
+PASS  bit-exact: every sample matches
+```
+
+Every sample arrived identical. No loss, no repetition, no drift, no rescaling,
+correct channel mapping, correct frame alignment — which verifies the elastic
+pacing, the I2S framing, the channel order and the clock-domain crossing all at
+once.
+
+Two firmware faults had to be fixed to reach it, and **neither was visible to
+any counter or by ear**: an unprimed pipe was paced as maximum negative drift
+and emitted short packets, and the capture could start on the wrong half of a
+frame, rotating every sample for the session.
