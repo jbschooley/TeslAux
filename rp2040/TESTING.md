@@ -314,3 +314,39 @@ that window.
 
 Neither counter is cleared by resuming playback: they are a record of the whole
 run. **Power-cycle the board for a fresh reading.**
+
+## Bit-exact end-to-end verification
+
+`tools/bitcompare.py` compares a recording made through the bridge against the
+file that was played. It is a stronger test than any LED code, because it proves
+a negative that counters can only approximate: that no sample was lost,
+repeated, truncated, reordered or rescaled anywhere between the source and the
+recorder.
+
+```sh
+tools/bitcompare.py reference.wav recording.wav
+tools/bitcompare.py --self-test
+```
+
+It aligns the two by correlation — the recording starts wherever it starts — and
+then names what it finds:
+
+| Result | Means |
+|---|---|
+| bit-exact | nothing was lost, repeated, rescaled or reordered |
+| repeated frame | a slip down: the pacer padded a starved batch |
+| dropped frame | a slip up: the pacer discarded to shed drift |
+| run of zeros | a dropout: muted, or the pipe reset |
+| channels swapped | the I2S slot mapping is inverted |
+| nearly everything differs | a chain problem, not a firmware fault |
+
+**The setup is the hard part, and most failures will be the chain rather than
+the bridge.** The source file must already be 48 kHz 16-bit, since anything else
+is resampled or dithered before it reaches us; the player needs a bit-perfect
+path with volume at 100% and all effects off, because Android mixes and rescales
+by default and 99% volume is a multiply; and the recorder must be at unity gain
+with no plugins. A chain fault shows up as everything differing at once, which is
+easy to tell from the localised differences a firmware fault produces.
+
+The tool self-tests against synthesised versions of each fault it names, so a
+result from it means something before it is pointed at real audio.
