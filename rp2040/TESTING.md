@@ -430,7 +430,23 @@ essentially normal, and every fault counter reads clean, because no sample is
 lost — they are merely all in the wrong half of a frame. `tools/bitcompare.py`
 detects it by testing a one-sample shift.
 
-### Recording without a DAW
+### Recording without a DAW — does not work
+
+**`ffmpeg -f avfoundation` drops about 10% of frames.** Measured: a 5 s capture
+returned 4.499 s, a 70 s capture returned 63.8 s, sustained rather than a
+startup offset. Losses scattered through the stream destroy sample alignment
+entirely, so the capture cannot be compared against a reference at all — even
+though its spectrum matches the reference closely enough to prove it is the
+right audio.
+
+The reliable way to remove the DAW's int16 conversion is to **record 32-bit
+float in the DAW**. `bitcompare.py` reads float WAVs and reports whether the
+samples are whole numbers, which is the same test with none of the capture
+risk.
+
+The script below is kept only as a record of a path that does not work.
+
+### The script (unreliable)
 
 `tools/record-mac.sh` captures the TeslaMic straight to a **float32** WAV with
 ffmpeg, which takes the DAW out of the chain:
