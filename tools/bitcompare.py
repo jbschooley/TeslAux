@@ -47,8 +47,57 @@ to tell apart from the localised differences a firmware fault produces."""
 CHANNELS = 2
 
 
+def read_float_wav(path):
+    """Read an IEEE-float WAV, which `wave` refuses. Returns (data, rate) or None.
+
+    Worth the trouble: CoreAudio hands applications float32, and a 16-bit sample
+    converts to float32 exactly. So a float recording that comes back as whole
+    numbers proves the samples reached the recorder untouched — the int16 they
+    are eventually written as is a separate, later conversion, and the usual
+    place a least significant bit goes missing.
+    """
+    with open(path, "rb") as f:
+        raw = f.read()
+    if raw[:4] != b"RIFF" or raw[8:12] != b"WAVE":
+        return None
+    pos, fmt, rate, ch, data = 12, None, None, None, None
+    while pos + 8 <= len(raw):
+        cid = raw[pos : pos + 4]
+        size = int.from_bytes(raw[pos + 4 : pos + 8], "little")
+        body = raw[pos + 8 : pos + 8 + size]
+        if cid == b"fmt ":
+            fmt = int.from_bytes(body[0:2], "little")
+            ch = int.from_bytes(body[2:4], "little")
+            rate = int.from_bytes(body[4:8], "little")
+            bits = int.from_bytes(body[14:16], "little")
+            if fmt == 0xFFFE and len(body) >= 26:
+                fmt = int.from_bytes(body[24:26], "little")
+        elif cid == b"data":
+            data = body
+        pos += 8 + size + (size & 1)
+    if fmt != 3 or data is None or bits != 32:
+        return None
+    return np.frombuffer(data, dtype="<f4").reshape(-1, ch), rate
+
+
 def read_wav(path):
     """Return (frames, rate) as an int16 array of shape (n, 2)."""
+    fl = read_float_wav(path)
+    if fl is not None:
+        x, rate = fl
+        scaled = x.astype(np.float64) * 32768.0
+        err = np.abs(scaled - np.rint(scaled))
+        integral = float(err.max()) < 1e-3
+        print(
+            f"note: {path} is float32; samples are "
+            + (
+                "exact integers -> reached the recorder untouched"
+                if integral
+                else f"NOT integral (max fractional error {err.max():.4f}) -> "
+                "something scaled or resampled them"
+            )
+        )
+        return np.clip(np.rint(scaled), -32768, 32767).astype(np.int16)[:, :CHANNELS], rate
     with wave.open(path, "rb") as w:
         if w.getnchannels() != CHANNELS:
             raise SystemExit(f"{path}: expected stereo, got {w.getnchannels()} channels")

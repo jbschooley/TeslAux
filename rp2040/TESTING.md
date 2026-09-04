@@ -429,3 +429,27 @@ This was found by bit-comparison, not by ear or by an LED: the audio sounds
 essentially normal, and every fault counter reads clean, because no sample is
 lost — they are merely all in the wrong half of a frame. `tools/bitcompare.py`
 detects it by testing a one-sample shift.
+
+### Recording without a DAW
+
+`tools/record-mac.sh` captures the TeslaMic straight to a **float32** WAV with
+ffmpeg, which takes the DAW out of the chain:
+
+```sh
+tools/record-mac.sh ~/Documents/capture.wav 70
+tools/bitcompare.py reference.wav ~/Documents/capture.wav
+```
+
+float32 is what CoreAudio hands applications, and a 16-bit sample converts to
+float32 **exactly**, so this adds no conversion of its own. `bitcompare.py`
+reports whether the float samples came back as whole numbers, which localises a
+missing least significant bit:
+
+| Float samples | Means |
+|---|---|
+| exact integers, matching the reference | the USB path is bit-perfect; any earlier 1 LSB was the DAW's int16 conversion |
+| exact integers, uniformly scaled | something applied a volume — check the input level in Audio MIDI Setup |
+| not integral | something resampled or processed them |
+
+Adjust the device index in the script if needed:
+`ffmpeg -f avfoundation -list_devices true -i ""`.
