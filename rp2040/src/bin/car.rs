@@ -638,7 +638,6 @@ async fn capture(
         }
         last_block = now;
         SOURCE_LIVE.store(true, Ordering::Relaxed);
-        LAST_ACTIVE_MS.store(now.as_millis() as u32, Ordering::Relaxed);
         // The link recovered, so the stall that preceded it was real.
         if pending_stall {
             faults::bump(&faults::I2S_STALLS);
@@ -883,6 +882,15 @@ async fn pump(
             match iso_in.write(&buf[..n]).await {
                 Ok(()) => {
                     STREAMING.store(true, Ordering::Relaxed);
+                    // Audio actually moved end to end. Updated here rather than
+                    // in `capture` because a source that is still clocking into
+                    // a host that has stopped listening is not activity — and
+                    // that is exactly the state you leave the board in when you
+                    // close the host application to read the report.
+                    LAST_ACTIVE_MS.store(
+                        Instant::now().as_millis() as u32,
+                        Ordering::Relaxed,
+                    );
 
                     // A host that stops *polling* never changes the alt setting,
                     // so `wait_enabled()` above does not come back around and the
@@ -1005,7 +1013,7 @@ fn current_state() -> status::State {
     use core::sync::atomic::Ordering;
     if MUTED.load(Ordering::Relaxed) || OVERSIZE.load(Ordering::Relaxed) {
         status::State::Fault
-    } else if SOURCE_LIVE.load(Ordering::Relaxed) {
+    } else if SOURCE_LIVE.load(Ordering::Relaxed) && STREAMING.load(Ordering::Relaxed) {
         status::State::Ok
     } else if (Instant::now().as_millis() as u32)
         .wrapping_sub(LAST_ACTIVE_MS.load(Ordering::Relaxed))
