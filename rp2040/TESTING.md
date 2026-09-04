@@ -194,6 +194,14 @@ deadband edge reads `HYSTERESIS + 48` and trips any threshold set relative to th
 deadband. That is what produced a false code 1 after activating the host
 mid-playback.
 
+Counts are **published with a one-second lag**, and only from a block where the
+stream is healthy. Reading this report requires unplugging the source, and that
+is a violent event: the source board browns out rather than stopping cleanly, so
+its clock degrades, the PIO sees glitched edges and the buffer drains — all of
+which the counters faithfully recorded. Lagging the published value means the
+disturbance cannot reach it, because no healthy block arrives afterwards to
+publish it. A real fault during steady streaming still lands at the next publish.
+
 **Every counter here shares one gate**: the stream is open *and* the pacer has
 the level inside its deadband (`SETTLED`). That single condition replaced a
 series of per-counter workarounds. Each counter, as it was added, first reported

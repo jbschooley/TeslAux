@@ -516,6 +516,11 @@ async fn capture(
     // contributed. See the accounting where these are used.
     let (mut under_base, mut under_acc) = (0u32, 0u32);
     let (mut over_base, mut over_acc) = (0u32, 0u32);
+    // Overflow is tallied locally and published with the others, below.
+    let mut pio_hits = 0u32;
+    // Blocks since the last publish. Publishing lags deliberately — see below.
+    let mut publish_ticks = 0u32;
+    const PUBLISH_EVERY: u32 = (teslamic::SAMPLE_RATE as usize / I2S_BLOCK) as u32;
 
     #[cfg(feature = "clock-locked")]
     let (mut win_sofs, mut last_sof) =
@@ -562,7 +567,7 @@ async fn capture(
         // Hand the previous block to the pipe while the DMA fills the next one.
         if have_work {
             if overflowed && streaming {
-                faults::bump(&faults::PIO_OVERFLOW);
+                pio_hits = pio_hits.saturating_add(1);
             }
 
             PIPE.lock(|p| {
@@ -653,14 +658,36 @@ async fn capture(
             under_base = under;
             over_base = over;
         }
-        faults::UNDERRAN.store(
-            under_acc.saturating_add(under.saturating_sub(under_base)),
-            Ordering::Relaxed,
-        );
-        faults::OVERRAN.store(
-            over_acc.saturating_add(over.saturating_sub(over_base)),
-            Ordering::Relaxed,
-        );
+        // Publish at most once a second, and only from a block where the
+        // stream is genuinely healthy.
+        //
+        // Reading this report requires unplugging the source, and unplugging is
+        // itself a violent event: the source board browns out rather than
+        // stopping cleanly, so its clock degrades, the PIO sees glitched edges
+        // and the buffer drains — all of which the counters faithfully record.
+        // Every code this latch has ever shown fired during that window or the
+        // matching one at stream start.
+        //
+        // Lagging the published value by a second means the disturbance can
+        // never reach it: by the time anything goes wrong, no further healthy
+        // block arrives to publish it. The live tallies keep running, so a real
+        // fault during steady streaming still lands at the next publish.
+        publish_ticks = publish_ticks.saturating_add(1);
+        if streaming
+            && off.unsigned_abs() <= HYSTERESIS as u32
+            && publish_ticks >= PUBLISH_EVERY
+        {
+            publish_ticks = 0;
+            faults::UNDERRAN.store(
+                under_acc.saturating_add(under.saturating_sub(under_base)),
+                Ordering::Relaxed,
+            );
+            faults::OVERRAN.store(
+                over_acc.saturating_add(over.saturating_sub(over_base)),
+                Ordering::Relaxed,
+            );
+            faults::PIO_OVERFLOW.store(pio_hits, Ordering::Relaxed);
+        }
 
         // Peak excursion is measured in `pump`, not here. The level sawtooths
         // by a whole USB packet every millisecond — this task pushes an I2S
