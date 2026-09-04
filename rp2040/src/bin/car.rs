@@ -538,6 +538,17 @@ async fn pump(
     loop {
         iso_in.wait_enabled().await;
 
+        // Start the rate measurement afresh. The detector counts captured I2S
+        // frames against USB frames, and USB frames only tick while the pump is
+        // writing — so across a gap it holds a large capture count against no
+        // frames at all, and its first window after the stream reopens reports
+        // an absurd rate. An unclassifiable rate mutes, so this cost a full
+        // second of silence every time the host selected alt 1 — which the car
+        // does constantly.
+        detect = RateDetect::new(1000);
+        last_captured = CAPTURED.load(Ordering::Relaxed);
+        MUTED.store(false, Ordering::Relaxed);
+
         // The car toggles AudioStreaming alt1/alt0 constantly (seen in the
         // on-screen USB spy capture), so do NOT tear anything down when the
         // stream goes idle — just stop writing and wait to be re-enabled.
