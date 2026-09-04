@@ -219,6 +219,22 @@ via `#[path]` rather than copied:
 A path include rather than a shared crate, so the car-proven RP2040 build stays
 untouched.
 
+## Shared with the two-board build
+
+`audio_pipe.rs` is compiled from `../rp2040/src/`, so fixes there land here too —
+but only once this branch has them. Two matter:
+
+- **`plan()` must not pace an unprimed pipe.** Without the guard an empty buffer
+  reads as maximum negative drift, so every packet is emitted one frame short.
+- **`trim_to_target()` on stream open and on poll resume.** Nothing drains the
+  pipe until the car polls, so it pegs at capacity; the pacer then sheds one
+  frame per packet and stops as soon as the level is inside the deadband, never
+  returning to target. Latency ends up set by whether the phone or the car came
+  up first, for the whole session.
+
+Removing the I2S link did not remove that second one. It is a property of a
+producer that runs while the consumer is idle, which both designs have.
+
 ## Not ported
 
 - **Rate following.** The RP2040 car board follows 32/44.1/48 kHz because a

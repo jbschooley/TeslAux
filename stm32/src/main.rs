@@ -395,8 +395,22 @@ async fn sink(mut ep: impl EndpointOut) -> ! {
 async fn pump(mut iso_in: impl EndpointIn) -> ! {
     let mut buf = [0u8; teslamic::BYTES_PER_FRAME + 8];
     let mut frames: u32 = 0;
+    let mut last_write = embassy_time::Instant::now();
     loop {
         iso_in.wait_enabled().await;
+
+        // Drop whatever piled up while the car was not listening.
+        //
+        // Nothing drains the pipe until the car polls, so it pegs at capacity;
+        // the pacer then sheds one frame per packet and stops as soon as the
+        // level is inside the deadband, so it never returns to target. The level
+        // parks at the deadband edge for the rest of the session, which makes
+        // latency depend on nothing but whether the phone or the car came up
+        // first — and the car serves a backlog before live audio.
+        //
+        // Removing the I2S link did not remove this one: it is a property of a
+        // producer that runs while the consumer is idle, which both designs have.
+        PIPE.lock(|p| p.borrow_mut().trim_to_target());
 
         // The car toggles AudioStreaming alt1/alt0 constantly (seen in the
         // on-screen USB spy capture), so do NOT tear anything down when the
@@ -404,7 +418,19 @@ async fn pump(mut iso_in: impl EndpointIn) -> ! {
         loop {
             let n = PIPE.lock(|p| p.borrow_mut().take(&mut buf, MODE));
             match iso_in.write(&buf[..n]).await {
-                Ok(()) => {}
+                Ok(()) => {
+                    // `wait_enabled()` above only returns on an alt-setting
+                    // change. A host that keeps the interface selected but stops
+                    // polling produces no error at all — the write simply blocks
+                    // — so the trim there never re-runs while the pipe fills.
+                    // Catch it where it actually shows: a gap between delivered
+                    // packets far longer than the one-frame polling interval.
+                    let now = embassy_time::Instant::now();
+                    if now.duration_since(last_write) > embassy_time::Duration::from_millis(20) {
+                        PIPE.lock(|p| p.borrow_mut().trim_to_target());
+                    }
+                    last_write = now;
+                }
                 Err(EndpointError::Disabled) => break,
                 Err(EndpointError::BufferOverflow) => {
                     OVERSIZE.store(true, Ordering::Relaxed);
