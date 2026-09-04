@@ -495,10 +495,7 @@ async fn capture(
     // count at the start of the current session; `acc` is what earlier sessions
     // contributed. See the accounting where these are used.
     let (mut starve_base, mut starve_acc) = (0u32, 0u32);
-    // Peak excursion is only meaningful once the level has actually reached its
-    // operating band this session. Coming out of alt 0 the pipe is pegged at
-    // capacity and sheds down over ~200 ms; that ramp is the stream starting.
-    let mut settled = false;
+
     #[cfg(feature = "clock-locked")]
     let (mut win_sofs, mut last_sof) =
         (0u32, USB_FRAMES.load(core::sync::atomic::Ordering::Relaxed));
@@ -585,7 +582,6 @@ async fn capture(
                 // recovery is the buffer draining because the source stopped —
                 // which is the disconnect, not a fault.
                 starve_acc = faults::STARVED.load(Ordering::Relaxed);
-            settled = false;
             }
             continue;
         }
@@ -635,25 +631,13 @@ async fn capture(
             starve_base = total;
         }
 
-        // Settled once the level has come inside the deadband; unsettled again
-        // whenever the stream stops. No time constant needed — the condition is
-        // exactly "the pacer has the level under control".
-        if !streaming {
-            settled = false;
-        } else if off.unsigned_abs() <= HYSTERESIS as u32 {
-            settled = true;
-        }
-        if settled && streaming {
-            let mag = off.unsigned_abs();
-            let slot = if off > 0 {
-                &faults::PEAK_HIGH
-            } else {
-                &faults::PEAK_OFF
-            };
-            if mag > slot.load(Ordering::Relaxed) {
-                slot.store(mag, Ordering::Relaxed);
-            }
-        }
+        // Peak excursion is measured in `pump`, not here. The level sawtooths
+        // by a whole USB packet every millisecond — this task pushes an I2S
+        // block three times per packet, the pump removes ~48 frames once — so
+        // sampling just after a push reads the top of that ramp while the pacer
+        // acts on the bottom. Measured here, a perfectly healthy buffer sitting
+        // at the deadband edge reads `HYSTERESIS + 48` and trips any threshold
+        // set relative to the deadband.
         faults::STARVED.store(
             starve_acc.saturating_add(total.saturating_sub(starve_base)),
             Ordering::Relaxed,
@@ -728,6 +712,8 @@ async fn pump(
     let mut buf = [0u8; teslamic::BYTES_PER_FRAME + 8];
     let mut detect = RateDetect::new(1000);
     let mut last_captured = CAPTURED.load(Ordering::Relaxed);
+    // True once the pacer has the level inside its deadband this session.
+    let mut settled = false;
     #[cfg(feature = "packet-stress")]
     let (mut phase, mut stress_hi) = (0u32, false);
 
@@ -776,7 +762,32 @@ async fn pump(
                 frames * 4
             };
             #[cfg(not(feature = "packet-stress"))]
-            let n = PIPE.lock(|p| p.borrow_mut().take(&mut buf, MODE));
+            let n = PIPE.lock(|p| {
+                let mut pipe = p.borrow_mut();
+
+                // Sample the level exactly where the pacer does: once per USB
+                // packet, before taking any frames. That is the bottom of the
+                // per-millisecond sawtooth and the value `plan()` acts on, so a
+                // threshold set relative to the deadband means what it says.
+                let off = pipe.off_target();
+                if !SOURCE_LIVE.load(Ordering::Relaxed) || !pipe.primed() {
+                    settled = false;
+                } else if off.unsigned_abs() <= HYSTERESIS as u32 {
+                    settled = true;
+                }
+                if settled {
+                    let slot = if off > 0 {
+                        &faults::PEAK_HIGH
+                    } else {
+                        &faults::PEAK_OFF
+                    };
+                    if off.unsigned_abs() > slot.load(Ordering::Relaxed) {
+                        slot.store(off.unsigned_abs(), Ordering::Relaxed);
+                    }
+                }
+
+                pipe.take(&mut buf, MODE)
+            });
             if MUTED.load(Ordering::Relaxed) {
                 buf[..n].fill(0);
             }

@@ -184,6 +184,15 @@ reported the pacer working. It also produced a false code 1 every time the host
 selected alt 1 after a gap: nothing drains the pipe on alt 0, so it pegs at
 capacity and then sheds ~200 frames back to target, one per packet.
 
+Peak excursion is measured **in the pump, once per USB packet, before any
+frames are taken** — the same point the pacer acts on. Phase matters more than
+it looks: the level sawtooths by a whole USB packet every millisecond, because
+capture pushes an I2S block three times per packet while the pump removes ~48
+frames once. Sampled just after a push, a perfectly healthy buffer parked at the
+deadband edge reads `HYSTERESIS + 48` and trips any threshold set relative to the
+deadband. That is what produced a false code 1 after activating the host
+mid-playback.
+
 Every counter here is gated on the pump actually writing packets, and peak
 excursion additionally waits until the level has come inside the deadband at
 least once in the current session — which is exactly "the pacer has the level
