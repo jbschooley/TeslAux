@@ -770,6 +770,7 @@ async fn pump(
     let mut settled = false;
     // When the host last actually took a packet.
     let mut last_write = Instant::now();
+    let (mut peak_high_live, mut peak_low_live) = (0u32, 0u32);
     #[cfg(feature = "packet-stress")]
     let (mut phase, mut stress_hi) = (0u32, false);
 
@@ -843,14 +844,20 @@ async fn pump(
                     settled = true;
                 }
                 SETTLED.store(settled, Ordering::Relaxed);
+                // Accumulate locally; publish only from a healthy moment, the
+                // same rule the other counters use. Writing straight through
+                // left this one counter still reachable by the disturbance that
+                // reading the report creates.
                 if settled {
-                    let slot = if off > 0 {
-                        &faults::PEAK_HIGH
+                    let mag = off.unsigned_abs();
+                    if off > 0 {
+                        peak_high_live = peak_high_live.max(mag);
                     } else {
-                        &faults::PEAK_OFF
-                    };
-                    if off.unsigned_abs() > slot.load(Ordering::Relaxed) {
-                        slot.store(off.unsigned_abs(), Ordering::Relaxed);
+                        peak_low_live = peak_low_live.max(mag);
+                    }
+                    if mag <= HYSTERESIS as u32 {
+                        faults::PEAK_HIGH.store(peak_high_live, Ordering::Relaxed);
+                        faults::PEAK_OFF.store(peak_low_live, Ordering::Relaxed);
                     }
                 }
 
