@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: MIT
+[package]
+name    = "teslaux-stm32"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Single-chip TeslAux bridge: phone and car both attach to one STM32F407, no I2S link."
+
+[[bin]]
+name = "bridge"
+path = "src/main.rs"
+
+[features]
+default = []
+# Halve the cushion: ring 256 (2.67 ms) with a 64-frame deadband, instead of
+# ring 512 (5.33 ms) with 192.
+#
+# The deadband is set by how much the PHONE bunches packets, not by the chip.
+# The default 192 is the figure the RP2040 source board uses and has been proven
+# with an iPhone; 64 is the tighter bound that the measured peak excursion
+# (<64 frames, from the MEASURE build) suggests is reachable. Measure before
+# trusting it: this is the one number that decides whether the single-chip
+# design lands near 4.7 ms or near 7.3 ms end to end.
+low-latency = []
+
+[dependencies]
+# embassy-usb is the same 0.6 the RP2040 build uses, which is why
+# `teslamic.rs` compiles here unchanged.
+embassy-stm32    = { version = "0.6", features = ["stm32f407ve", "time-driver-any", "memory-x", "unstable-pac"] }
+embassy-usb      = { version = "0.6", default-features = false }
+embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread"] }
+embassy-time     = { version = "0.5" }
+embassy-futures  = { version = "0.1" }
+embassy-sync     = { version = "0.7" }
+
+cortex-m    = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "0.7"
+
+[profile.release]
+opt-level     = "s"
+lto           = true
+debug         = 2
+codegen-units = 1

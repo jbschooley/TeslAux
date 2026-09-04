@@ -1,0 +1,405 @@
+// SPDX-License-Identifier: MIT
+//! TeslAux, single chip.
+//!
+//! The two-board rig puts the phone on one RP2040 and the car on another, with
+//! an I2S link between them. That link is the only reason the RP2040 build has
+//! a PIO driver, two ring buffers, a clock-steering control loop, and three
+//! separate clock domains to reconcile.
+//!
+//! The STM32F407 has **two independent USB device controllers**, so both hosts
+//! attach to one chip and the link disappears:
+//!
+//! ```text
+//!   phone --USB--> OTG_HS (PB14/PB15)  ->  Pipe  ->  OTG_FS (PA11/PA12) --USB--> car
+//!                  UAC1 speaker                      TeslaMic
+//! ```
+//!
+//! What that buys, concretely:
+//!
+//!   * **No I2S at all.** Both streams live in one address space, so audio moves
+//!     by memcpy instead of over a wire. The whole class of bugs from the RP2040
+//!     bring-up — floating inputs streaming noise, PIO divider quantisation,
+//!     bit alignment, a jumper twitching in a moving car — cannot occur here.
+//!   * **One clock crossing instead of three.** The phone's frame clock versus
+//!     the car's frame clock, absorbed losslessly by varying the packet size to
+//!     the car. That mechanism is already proven in the car on the RP2040 build.
+//!   * **No sample slipping.** Elastic pacing alone covers it, so the deadband
+//!     rule that bit the RP2040 three times has one producer to satisfy, not two.
+//!
+//! What it does *not* buy: the cushion. That is set by how much the phone bunches
+//! packets, which is a property of iOS/Android and not of the chip. See `RING`.
+
+#![no_std]
+#![no_main]
+
+// The clock-domain logic is HAL-free and has 27 host-run tests, so it is
+// compiled straight out of the RP2040 tree rather than copied. Same for the
+// TeslaMic descriptors, which are generic over `embassy_usb::driver::Driver`
+// and therefore already chip-agnostic — porting them changed nothing.
+//
+// A path include rather than a shared crate: it leaves the car-proven RP2040
+// build completely untouched, and there is exactly one consumer.
+#[path = "../../rp2040/src/audio_pipe.rs"]
+mod audio_pipe;
+#[path = "../../rp2040/src/teslamic.rs"]
+mod teslamic;
+
+mod speaker;
+mod status;
+
+use audio_pipe::{PaceMode, Pipe};
+use core::cell::RefCell;
+use core::sync::atomic::{AtomicBool, Ordering};
+use embassy_executor::Spawner;
+use embassy_futures::join::join;
+use embassy_stm32::gpio::{Level, Output, Speed};
+use embassy_stm32::time::Hertz;
+use embassy_stm32::{bind_interrupts, peripherals, usb};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex;
+use embassy_usb::driver::{EndpointError, EndpointIn, EndpointOut};
+use embassy_usb::{Builder, UsbDevice};
+
+use embassy_usb::class::hid::State as HidState;
+use teslamic::{If3Handler, KeyboardHandler};
+
+/// Frames in one USB packet at 48 kHz. This is the producer's burst size, and
+/// the deadband below has to exceed it.
+const FRAMES_PER_PACKET: usize = (speaker::RATE / 1000) as usize;
+
+/// Ring capacity in frames. The pipe steers toward `RING / 2`, so half of this
+/// is the steady-state latency: 256 frames = 5.33 ms at 48 kHz.
+///
+/// Sized by the phone, not by the chip. The producer is a USB packet from the
+/// host — 48 frames, and hosts bunch several together — where on the RP2040 car
+/// board the producer was a 16-frame I2S DMA block. So collapsing two boards
+/// into one removes a whole cushion but does not shrink the remaining one.
+#[cfg(not(feature = "low-latency"))]
+const RING: usize = 512;
+#[cfg(feature = "low-latency")]
+const RING: usize = 256;
+
+/// Slip deadband. 192 = four USB frames, tolerating a host that bunches up to
+/// three packets; this is the figure the RP2040 source board runs and has been
+/// proven with an iPhone.
+#[cfg(not(feature = "low-latency"))]
+const HYSTERESIS: usize = 192;
+#[cfg(feature = "low-latency")]
+const HYSTERESIS: usize = 64;
+
+/// The rule that was violated three separate times during the RP2040 bring-up:
+/// **the deadband must exceed the producer's burst, and both must fit inside the
+/// cushion.** A deadband at or above the target means the pacer can never
+/// correct; a deadband below the burst means every burst trips a correction.
+/// Checked here at compile time so it cannot be got wrong again.
+const _: () = {
+    assert!(
+        HYSTERESIS > FRAMES_PER_PACKET,
+        "deadband must exceed one USB packet, or every packet trips a correction"
+    );
+    assert!(
+        HYSTERESIS + FRAMES_PER_PACKET < RING / 2,
+        "deadband plus one producer burst does not fit in the cushion; grow RING"
+    );
+};
+
+/// Elastic: absorb the phone-vs-car clock difference by varying how many frames
+/// go into each packet to the car. Lossless, unlike slipping a sample, and the
+/// mechanism already proven in the car on the RP2040 build.
+const MODE: PaceMode = PaceMode::Elastic;
+
+static PIPE: Mutex<CriticalSectionRawMutex, RefCell<Pipe<RING>>> =
+    Mutex::new(RefCell::new(Pipe::new_with_hysteresis(
+        speaker::RATE,
+        HYSTERESIS,
+    )));
+
+/// True while the phone's stream is open and delivering.
+static SOURCE_LIVE: AtomicBool = AtomicBool::new(false);
+/// Latched: we tried to send more than wMaxPacketSize. A firmware bug, not a
+/// transient — the packet is silently dropped and the audio degrades to a click
+/// at every boundary, which does not sound like a drift problem at all.
+static OVERSIZE: AtomicBool = AtomicBool::new(false);
+
+/// Latched record of what went wrong since boot, for reading back after a drive.
+///
+/// You cannot watch an LED while driving, and "it sounded weird once or twice"
+/// does not say whether the pacer slipped, the buffer ran dry, or the phone
+/// dropped the stream — which have different fixes.
+mod faults {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    /// Pacer corrected drift, sampled from the pipe's own counters.
+    pub static SLIPS: AtomicU32 = AtomicU32::new(0);
+    /// The phone's stream went away mid-run.
+    pub static SOURCE_DROPS: AtomicU32 = AtomicU32::new(0);
+    /// Buffer ran dry or overflowed; the cushion was not big enough.
+    pub static STARVED: AtomicU32 = AtomicU32::new(0);
+
+    pub fn bump(c: &AtomicU32) {
+        c.store(c.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
+    }
+
+    /// Worst thing seen, most serious first, as a blink count. `None` means a
+    /// clean run.
+    ///
+    /// A handful of slips over a drive is normal and not worth reporting, so
+    /// that one has a threshold. The other two are individually audible.
+    pub fn worst() -> Option<u8> {
+        if STARVED.load(Ordering::Relaxed) > 0 {
+            Some(3)
+        } else if SOURCE_DROPS.load(Ordering::Relaxed) > 1 {
+            Some(2)
+        } else if SLIPS.load(Ordering::Relaxed) > 8 {
+            Some(1)
+        } else {
+            None
+        }
+    }
+}
+
+bind_interrupts!(struct Irqs {
+    OTG_FS => usb::InterruptHandler<peripherals::USB_OTG_FS>;
+    OTG_HS => usb::InterruptHandler<peripherals::USB_OTG_HS>;
+});
+
+/// Car-facing: the onboard USB-C connector, wired to PA11/PA12 through 22R.
+type CarDriver = usb::Driver<'static, peripherals::USB_OTG_FS>;
+/// Phone-facing: the SparkFun breakout on PB14/PB15, OTG_HS running its
+/// internal full-speed PHY.
+type PhoneDriver = usb::Driver<'static, peripherals::USB_OTG_HS>;
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! {
+    loop {
+        cortex_m::asm::wfi();
+    }
+}
+
+#[embassy_executor::task]
+async fn usb_car_task(mut d: UsbDevice<'static, CarDriver>) -> ! {
+    d.run().await
+}
+
+#[embassy_executor::task]
+async fn usb_phone_task(mut d: UsbDevice<'static, PhoneDriver>) -> ! {
+    d.run().await
+}
+
+#[embassy_executor::task]
+async fn status_task(mut led: Output<'static>) -> ! {
+    status::run(&mut led, current_state).await
+}
+
+fn current_state() -> status::State {
+    if OVERSIZE.load(Ordering::Relaxed) {
+        status::State::Fault
+    } else if SOURCE_LIVE.load(Ordering::Relaxed) {
+        status::State::Ok
+    } else if let Some(code) = faults::worst() {
+        // The phone has gone away, so live status has nothing to say and the LED
+        // is free to report what went wrong while you were driving.
+        status::State::Report(code)
+    } else {
+        status::State::Waiting
+    }
+}
+
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    let mut config = embassy_stm32::Config::default();
+    {
+        use embassy_stm32::rcc::*;
+        // The board has a real 8 MHz crystal, so this is `Oscillator`, NOT the
+        // `Bypass` in embassy's stm32f4 example — Bypass expects an external
+        // clock signal, and with a crystal fitted the PLL never locks and
+        // nothing enumerates at all.
+        config.rcc.hse = Some(Hse {
+            freq: Hertz(8_000_000),
+            mode: HseMode::Oscillator,
+        });
+        config.rcc.pll_src = PllSource::HSE;
+        config.rcc.pll = Some(Pll {
+            prediv: PllPreDiv::DIV4,
+            mul: PllMul::MUL168,
+            divp: Some(PllPDiv::DIV2), // 8 / 4 * 168 / 2 = 168 MHz sysclk
+            divq: Some(PllQDiv::DIV7), // 8 / 4 * 168 / 7 = 48 MHz, exactly, for USB
+            divr: None,
+        });
+        config.rcc.ahb_pre = AHBPrescaler::DIV1;
+        config.rcc.apb1_pre = APBPrescaler::DIV4;
+        config.rcc.apb2_pre = APBPrescaler::DIV2;
+        config.rcc.sys = Sysclk::PLL1_P;
+        config.rcc.mux.clk48sel = mux::Clk48sel::PLL1_Q;
+    }
+    let p = embassy_stm32::init(config);
+
+    // D2 is wired in sink mode, so start HIGH = off.
+    let led = Output::new(p.PA1, Level::High, Speed::Low);
+
+    // Two USB stacks means two of everything. Neither `vbus_detection` is
+    // enabled: the car port powers the board, and the phone port deliberately
+    // has no VBUS wire — the board's +5V rail ties straight to the car's VBUS
+    // with no protection, so bridging the phone's VBUS to it would connect two
+    // hosts' supplies together.
+    let mut car_cfg = usb::Config::default();
+    car_cfg.vbus_detection = false;
+    let mut phone_cfg = usb::Config::default();
+    phone_cfg.vbus_detection = false;
+
+    static mut EP_OUT_CAR: [u8; 512] = [0; 512];
+    static mut EP_OUT_PHONE: [u8; 1024] = [0; 1024];
+    // SAFETY: each taken once, at startup, and outlives its driver (main never
+    // returns).
+    let (ep_car, ep_phone) = unsafe {
+        (
+            &mut *core::ptr::addr_of_mut!(EP_OUT_CAR),
+            &mut *core::ptr::addr_of_mut!(EP_OUT_PHONE),
+        )
+    };
+
+    let car_drv = usb::Driver::new_fs(p.USB_OTG_FS, Irqs, p.PA12, p.PA11, ep_car, car_cfg);
+    let phone_drv = usb::Driver::new_fs(p.USB_OTG_HS, Irqs, p.PB15, p.PB14, ep_phone, phone_cfg);
+
+    // --- car side: the TeslaMic, byte-for-byte ---
+    let iso_in = {
+        // The 40-byte serial forces a 162-byte string descriptor, so the control
+        // buffer must be >= 256. 128 broke enumeration on the nRF.
+        static mut CD: [u8; 256] = [0; 256];
+        static mut BD: [u8; 32] = [0; 32];
+        static mut MD: [u8; 16] = [0; 16];
+        static mut CB: [u8; 256] = [0; 256];
+        static mut HID: HidState<'static> = HidState::new();
+        static mut KBD: KeyboardHandler = KeyboardHandler;
+        static mut IF3: If3Handler = If3Handler;
+        // SAFETY: taken once at startup; all outlive `usb` (main never returns).
+        let (cd, bd, md, cb, hid, kbd, if3) = unsafe {
+            (
+                &mut *core::ptr::addr_of_mut!(CD),
+                &mut *core::ptr::addr_of_mut!(BD),
+                &mut *core::ptr::addr_of_mut!(MD),
+                &mut *core::ptr::addr_of_mut!(CB),
+                &mut *core::ptr::addr_of_mut!(HID),
+                &mut *core::ptr::addr_of_mut!(KBD),
+                &mut *core::ptr::addr_of_mut!(IF3),
+            )
+        };
+        let mut builder = Builder::new(car_drv, teslamic::config(), cd, bd, md, cb);
+        // Elastic pacing sends `nominal + 1` frames when shedding drift, so the
+        // endpoint must be declared at 196, not the real mic's 192. An endpoint
+        // declared at 192 silently drops every corrected packet.
+        let ep = teslamic::build(
+            &mut builder,
+            hid,
+            kbd,
+            if3,
+            teslamic::BYTES_PER_FRAME_ELASTIC as u16,
+            speaker::RATE,
+        );
+        spawner.spawn(usb_car_task(builder.build()).unwrap());
+        ep
+    };
+
+    // --- phone side: a UAC1 speaker at 48 kHz ---
+    let iso_out = {
+        static mut CD: [u8; 256] = [0; 256];
+        static mut BD: [u8; 32] = [0; 32];
+        static mut MD: [u8; 16] = [0; 16];
+        static mut CB: [u8; 256] = [0; 256];
+        static mut RATE_HANDLER: speaker::SampleRateHandler = speaker::SampleRateHandler;
+        // SAFETY: as above.
+        let (cd, bd, md, cb, rh) = unsafe {
+            (
+                &mut *core::ptr::addr_of_mut!(CD),
+                &mut *core::ptr::addr_of_mut!(BD),
+                &mut *core::ptr::addr_of_mut!(MD),
+                &mut *core::ptr::addr_of_mut!(CB),
+                &mut *core::ptr::addr_of_mut!(RATE_HANDLER),
+            )
+        };
+        let mut builder = Builder::new(phone_drv, speaker::config(), cd, bd, md, cb);
+        builder.handler(rh);
+        let ep = speaker::build(&mut builder);
+        spawner.spawn(usb_phone_task(builder.build()).unwrap());
+        ep
+    };
+
+    spawner.spawn(status_task(led).unwrap());
+
+    // Producer and consumer both live here rather than in spawned tasks: an
+    // `#[embassy_executor::task]` cannot be generic over the endpoint type, and
+    // the two drivers have different ones.
+    join(sink(iso_out), pump(iso_in)).await;
+    unreachable!()
+}
+
+/// Producer: iso OUT packets from the phone into the pipe.
+async fn sink(mut ep: impl EndpointOut) -> ! {
+    let mut buf = [0u8; speaker::BYTES_PER_FRAME + 8];
+    let mut ever_live = false;
+    loop {
+        ep.wait_enabled().await;
+        loop {
+            match ep.read(&mut buf).await {
+                Ok(n) => {
+                    SOURCE_LIVE.store(true, Ordering::Relaxed);
+                    ever_live = true;
+                    PIPE.lock(|p| {
+                        let mut pipe = p.borrow_mut();
+                        for f in buf[..n].chunks_exact(4) {
+                            pipe.push([
+                                i16::from_le_bytes([f[0], f[1]]),
+                                i16::from_le_bytes([f[2], f[3]]),
+                            ]);
+                        }
+                    })
+                }
+                // Endpoint disabled (host went to alt 0). Normal between tracks
+                // and on pause; wait to be re-enabled rather than tearing down.
+                Err(_) => break,
+            }
+        }
+        SOURCE_LIVE.store(false, Ordering::Relaxed);
+        // Only count a drop that interrupted a stream that had actually started,
+        // so the idle period before the first play does not register as a fault.
+        if ever_live {
+            faults::bump(&faults::SOURCE_DROPS);
+        }
+        PIPE.lock(|p| p.borrow_mut().reset());
+    }
+}
+
+/// Consumer: hand the car one packet per USB frame, sized to hold the buffer at
+/// target.
+async fn pump(mut iso_in: impl EndpointIn) -> ! {
+    let mut buf = [0u8; teslamic::BYTES_PER_FRAME + 8];
+    let mut frames: u32 = 0;
+    loop {
+        iso_in.wait_enabled().await;
+
+        // The car toggles AudioStreaming alt1/alt0 constantly (seen in the
+        // on-screen USB spy capture), so do NOT tear anything down when the
+        // stream goes idle — just stop writing and wait to be re-enabled.
+        loop {
+            let n = PIPE.lock(|p| p.borrow_mut().take(&mut buf, MODE));
+            match iso_in.write(&buf[..n]).await {
+                Ok(()) => {}
+                Err(EndpointError::Disabled) => break,
+                Err(EndpointError::BufferOverflow) => {
+                    OVERSIZE.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+
+            // Mirror the pipe's own tallies into the latch about once a second.
+            // Sampling beats counting at each site: the pipe already counts these
+            // exactly, so the LED and the pipe can never disagree.
+            frames = frames.wrapping_add(1);
+            if frames % 1000 == 0 {
+                let st = PIPE.lock(|p| p.borrow().stats);
+                faults::SLIPS.store(st.adj_up + st.adj_down, Ordering::Relaxed);
+                faults::STARVED.store(st.overruns + st.underruns, Ordering::Relaxed);
+            }
+        }
+    }
+}

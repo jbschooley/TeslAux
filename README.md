@@ -176,3 +176,10 @@ holder, and `tools/uf2conv.py`, from Microsoft's uf2 project.
 
 "Tesla", "TeslaMic" and "CaraokeMic" are trademarks of Tesla, Inc. This project
 is independent and not affiliated with or endorsed by Tesla.
+
+## Single-chip variant (experimental)
+
+`stm32/` holds a port to one STM32F407, which has two USB device controllers and
+so needs no I2S link between the two halves. It builds but has never been run on
+hardware — see `stm32/README.md`. The two-board RP2040 rig in `rp2040/` is the
+version that works in a car.

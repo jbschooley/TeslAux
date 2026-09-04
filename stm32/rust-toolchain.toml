@@ -1,0 +1,5 @@
+# Pinned separately from rp2040/ and t114/: sibling crates, different cores.
+# The STM32F407 is a Cortex-M4F (thumbv7em with hardware float).
+[toolchain]
+channel = "1.95.0"
+targets = ["thumbv7em-none-eabihf"]
