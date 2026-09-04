@@ -378,3 +378,29 @@ alignment holds exactly for tens of seconds, which means no sample is being
 gained or lost in between — so the pacing is doing its job and a discard is a
 discrete event somewhere, not drift. A clock problem in the bridge would show as
 a steady ramp instead.
+
+### Measured result, 2026-09-04
+
+A 60 s bit-comparison through the two-board rig (Android -> source -> I2S ->
+car -> Mac) came back **lossless**: 2,880,000 frames with no splice, no dropped
+or repeated frame, and no drift. The alignment held exactly from start to
+finish, which is a stronger statement than a clean LED — it means every sample
+the phone sent arrived exactly once, so the elastic pacing neither gained nor
+lost anything across the whole run.
+
+Two caveats on that run:
+
+* Every sample was one LSB low, from a truncating `int16 -> float -> int16`
+  round-trip in the playback or recording chain. Harmless, but it means the run
+  is *lossless*, not *bit-exact*. Confirming bit-exactness needs a player with a
+  bit-perfect path to USB audio.
+* An earlier run with the same setup showed five splices totalling 2304 frames,
+  all exact multiples of 384 frames (8 ms) — a plausible Android USB audio
+  buffer, and it happened while playing through Android's mixer rather than a
+  bit-perfect player. The clean run above used the same firmware, so whatever
+  discarded that audio was not in the bridge.
+
+The car board's LED reported an underrun on the clean run. Nothing in the audio
+supports it: an underrun repeats the previous frame, and there are none. Trust
+the comparison over the latch — it is self-tested against synthesised faults,
+and it measures the audio rather than a counter's opinion of it.
