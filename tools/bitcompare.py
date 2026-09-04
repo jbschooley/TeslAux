@@ -261,9 +261,16 @@ def compare(ref_path, rec_path):
         print("PASS  bit-exact: every sample matches")
         return 0
 
-    # Not identical. Separate a small level error from actual lost audio before
-    # saying anything, because one is harmless and the other is not.
-    stats, edits = walk(ref, rec, 0)
+    # Not identical. Measure the level error first, and use it as the tolerance
+    # for finding splices: a hardcoded tolerance either misses them (too tight,
+    # every frame looks like an edit) or invents matches (too loose).
+    probe = min(len(ref), len(rec), 20 * ref_rate)
+    d = np.abs(ref[:probe].astype(np.int32) - rec[:probe].astype(np.int32))
+    tol = int(np.percentile(d, 99.9)) if probe else 0
+    if tol > 8:
+        # Not a level error at all; fall through to the bulk explanation.
+        tol = 0
+    stats, edits = walk(ref, rec, 0, tol=max(tol, 1))
     lost = sum(e[2] for e in edits if e[1] == "missing")
     gained = sum(e[2] for e in edits if e[1] == "extra")
     print(f"compared {stats['compared'] // CHANNELS} frames between edits")
@@ -273,6 +280,16 @@ def compare(ref_path, rec_path):
             f"      level: {pct:.1f}% of samples differ by at most "
             f"{stats['worst_lsb']} LSB"
         )
+        # A multiply and a rounding error look alike at this scale, so say which:
+        # a volume control shows up as a consistent scale factor, a truncating
+        # conversion does not.
+        a = ref[:probe].astype(np.float64).ravel()
+        b = rec[:probe].astype(np.float64).ravel()
+        den = float((a * a).sum())
+        if den:
+            k = float((a * b).sum()) / den
+            db = 20.0 * np.log10(k) if k > 0 else float("nan")
+            print(f"      best-fit scale {k:.8f} ({db:+.5f} dB)")
         print("      A truncating float round-trip does this — an audio stack that")
         print("      converts int16 -> float -> int16 without rounding. It loses no")
         print("      audio, but it is not bit-exact, so fix it before trusting a pass.")
