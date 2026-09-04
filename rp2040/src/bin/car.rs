@@ -305,6 +305,16 @@ mod faults {
     }
 }
 
+/// True while the pump is actually handing packets to the car.
+///
+/// Faults are only meaningful while audio is genuinely flowing end to end.
+/// Before the host selects alt 1 — during enumeration, and whenever the car
+/// parks on alt 0, which it does constantly — nothing drains the pipe, so it
+/// fills and overruns, and the capture task competes with the USB stack for the
+/// CPU so the DMA re-arm window stretches. Both are normal for a stream that has
+/// not started, and counting them reports startup rather than streaming.
+static STREAMING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// True while I2S frames are actually arriving.
 static SOURCE_LIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -495,9 +505,11 @@ async fn capture(
             hit
         };
 
+        let streaming = STREAMING.load(Ordering::Relaxed);
+
         // Hand the previous block to the pipe while the DMA fills the next one.
         if have_work {
-            if overflowed {
+            if overflowed && streaming {
                 faults::bump(&faults::PIO_OVERFLOW);
             }
 
@@ -577,7 +589,7 @@ async fn capture(
             let st = p.borrow().stats;
             st.overruns.saturating_add(st.underruns)
         });
-        if !was_live {
+        if !was_live || !streaming {
             starve_base = total;
         }
         faults::STARVED.store(
@@ -697,16 +709,22 @@ async fn pump(
                 buf[..n].fill(0);
             }
             match iso_in.write(&buf[..n]).await {
-                Ok(()) => {}
+                Ok(()) => {
+                    STREAMING.store(true, Ordering::Relaxed);
+                }
                 // The host deselected the stream; normal, just wait to be
                 // re-enabled.
-                Err(EndpointError::Disabled) => break,
+                Err(EndpointError::Disabled) => {
+                    STREAMING.store(false, Ordering::Relaxed);
+                    break;
+                }
                 // We tried to send more than wMaxPacketSize. That is a firmware
                 // bug, not a transient — the packet is silently dropped and the
                 // audio degrades to a click at every boundary. Latch it as a
                 // fault so the LED says so instead of it looking like drift.
                 Err(EndpointError::BufferOverflow) => {
                     OVERSIZE.store(true, Ordering::Relaxed);
+                    STREAMING.store(false, Ordering::Relaxed);
                     break;
                 }
             }
