@@ -173,9 +173,10 @@ unplug the phone, and read the blink code:
 | 1 | amber | level ran too **full** | source outran the car, or the stream restarted after alt 0 |
 | 2 | blue | I2S link dropped for >250 ms | mechanical: jumpers, connector, vibration |
 | 3 | purple | re-enumerated at a new rate | source changed sample rate mid-drive |
-| 4 | red | buffer over/underran | cushion too small for the observed drift |
+| 4 | red | buffer ran **dry** | the car outran the source |
 | 5 | white | **PIO RX FIFO overflowed — samples silently lost** | the capture DMA is single-buffered |
 | 6 | cyan | level ran too **empty** | the car outran the source |
+| 7 | orange | buffer ran **full** | the source outran the car, or a backlog was not trimmed |
 
 Code 1 reports **peak excursion**, not a count of corrections. Corrections on
 this board are `plan_batch` — lossless changes to the next packet's size, and

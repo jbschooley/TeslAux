@@ -283,9 +283,12 @@ mod faults {
     /// source is outrunning the car or the stream just restarted after alt 0,
     /// too empty means the opposite — and a single number cannot say which.
     pub static PEAK_HIGH: AtomicU32 = AtomicU32::new(0);
-    /// Buffer ran dry or overflowed, likewise sampled from the pipe. The
-    /// cushion was not big enough.
-    pub static STARVED: AtomicU32 = AtomicU32::new(0);
+    /// Buffer ran **dry**: the car asked for frames that were not there.
+    pub static UNDERRAN: AtomicU32 = AtomicU32::new(0);
+    /// Buffer ran **full**: frames arrived with nowhere to put them. Split from
+    /// [`UNDERRAN`] because the two have opposite causes, and reporting them as
+    /// one number left the same ambiguity that made peak excursion unreadable.
+    pub static OVERRAN: AtomicU32 = AtomicU32::new(0);
     /// Re-enumerated because the source changed sample rate. ~1 s of silence.
     pub static RATE_CHANGES: AtomicU32 = AtomicU32::new(0);
     /// The PIO RX FIFO overflowed and samples were **silently discarded**.
@@ -314,8 +317,10 @@ mod faults {
     pub fn worst() -> Option<u8> {
         if PIO_OVERFLOW.load(Ordering::Relaxed) > 0 {
             Some(5)
-        } else if STARVED.load(Ordering::Relaxed) > 0 {
+        } else if UNDERRAN.load(Ordering::Relaxed) > 0 {
             Some(4)
+        } else if OVERRAN.load(Ordering::Relaxed) > 0 {
+            Some(7)
         } else if RATE_CHANGES.load(Ordering::Relaxed) > 0 {
             Some(3)
         } else if I2S_STALLS.load(Ordering::Relaxed) > 0 {
@@ -494,7 +499,8 @@ async fn capture(
     // Starve bookkeeping, per streaming session. `base` is the pipe's cumulative
     // count at the start of the current session; `acc` is what earlier sessions
     // contributed. See the accounting where these are used.
-    let (mut starve_base, mut starve_acc) = (0u32, 0u32);
+    let (mut under_base, mut under_acc) = (0u32, 0u32);
+    let (mut over_base, mut over_acc) = (0u32, 0u32);
 
     #[cfg(feature = "clock-locked")]
     let (mut win_sofs, mut last_sof) =
@@ -581,7 +587,8 @@ async fn capture(
                 // the source was known good. Everything from now until the next
                 // recovery is the buffer draining because the source stopped —
                 // which is the disconnect, not a fault.
-                starve_acc = faults::STARVED.load(Ordering::Relaxed);
+                under_acc = faults::UNDERRAN.load(Ordering::Relaxed);
+                over_acc = faults::OVERRAN.load(Ordering::Relaxed);
             }
             continue;
         }
@@ -613,12 +620,9 @@ async fn capture(
         //
         // Rebasing at each session start discards exactly that drain, because
         // the total is only ever sampled at a moment the source is known good.
-        let (total, off) = PIPE.lock(|p| {
+        let (under, over, off) = PIPE.lock(|p| {
             let b = p.borrow();
-            (
-                b.stats.overruns.saturating_add(b.stats.underruns),
-                b.off_target(),
-            )
+            (b.stats.underruns, b.stats.overruns, b.off_target())
         });
         // Also rebase while the buffer is still above its operating band.
         //
@@ -628,8 +632,17 @@ async fn capture(
         // second, overrunning on the way. That is the stream starting, not a
         // fault, and it happens every time the car toggles alt settings.
         if !was_live || !streaming || off > HYSTERESIS as i32 {
-            starve_base = total;
+            under_base = under;
+            over_base = over;
         }
+        faults::UNDERRAN.store(
+            under_acc.saturating_add(under.saturating_sub(under_base)),
+            Ordering::Relaxed,
+        );
+        faults::OVERRAN.store(
+            over_acc.saturating_add(over.saturating_sub(over_base)),
+            Ordering::Relaxed,
+        );
 
         // Peak excursion is measured in `pump`, not here. The level sawtooths
         // by a whole USB packet every millisecond — this task pushes an I2S
@@ -638,10 +651,6 @@ async fn capture(
         // acts on the bottom. Measured here, a perfectly healthy buffer sitting
         // at the deadband edge reads `HYSTERESIS + 48` and trips any threshold
         // set relative to the deadband.
-        faults::STARVED.store(
-            starve_acc.saturating_add(total.saturating_sub(starve_base)),
-            Ordering::Relaxed,
-        );
         was_live = true;
 
         // ── SOF-locked clock trim (clock-locked build only) ─────────────────
@@ -714,6 +723,8 @@ async fn pump(
     let mut last_captured = CAPTURED.load(Ordering::Relaxed);
     // True once the pacer has the level inside its deadband this session.
     let mut settled = false;
+    // When the host last actually took a packet.
+    let mut last_write = Instant::now();
     #[cfg(feature = "packet-stress")]
     let (mut phase, mut stress_hi) = (0u32, false);
 
@@ -803,6 +814,23 @@ async fn pump(
             match iso_in.write(&buf[..n]).await {
                 Ok(()) => {
                     STREAMING.store(true, Ordering::Relaxed);
+
+                    // A host that stops *polling* never changes the alt setting,
+                    // so `wait_enabled()` above does not come back around and the
+                    // trim there never re-runs. Meanwhile nothing drains the pipe
+                    // and it pegs at capacity, so when polling resumes the host
+                    // is served a backlog instead of live audio — and the level
+                    // parks at the deadband edge for the rest of the session,
+                    // since the pacer stops shedding as soon as it is inside.
+                    //
+                    // An iso IN endpoint is polled every frame, so a gap this
+                    // long is the host not listening, not jitter.
+                    let now = Instant::now();
+                    if now.duration_since(last_write) > Duration::from_millis(20) {
+                        PIPE.lock(|p| p.borrow_mut().trim_to_target());
+                        settled = false;
+                    }
+                    last_write = now;
                 }
                 // The host deselected the stream; normal, just wait to be
                 // re-enabled.
