@@ -177,6 +177,19 @@ const _: () = {
 /// Marks scratch1 as holding a rate we put there, rather than power-on garbage.
 const RATE_MAGIC: u32 = 0x5453_4C41; // "TSLA"
 
+/// Steady-state fill level the pacer holds.
+const TARGET: usize = RING / 2;
+
+/// Peak excursion worth reporting: halfway from where the pacer starts
+/// correcting to a dry buffer. It must sit **above** `HYSTERESIS`, because
+/// inside the deadband the level wanders freely by design.
+const PEAK_WARN: usize = HYSTERESIS + (TARGET - HYSTERESIS) / 2;
+
+const _: () = {
+    assert!(PEAK_WARN > HYSTERESIS, "peak warning sits inside the deadband");
+    assert!(PEAK_WARN < TARGET, "peak warning is at or past a dry buffer");
+};
+
 /// Bytes per audio frame: 2 channels x 2 bytes.
 const CHANNELS_X_BYTES: usize = 4;
 
@@ -257,9 +270,14 @@ mod faults {
 
     /// I2S clock vanished for >250 ms. Mechanical: a wire, a connector, EMI.
     pub static I2S_STALLS: AtomicU32 = AtomicU32::new(0);
-    /// Pacer corrected drift, sampled from the pipe's own counters. Expected
-    /// occasionally; frequent means the clock steering is struggling.
-    pub static SLIPS: AtomicU32 = AtomicU32::new(0);
+    /// Largest |off_target| seen while genuinely streaming, in frames.
+    ///
+    /// Not a correction count. Corrections on this board are `plan_batch` —
+    /// lossless changes to the next packet's size, and the normal mechanism for
+    /// absorbing the source-versus-car clock difference. Counting them reports
+    /// the pacer doing its job; what predicts a dropout is the level drifting
+    /// toward an end of the cushion.
+    pub static PEAK_OFF: AtomicU32 = AtomicU32::new(0);
     /// Buffer ran dry or overflowed, likewise sampled from the pipe. The
     /// cushion was not big enough.
     pub static STARVED: AtomicU32 = AtomicU32::new(0);
@@ -297,7 +315,7 @@ mod faults {
             Some(3)
         } else if I2S_STALLS.load(Ordering::Relaxed) > 0 {
             Some(2)
-        } else if SLIPS.load(Ordering::Relaxed) > 8 {
+        } else if PEAK_OFF.load(Ordering::Relaxed) > super::PEAK_WARN as u32 {
             Some(1)
         } else {
             None
@@ -468,6 +486,10 @@ async fn capture(
     // count at the start of the current session; `acc` is what earlier sessions
     // contributed. See the accounting where these are used.
     let (mut starve_base, mut starve_acc) = (0u32, 0u32);
+    // Peak excursion is only meaningful once the level has actually reached its
+    // operating band this session. Coming out of alt 0 the pipe is pegged at
+    // capacity and sheds down over ~200 ms; that ramp is the stream starting.
+    let mut settled = false;
     #[cfg(feature = "clock-locked")]
     let (mut win_sofs, mut last_sof) =
         (0u32, USB_FRAMES.load(core::sync::atomic::Ordering::Relaxed));
@@ -554,6 +576,7 @@ async fn capture(
                 // recovery is the buffer draining because the source stopped —
                 // which is the disconnect, not a fault.
                 starve_acc = faults::STARVED.load(Ordering::Relaxed);
+            settled = false;
             }
             continue;
         }
@@ -601,6 +624,21 @@ async fn capture(
         // fault, and it happens every time the car toggles alt settings.
         if !was_live || !streaming || off > HYSTERESIS as i32 {
             starve_base = total;
+        }
+
+        // Settled once the level has come inside the deadband; unsettled again
+        // whenever the stream stops. No time constant needed — the condition is
+        // exactly "the pacer has the level under control".
+        if !streaming {
+            settled = false;
+        } else if off.unsigned_abs() <= HYSTERESIS as u32 {
+            settled = true;
+        }
+        if settled && streaming {
+            let mag = off.unsigned_abs();
+            if mag > faults::PEAK_OFF.load(Ordering::Relaxed) {
+                faults::PEAK_OFF.store(mag, Ordering::Relaxed);
+            }
         }
         faults::STARVED.store(
             starve_acc.saturating_add(total.saturating_sub(starve_base)),
@@ -756,10 +794,9 @@ async fn pump(
                 // Mirror the pipe's own tallies into the latch. Sampling beats
                 // counting at each site: the pipe already counts these exactly,
                 // and this way the two can never disagree.
-                // STARVED is owned by `capture`, which can tell a real underrun
-                // from a source that has simply stopped. See the accounting there.
-                let st = PIPE.lock(|p| p.borrow().stats);
-                faults::SLIPS.store(st.adj_up + st.adj_down, Ordering::Relaxed);
+                // Nothing to sample here any more: `capture` owns the fault
+                // tallies, because only it can tell a running stream from a
+                // source that has stopped.
                 if let Some(hz) = detect.on_usb_frame() {
                     let advertised = ADVERTISED.load(Ordering::Relaxed);
                     match classify(hz) {

@@ -170,11 +170,23 @@ unplug the phone, and read the blink code:
 | Blinks | Colour | Meaning | Where to look |
 |---|---|---|---|
 | none (solid blue) | blue | clean run | — |
-| 1 | amber | more than 8 pacer slips | source is free-running; try `source-steered-lowlat` |
+| 1 | amber | peak level excursion passed `PEAK_WARN` | margin being used up; nothing audible yet |
 | 2 | blue | I2S link dropped for >250 ms | mechanical: jumpers, connector, vibration |
 | 3 | purple | re-enumerated at a new rate | source changed sample rate mid-drive |
 | 4 | red | buffer over/underran | cushion too small for the observed drift |
 | 5 | white | **PIO RX FIFO overflowed — samples silently lost** | the capture DMA is single-buffered |
+
+Code 1 reports **peak excursion**, not a count of corrections. Corrections on
+this board are `plan_batch` — lossless changes to the next packet's size, and
+the normal way the source-versus-car clock difference is absorbed. Counting them
+reported the pacer working. It also produced a false code 1 every time the host
+selected alt 1 after a gap: nothing drains the pipe on alt 0, so it pegs at
+capacity and then sheds ~200 frames back to target, one per packet.
+
+Every counter here is gated on the pump actually writing packets, and peak
+excursion additionally waits until the level has come inside the deadband at
+least once in the current session — which is exactly "the pacer has the level
+under control", and needs no time constant.
 
 **A stall is counted only when the link comes back.** A stall that never
 recovers is just you unplugging the phone to read the report, and one before the
