@@ -471,18 +471,34 @@ async fn capture(
         // flight, so the FIFO always has somewhere to go.
         let xfer = sm.rx().dma_pull(dma.reborrow(), &mut raw, false);
 
-        // Hand the previous block to the pipe while the DMA fills the next one.
-        if have_work {
-            // `RXSTALL` latches on a push to a full RX FIFO, which for
-            // `push noblock` means a sample was discarded. Read and clear it
-            // each block, so this counts blocks that lost data.
+        // `RXSTALL` latches on a push to a full RX FIFO, which for `push
+        // noblock` means a sample was discarded. Read and clear it every
+        // iteration — but only *count* it once a block has actually been
+        // captured.
+        //
+        // The state machine starts as soon as it is enabled, while the first
+        // DMA is not armed until this task first runs, after USB setup and task
+        // spawning. With a source already clocking, the FIFO fills in ~83 us and
+        // the flag latches. Counting that would report the bring-up transient on
+        // every boot, forever, and would say nothing about streaming. The same
+        // applies to the first block after a stall, which `have_work` also
+        // covers.
+        let overflowed = {
             use embassy_rp::pac;
             let fdebug = pac::PIO0.fdebug();
-            if fdebug.read().rxstall() & 1 != 0 {
-                faults::bump(&faults::PIO_OVERFLOW);
+            let hit = fdebug.read().rxstall() & 1 != 0;
+            if hit {
                 let mut clear = pac::pio::regs::Fdebug(0);
                 clear.set_rxstall(1);
                 fdebug.write_value(clear);
+            }
+            hit
+        };
+
+        // Hand the previous block to the pipe while the DMA fills the next one.
+        if have_work {
+            if overflowed {
+                faults::bump(&faults::PIO_OVERFLOW);
             }
 
             PIPE.lock(|p| {

@@ -193,6 +193,12 @@ only the 8-word FIFO — about 83 us at 48 kHz — is holding the stream. The `p
 task takes `PIPE` under a critical section in that window, and USB interrupts
 land in it too.
 
+`RXSTALL` latches, and the state machine runs from the moment it is enabled
+while the first DMA is not armed until the capture task first runs — so with a
+source already clocking, every boot sets the flag. That transient is cleared
+without being counted, as is the first block after a stall; otherwise code 5
+would appear on every single run and say nothing about streaming.
+
 **Code 5 was observed on a real run**, which is what prompted double-buffering
 the capture: the next DMA is now armed before the pipe push and the bookkeeping,
 so all of that overlaps a running transfer and the unattended window shrinks from
