@@ -338,7 +338,7 @@ then names what it finds:
 | dropped frame | a slip up: the pacer discarded to shed drift |
 | run of zeros | a dropout: muted, or the pipe reset |
 | channels swapped | the I2S slot mapping is inverted |
-| nearly everything differs | a chain problem, not a firmware fault |
+| nearly everything differs | a chain problem, not a firmware fault — and it says which |
 
 **The setup is the hard part, and most failures will be the chain rather than
 the bridge.** The source file must already be 48 kHz 16-bit, since anything else
@@ -346,7 +346,12 @@ is resampled or dithered before it reaches us; the player needs a bit-perfect
 path with volume at 100% and all effects off, because Android mixes and rescales
 by default and 99% volume is a multiply; and the recorder must be at unity gain
 with no plugins. A chain fault shows up as everything differing at once, which is
-easy to tell from the localised differences a firmware fault produces.
+easy to tell from the localised differences a firmware fault produces — and the
+tool goes further, separating a **constant gain** (a volume control not at 100%,
+or a gain stage in the recorder: one multiply explains every sample) from a
+**resample** (no constant explains it). That makes it a way to qualify a player:
+run it once with whatever you have, and if the answer is "a gain of 0.98", the
+player is fine and the volume is not.
 
 The tool self-tests against synthesised versions of each fault it names, so a
 result from it means something before it is pointed at real audio.

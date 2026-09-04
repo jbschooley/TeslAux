@@ -125,6 +125,43 @@ def classify(ref, rec, limit=20):
     return notes
 
 
+def explain_bulk(ref, rec):
+    """When nearly everything differs, say *how* — the chain and the firmware
+    fail in completely different ways.
+
+    A single multiply (a volume control not quite at maximum, a recorder gain
+    stage) leaves the signal otherwise intact, so one constant explains every
+    sample. A resample leaves no such constant. Naming which is which turns a
+    useless "everything differs" into a specific thing to go and fix.
+    """
+    a = ref.astype(np.float64).ravel()
+    b = rec.astype(np.float64).ravel()
+    denom = float((a * a).sum())
+    if denom == 0:
+        return None
+    k = float((a * b).sum()) / denom
+    resid = b - k * a
+    rms_b = float(np.sqrt((b * b).mean()))
+    if rms_b == 0:
+        return None
+    rel = float(np.sqrt((resid * resid).mean())) / rms_b
+    if rel < 0.02 and abs(k - 1.0) > 1e-4:
+        db = 20.0 * np.log10(k) if k > 0 else float("nan")
+        return (
+            f"a constant gain of {k:.6f} ({db:+.3f} dB) explains the whole "
+            f"recording to within {rel * 100:.2f}%.\n"
+            "      Something applied a multiply: a volume control not at 100%, "
+            "or a gain stage\n      in the recorder. Nothing here is a bridge "
+            "fault."
+        )
+    if rel < 0.02:
+        return "the signal matches to within a constant, but that constant is 1 — check alignment."
+    return (
+        f"no constant gain explains it (residual {rel * 100:.1f}%).\n"
+        "      That is a resample or different material, not a level change."
+    )
+
+
 def compare(ref_path, rec_path):
     ref, ref_rate = read_wav(ref_path)
     rec, rec_rate = read_wav(rec_path)
@@ -159,10 +196,14 @@ def compare(ref_path, rec_path):
     pct = 100.0 * total / n
     print(f"FAIL  {total} frames differ ({pct:.4f}%)")
     if pct > 50:
-        print("      Nearly everything differs, which is a chain problem rather")
-        print("      than a firmware fault — a resample, a gain stage or a")
-        print("      different master.\n")
+        print("      Nearly everything differs, so this is the chain rather than")
+        print("      the bridge. Specifically:")
+        why = explain_bulk(ref[:n], rec[:n])
+        if why:
+            print(f"      {why}")
+        print()
         print(PRECONDITIONS)
+        return 1
     for note in notes:
         print(
             f"      frame {note['frame']:>9}  {note['kind']:<28}"
@@ -232,6 +273,23 @@ def _self_test():
     swap = ref.copy()
     swap[25000] = swap[25000][::-1]
     check("channel swap", swap, False, "channels swapped")
+
+    # Bulk explanations: qualifying the player matters as much as the firmware.
+    quiet = (ref.astype(np.float64) * 0.98).astype(np.int16)
+    why = explain_bulk(ref, quiet)
+    if why and "constant gain" in why:
+        print("  ok   volume multiply -> named as a gain")
+    else:
+        print(f"  FAIL volume multiply: {why}")
+        ok = False
+
+    resampled = np.roll(ref, 1, axis=0) // 2 + ref // 2
+    why = explain_bulk(ref, resampled)
+    if why and "no constant gain" in why:
+        print("  ok   resample-like -> named as not a level change")
+    else:
+        print(f"  FAIL resample-like: {why}")
+        ok = False
 
     print("\nself-test:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
