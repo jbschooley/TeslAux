@@ -74,6 +74,13 @@ reliable and about 5 ms lower latency than the two-board version. That leaves on
 RP2040 plus a ~$10 module. The car-side firmware already supports it and follows
 whatever sample rate it delivers; it has not been tested yet.
 
+## Verified bit-exact
+
+The two-board rig has been measured, not just listened to: **2,784,000
+consecutive frames delivered from an Android phone to a Mac through both boards,
+identical to the source file, sample for sample.** See `rp2040/TESTING.md` for
+the method and `tools/bitcompare.py` for the tool.
+
 ## What the car accepts
 
 Findings from the car itself, not from documentation. Several contradict what
