@@ -24,7 +24,7 @@
 //! | green | exactly **one** track was opened |
 //! | cyan | **several** tracks were opened |
 //! | white | **many** (16+) tracks were opened |
-//! | red | the transport gave up: a malformed CBW, or an endpoint error |
+//! | red | a SCSI command was refused mid-scan, or the transport gave up |
 //!
 //! The count is the useful part once a host mounts the volume but will not play
 //! it. One track means it opened a file and rejected something about it; all
@@ -92,15 +92,23 @@ static READ_TRACK_DATA: AtomicBool = AtomicBool::new(false);
 /// volume and is declining it for a reason that has nothing to do with the
 /// files. Those need completely different next steps.
 static TRACKS_SEEN: AtomicU32 = AtomicU32::new(0);
-/// A SCSI command failed. Not fatal — hosts probe for optional commands — but
-/// worth seeing during bring-up.
-static CMD_FAILED: AtomicBool = AtomicBool::new(false);
+/// A SCSI command was refused *after* the host had started reading tracks.
+///
+/// Failures before that are normal: hosts probe for optional commands and
+/// expect to be told no. One that arrives mid-scan is different — it may be the
+/// reason a host stops. Kept separate from the early probing so the signal is
+/// not buried in it.
+static LATE_CMD_FAILED: AtomicBool = AtomicBool::new(false);
 /// The transport could not continue: a malformed CBW, or an endpoint error.
 static WEDGED: AtomicBool = AtomicBool::new(false);
 
 fn current_state() -> status::State {
     if WEDGED.load(Ordering::Relaxed) {
         // red: the transport gave up
+        status::State::Fault
+    } else if LATE_CMD_FAILED.load(Ordering::Relaxed) {
+        // A command refused while the host was scanning is a better lead than
+        // any count, so it outranks them.
         status::State::Fault
     } else if READ_TRACK_DATA.load(Ordering::Relaxed) {
         // The host parsed the filesystem and opened files; how many it opened
@@ -325,7 +333,9 @@ async fn main(spawner: Spawner) {
                     (sent, CswStatus::Passed)
                 }
                 Action::Fail => {
-                    CMD_FAILED.store(true, Ordering::Relaxed);
+                    if READ_TRACK_DATA.load(Ordering::Relaxed) {
+                        LATE_CMD_FAILED.store(true, Ordering::Relaxed);
+                    }
                     // The spec would have us stall the data endpoint here, but
                     // `embassy-usb` exposes no stall for bulk. Sending nothing
                     // and reporting the full amount as residue tells the host

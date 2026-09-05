@@ -222,6 +222,24 @@ The tone is generated from the sample index rather than an accumulator, because
 sectors are produced on demand and in whatever order the host asks for them.
 Verified as a clean 375 Hz at half scale by mounting the image.
 
+### A real bug: EVPD inquiries were answered wrongly
+
+Byte 1 bit 0 of `INQUIRY` is EVPD — the host is asking for a **vital product
+data** page, named by byte 2, rather than the standard inquiry data. The first
+implementation ignored that bit and returned standard data to every `INQUIRY`.
+That is a protocol violation, and a host that asked for a serial number and got
+a device type back has every reason to distrust the device it just mounted.
+
+Pages `0x00` (supported list), `0x80` (serial number) and `0x83` (device
+identification) are now answered properly, and a page we do not publish is
+refused with `INVALID_FIELD` rather than approximated. `READ(12)`,
+`REPORT LUNS` and `READ CAPACITY(16)` are handled too, since a host that gets a
+refusal to any of those may stop rather than fall back.
+
+`READ(12)` is worth noting on its own: its block count is 32 bits where
+`READ(10)` has 16, so reading it as 16 bits truncates every large transfer
+silently.
+
 ### If the car does not offer it as a media source
 
 Owner reports converge on one cause that has nothing to do with the volume:

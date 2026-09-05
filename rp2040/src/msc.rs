@@ -47,6 +47,10 @@ const PREVENT_ALLOW_REMOVAL: u8 = 0x1E;
 const READ_FORMAT_CAPACITIES: u8 = 0x23;
 const READ_CAPACITY_10: u8 = 0x25;
 const READ_10: u8 = 0x28;
+const READ_12: u8 = 0xA8;
+const REPORT_LUNS: u8 = 0xA0;
+const SERVICE_ACTION_IN_16: u8 = 0x9E;
+const SAI_READ_CAPACITY_16: u8 = 0x10;
 const WRITE_10: u8 = 0x2A;
 const SYNCHRONIZE_CACHE: u8 = 0x35;
 const MODE_SENSE_10: u8 = 0x5A;
@@ -65,6 +69,8 @@ impl Sense {
     pub const INVALID_COMMAND: Sense = Sense { key: 0x05, asc: 0x20, ascq: 0x00 };
     /// Illegal request / logical block address out of range.
     pub const LBA_OUT_OF_RANGE: Sense = Sense { key: 0x05, asc: 0x21, ascq: 0x00 };
+    /// Illegal request / invalid field in the command block.
+    pub const INVALID_FIELD: Sense = Sense { key: 0x05, asc: 0x24, ascq: 0x00 };
     /// Data protect / write protected.
     pub const WRITE_PROTECTED: Sense = Sense { key: 0x07, asc: 0x27, ascq: 0x00 };
 }
@@ -198,15 +204,44 @@ impl Scsi {
             TEST_UNIT_READY | START_STOP_UNIT | PREVENT_ALLOW_REMOVAL | SYNCHRONIZE_CACHE => {
                 Action::None
             }
-            INQUIRY => Action::Reply { len: self.inquiry(reply, cbw.data_len as usize) },
+            INQUIRY => {
+                // Bit 0 of byte 1 is EVPD: the host wants a vital-product-data
+                // page, named by byte 2, *not* the standard inquiry data.
+                // Answering with standard data regardless is a protocol
+                // violation, and a host that asked for a serial number and got
+                // a device type back has every reason to distrust the device.
+                if cbw.cb[1] & 0x01 != 0 {
+                    match self.vpd(cbw.cb[2], reply, cbw.data_len as usize) {
+                        Some(len) => Action::Reply { len },
+                        None => {
+                            // An unsupported page must be refused, not
+                            // approximated.
+                            self.sense = Sense::INVALID_FIELD;
+                            Action::Fail
+                        }
+                    }
+                } else {
+                    Action::Reply { len: self.inquiry(reply, cbw.data_len as usize) }
+                }
+            }
+            REPORT_LUNS => Action::Reply { len: self.report_luns(reply) },
+            SERVICE_ACTION_IN_16 if cbw.cb[1] & 0x1F == SAI_READ_CAPACITY_16 => {
+                Action::Reply { len: self.read_capacity_16(reply) }
+            }
             READ_CAPACITY_10 => Action::Reply { len: self.read_capacity(reply) },
             READ_FORMAT_CAPACITIES => {
                 Action::Reply { len: self.read_format_capacities(reply) }
             }
             MODE_SENSE_6 => Action::Reply { len: self.mode_sense_6(reply) },
             MODE_SENSE_10 => Action::Reply { len: self.mode_sense_10(reply) },
-            READ_10 => {
-                let (lba, blocks) = (cbw.lba(), cbw.blocks() as u32);
+            READ_10 | READ_12 => {
+                // READ(12) puts a 32-bit block count where READ(10) has 16.
+                let blocks = if op == READ_12 {
+                    u32::from_be_bytes([cbw.cb[6], cbw.cb[7], cbw.cb[8], cbw.cb[9]])
+                } else {
+                    cbw.blocks() as u32
+                };
+                let lba = cbw.lba();
                 // A zero-length read is legal and means nothing to do.
                 if blocks == 0 {
                     return Action::None;
@@ -249,6 +284,78 @@ impl Scsi {
             out[32..36].copy_from_slice(b"1.00");
         }
         n
+    }
+
+    /// Vital product data. `None` for a page we do not publish.
+    fn vpd(&self, page: u8, out: &mut [u8], want: usize) -> Option<usize> {
+        let len = match page {
+            // 0x00: the list of pages we support, including itself.
+            0x00 => {
+                if out.len() < 7 {
+                    return Some(0);
+                }
+                out[..7].fill(0);
+                out[1] = 0x00;
+                out[3] = 3; // three pages follow
+                out[4] = 0x00;
+                out[5] = 0x80;
+                out[6] = 0x83;
+                7
+            }
+            // 0x80: unit serial number.
+            0x80 => {
+                const SERIAL: &[u8] = b"TESLAUX0001     ";
+                if out.len() < 4 + SERIAL.len() {
+                    return Some(0);
+                }
+                out[0] = 0x00;
+                out[1] = 0x80;
+                out[2] = 0;
+                out[3] = SERIAL.len() as u8;
+                out[4..4 + SERIAL.len()].copy_from_slice(SERIAL);
+                4 + SERIAL.len()
+            }
+            // 0x83: device identification, as a single vendor-specific
+            // descriptor — the simplest form that is still well formed.
+            0x83 => {
+                const ID: &[u8] = b"TeslAux Media   ";
+                let total = 4 + 4 + ID.len();
+                if out.len() < total {
+                    return Some(0);
+                }
+                out[..total].fill(0);
+                out[1] = 0x83;
+                out[3] = (4 + ID.len()) as u8;
+                out[4] = 0x02; // ASCII
+                out[5] = 0x00; // vendor specific
+                out[7] = ID.len() as u8;
+                out[8..8 + ID.len()].copy_from_slice(ID);
+                total
+            }
+            _ => return None,
+        };
+        Some(len.min(out.len()).min(if want == 0 { len } else { want }))
+    }
+
+    /// REPORT LUNS: one LUN, numbered zero.
+    fn report_luns(&self, out: &mut [u8]) -> usize {
+        if out.len() < 16 {
+            return 0;
+        }
+        out[..16].fill(0);
+        out[3] = 8; // one 8-byte LUN entry follows
+        16
+    }
+
+    /// READ CAPACITY(16), for hosts that ask the 16-byte way.
+    fn read_capacity_16(&self, out: &mut [u8]) -> usize {
+        if out.len() < 32 {
+            return 0;
+        }
+        out[..32].fill(0);
+        out[4..8].copy_from_slice(&(self.blocks - 1).to_be_bytes());
+        out[8..12].copy_from_slice(&self.block_size.to_be_bytes());
+        32
     }
 
     /// READ CAPACITY(10) reports the address of the **last** block, not the
@@ -486,6 +593,68 @@ mod tests {
             assert_eq!(d.command(&c, &mut r), Action::None, "opcode {op:#04x}");
             assert_eq!(d.sense(), Sense::GOOD);
         }
+    }
+
+    #[test]
+    fn evpd_inquiry_returns_the_requested_page_not_standard_data() {
+        // The bug this test exists for: ignoring the EVPD bit and answering
+        // every INQUIRY with standard data. A host that asked for a serial
+        // number and got a device type back has reason to distrust the device.
+        let mut d = disk();
+        let mut r = [0u8; 64];
+
+        // Page 0x00 lists the pages we support, and must list itself.
+        let c = Cbw::parse(&cbw(1, 64, true, &[INQUIRY, 0x01, 0x00, 0, 64, 0])).unwrap();
+        let a = d.command(&c, &mut r);
+        assert!(matches!(a, Action::Reply { .. }), "page 00 refused: {a:?}");
+        assert_eq!(r[1], 0x00, "page code must be echoed");
+        let n = r[3] as usize;
+        assert!(r[4..4 + n].contains(&0x00), "page list must include itself");
+        assert!(r[4..4 + n].contains(&0x80), "page list must include the serial");
+        assert!(r[4..4 + n].contains(&0x83), "page list must include device id");
+
+        // Page 0x80 is the serial number, and must echo its own page code.
+        let c = Cbw::parse(&cbw(2, 64, true, &[INQUIRY, 0x01, 0x80, 0, 64, 0])).unwrap();
+        assert!(matches!(d.command(&c, &mut r), Action::Reply { .. }));
+        assert_eq!(r[1], 0x80);
+        assert!(r[3] > 0, "serial number must not be empty");
+
+        // A page we do not publish must be refused rather than approximated.
+        let c = Cbw::parse(&cbw(3, 64, true, &[INQUIRY, 0x01, 0xB2, 0, 64, 0])).unwrap();
+        assert_eq!(d.command(&c, &mut r), Action::Fail);
+        assert_eq!(d.sense(), Sense::INVALID_FIELD);
+    }
+
+    #[test]
+    fn read_12_uses_its_wider_block_count() {
+        // READ(12) puts a 32-bit count where READ(10) has 16. Reading it as
+        // 16 bits truncates every large transfer, silently.
+        let mut d = disk();
+        let mut r = [0u8; 64];
+        let c = Cbw::parse(&cbw(
+            1, 0x20000, true,
+            &[READ_12, 0, 0, 0, 0x10, 0x00, 0, 0, 0x01, 0x00, 0, 0],
+        )).unwrap();
+        assert_eq!(d.command(&c, &mut r), Action::ReadBlocks { lba: 0x1000, blocks: 256 });
+    }
+
+    #[test]
+    fn report_luns_and_capacity_16_are_well_formed() {
+        let mut d = disk();
+        let mut r = [0u8; 64];
+
+        let c = Cbw::parse(&cbw(1, 16, true, &[REPORT_LUNS, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0]))
+            .unwrap();
+        assert_eq!(d.command(&c, &mut r), Action::Reply { len: 16 });
+        assert_eq!(r[3], 8, "one LUN entry expected");
+
+        let c = Cbw::parse(&cbw(
+            2, 32, true,
+            &[SERVICE_ACTION_IN_16, SAI_READ_CAPACITY_16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0],
+        )).unwrap();
+        assert_eq!(d.command(&c, &mut r), Action::Reply { len: 32 });
+        // Same off-by-one rule as READ CAPACITY(10): the last block, not a count.
+        assert_eq!(u32::from_be_bytes(r[4..8].try_into().unwrap()), 4_501_675);
     }
 
     #[test]
