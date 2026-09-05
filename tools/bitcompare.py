@@ -163,8 +163,15 @@ def find_offset(ref, rec, probe=48000, search=None):
     # actually under test.
     best = float(ncc.max())
     if best > 0:
+        # Take the earliest *place* that matches about as well as the best one,
+        # then the exact peak within it. Taking the first index above the
+        # threshold instead is not the same thing and is wrong: neighbouring
+        # lags of smooth material correlate well above 0.98, so it lands a few
+        # frames early — which then reads as a spurious edit at the anchor,
+        # because the walk starts misaligned by exactly that much.
         good = np.nonzero(ncc >= 0.98 * best)[0]
-        peak = int(good[0])
+        cluster = good[good <= good[0] + len(needle)]
+        peak = int(cluster[np.argmax(ncc[cluster])])
     else:
         peak = int(np.argmax(ncc))
     return peak - start
@@ -366,11 +373,11 @@ def report_lead_in(ref, rec, tol, rate):
     n = len(ref)
     if n == 0:
         print("      lead-in: none (recording starts at the reference)")
-        return True
+        return True, 0
     secs = n / rate
     if np.array_equal(ref, rec):
         print(f"      lead-in: first {secs:.1f} s match exactly")
-        return True
+        return True, 0
     if n > 2400:
         _, edits = walk(ref, rec, 0, tol=tol)
         if edits:
@@ -378,7 +385,10 @@ def report_lead_in(ref, rec, tol, rate):
             print(f"      lead-in: {len(edits)} edit(s) in the first {secs:.1f} s ({kinds})")
             for pos, kind, cnt in edits[:4]:
                 print(f"        ref frame {pos:>9}  {pos / rate:6.3f} s  {kind} {cnt} frames")
-            return False
+            net = sum(c for _, k, c in edits if k == "extra") - sum(
+                c for _, k, c in edits if k == "missing"
+            )
+            return False, net
     # No splice explains it, so say how big the difference actually is: at the
     # start of a stream this is usually one file having signal where the other
     # still has silence, which is not a fault and should not read like one.
@@ -391,7 +401,7 @@ def report_lead_in(ref, rec, tol, rate):
     )
     # A handful of near-silent frames at a stream's edge is the recorder finding
     # the signal, not a fault. Anything louder is real.
-    return worst <= 32
+    return worst <= 32, 0
 
 
 def compare(ref_path, rec_path):
@@ -473,18 +483,26 @@ def compare(ref_path, rec_path):
     # main walk because a stream's first moments are exactly where one file
     # holds material the other does not, which no shift reconciles; a failure
     # there should be reported, not allowed to derail the rest.
+    lead_n0 = min(anchor, len(ref), len(rec))
+    lead_ok, lead_net = report_lead_in(
+        ref[:lead_n0], rec[:lead_n0], 1, ref_rate
+    )
+    # Carry what the lead-in found into the main comparison. Without this the
+    # walk restarts at the anchor still using the original offset, is out by
+    # however many frames the lead-in gained or lost, and rediscovers the same
+    # edit as a second one — a single insertion at startup got reported twice,
+    # once at frame 1 and again at the anchor.
     lead_ref, lead_rec = ref[:anchor], rec[:anchor]
     ref = ref[anchor:]
-    rec = rec[anchor:]
+    rec = rec[anchor + lead_net :] if anchor + lead_net >= 0 else rec[anchor:]
     n = min(len(ref), len(rec))
     if n == 0:
         print("FAIL  no overlap after alignment")
         return 1
 
     lead_n = min(len(lead_ref), len(lead_rec))
-    lead_clean = lead_n == 0 or np.array_equal(lead_ref[:lead_n], lead_rec[:lead_n])
 
-    if lead_clean and np.array_equal(ref[:n], rec[:n]):
+    if lead_ok and np.array_equal(ref[:n], rec[:n]):
         total = n + lead_n
         print(f"compared {total} frames ({total / ref_rate:.1f} s), lead-in included")
         print("PASS  bit-exact: every sample matches")
@@ -500,7 +518,6 @@ def compare(ref_path, rec_path):
         # Not a level error at all; fall through to the bulk explanation.
         tol = 0
     stats, edits = walk(ref, rec, 0, tol=max(tol, 1))
-    lead_ok = report_lead_in(lead_ref[:lead_n], lead_rec[:lead_n], max(tol, 1), ref_rate)
     lost = sum(e[2] for e in edits if e[1] == "missing")
     gained = sum(e[2] for e in edits if e[1] == "extra")
     corrupt = sum(e[2] for e in edits if e[1] == "corrupt")
@@ -752,6 +769,22 @@ def _check_lead_in():
     else:
         good = False
         print("  FAIL splice inside the anchor was not reported")
+        print("\n".join("        " + l for l in out.splitlines()))
+
+    # A fault inside the lead-in must not leak into the main walk. It used to:
+    # the walk restarted at the anchor with the original offset, was out by
+    # however many frames the lead-in had gained, and rediscovered the same
+    # insertion as a second edit of its own.
+    at = 1000
+    inserted = np.concatenate([ref[:at], np.repeat(ref[at - 1 : at], 8, axis=0), ref[at:]])
+    out = run(inserted)
+    main = [l for l in out.splitlines() if "edit(s):" in l]
+    leaked = main and not main[0].strip().startswith("0 edit(s)")
+    if "lead-in:" in out and not leaked:
+        print("  ok   a fault inside the lead-in does not leak into the main walk")
+    else:
+        good = False
+        print("  FAIL lead-in fault leaked into the main walk")
         print("\n".join("        " + l for l in out.splitlines()))
 
     out = run(ref.copy())
