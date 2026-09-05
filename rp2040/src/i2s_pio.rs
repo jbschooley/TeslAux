@@ -59,7 +59,11 @@ pub fn slave_rx<'d, P: Instance, const SM: usize>(
         ".wrap_target",
         // LRCK low marks the left slot. Resync every frame so a glitch costs
         // one frame rather than desynchronising the stream permanently.
-        "    wait 0 pin 2",
+        //
+        // LRCK is at IN base + 3, not + 2: the shield pin takes + 2 so that it
+        // lies between BCK and LRCK on the board. See `pins`, which asserts the
+        // two agree.
+        "    wait 0 pin 3",
         // Standard I2S delays data by one BCK after the LRCK edge; burn that
         // edge before sampling.
         "    wait 1 pin 1",
@@ -82,7 +86,7 @@ pub fn slave_rx<'d, P: Instance, const SM: usize>(
         //
         // Pushing whole frames removes the parity entirely: there is no way to
         // be half a frame out.
-        "    wait 1 pin 2",
+        "    wait 1 pin 3",
         "    wait 1 pin 1",
         "    set x, 15",
         "right:",
@@ -113,7 +117,13 @@ pub fn slave_rx<'d, P: Instance, const SM: usize>(
 
     let mut cfg = Config::default();
     cfg.use_program(&common.load_program(&prg.program), &[]);
-    cfg.set_in_pins(&[&data, &bck, &lrck]);
+    // Only the base matters. The three are no longer consecutive — the shield
+    // sits between BCK and LRCK — and `set_in_pins` asserts consecutiveness on
+    // whatever it is given, so hand it the base alone. `in pins, 1` reads the
+    // base; the clocks are reached by the `wait` indices, which are free to be
+    // any offset from it. (RP2040 has no IN_COUNT register: embassy only writes
+    // one on RP2350.)
+    cfg.set_in_pins(&[&data]);
     // MSB first: the first bit sampled must end up in bit 15.
     // 32 bits per push: left sample in the top half, right in the bottom.
     cfg.shift_in = ShiftConfig {
@@ -138,12 +148,16 @@ pub fn master_rx<'d, P: Instance, const SM: usize>(
     sm: &mut StateMachine<'d, P, SM>,
     data: Peri<'d, impl PioPin>,
     bck: Peri<'d, impl PioPin>,
+    shield: Peri<'d, impl PioPin>,
     lrck: Peri<'d, impl PioPin>,
     sys_hz: u32,
     rate: u32,
 ) {
-    // side-set drives BCK (bit 0) and LRCK (bit 1) so both clocks are emitted
-    // by the same instructions that sample the data — they cannot skew.
+    // side-set drives BCK (bit 0), the shield (bit 1) and LRCK (bit 2) so both
+    // clocks are emitted by the same instructions that sample the data — they
+    // cannot skew. The shield is written 0 throughout; see `master_tx` and
+    // `pins` for why it is there. Side-set pins run upward from the lowest, and
+    // on this board BCK is below SHIELD is below LRCK, so the bits read 0bWSB.
     //
     // Every bit-clock period is exactly two PIO cycles, ordered (high, low), so
     // sampling happens on the BCK rising edge. Each channel slot is 32 BCK:
@@ -155,41 +169,42 @@ pub fn master_rx<'d, P: Instance, const SM: usize>(
     // BCK per frame while the divider was computed for 64, which would have run
     // the whole link at twice the intended sample rate.
     let prg = pio::pio_asm!(
-        ".side_set 2",
+        ".side_set 3",               // side 0bWSB - W = word clock, S = shield, B = bit clock
         ".wrap_target",
         // ---- left slot: LRCK low ----
-        "    set x, 15          side 0b01",
-        "    nop                side 0b00",
+        "    set x, 15          side 0b001",
+        "    nop                side 0b000",
         "lrx:",
-        "    in pins, 1         side 0b01",
-        "    jmp x-- lrx        side 0b00",
-        "    push noblock       side 0b01",
-        "    set y, 13          side 0b00",
+        "    in pins, 1         side 0b001",
+        "    jmp x-- lrx        side 0b000",
+        "    push noblock       side 0b001",
+        "    set y, 13          side 0b000",
         "lpad:",
-        "    nop                side 0b01",
-        "    jmp y-- lpad       side 0b00",
+        "    nop                side 0b001",
+        "    jmp y-- lpad       side 0b000",
         // ---- right slot: LRCK high ----
-        "    set x, 15          side 0b11",
-        "    nop                side 0b10",
+        "    set x, 15          side 0b101",
+        "    nop                side 0b100",
         "rrx:",
-        "    in pins, 1         side 0b11",
-        "    jmp x-- rrx        side 0b10",
-        "    push noblock       side 0b11",
-        "    set y, 13          side 0b10",
+        "    in pins, 1         side 0b101",
+        "    jmp x-- rrx        side 0b100",
+        "    push noblock       side 0b101",
+        "    set y, 13          side 0b100",
         "rpad:",
-        "    nop                side 0b11",
-        "    jmp y-- rpad       side 0b10",
+        "    nop                side 0b101",
+        "    jmp y-- rpad       side 0b100",
         ".wrap",
     );
 
     let data = common.make_pio_pin(data);
     let bck = common.make_pio_pin(bck);
+    let shield = common.make_pio_pin(shield);
     let lrck = common.make_pio_pin(lrck);
     sm.set_pin_dirs(Direction::In, &[&data]);
-    sm.set_pin_dirs(Direction::Out, &[&bck, &lrck]);
+    sm.set_pin_dirs(Direction::Out, &[&bck, &shield, &lrck]);
 
     let mut cfg = Config::default();
-    cfg.use_program(&common.load_program(&prg.program), &[&bck, &lrck]);
+    cfg.use_program(&common.load_program(&prg.program), &[&bck, &shield, &lrck]);
     cfg.set_in_pins(&[&data]);
     // 32 bits per push: left sample in the top half, right in the bottom.
     cfg.shift_in = ShiftConfig {
@@ -269,30 +284,41 @@ pub fn master_tx<'d, P: Instance, const SM: usize>(
     sm: &mut StateMachine<'d, P, SM>,
     data: Peri<'d, impl PioPin>,
     bck: Peri<'d, impl PioPin>,
+    shield: Peri<'d, impl PioPin>,
     lrck: Peri<'d, impl PioPin>,
     sys_hz: u32,
     rate: u32,
 ) {
+    // Side-set carries three pins, not two, and the middle one is the shield:
+    // it is written 0 by every instruction, so it is a driven-low conductor
+    // running between BCK and LRCK for the whole length of the joint. It costs
+    // one of the five side-set bits and buys separation between the 3 MHz
+    // aggressor and the line whose early release corrupts a sample. See `pins`
+    // for the measurement that prompted it.
+    //
+    // Side-set pins are ordered upward from the lowest, so with LRCK below
+    // SHIELD below BCK the bits read 0bBSW.
     let prg = pio::pio_asm!(
-        ".side_set 2",               // side 0bWB - W = word clock, B = bit clock
-        "    set x, 30      side 0b01",
+        ".side_set 3",               // side 0bBSW - B = bit clock, S = shield, W = word clock
+        "    set x, 30      side 0b100",
         "left_data:",
-        "    out pins, 1    side 0b00",
-        "    jmp x-- left_data side 0b01",
-        "    out pins, 1    side 0b10", // word clock flips one bit early: I2S
-        "    set x, 30      side 0b11",
+        "    out pins, 1    side 0b000",
+        "    jmp x-- left_data side 0b100",
+        "    out pins, 1    side 0b001", // word clock flips one bit early: I2S
+        "    set x, 30      side 0b101",
         "right_data:",
-        "    out pins, 1    side 0b10",
-        "    jmp x-- right_data side 0b11",
-        "    out pins, 1    side 0b00",
+        "    out pins, 1    side 0b001",
+        "    jmp x-- right_data side 0b101",
+        "    out pins, 1    side 0b000",
     );
 
     let data = common.make_pio_pin(data);
     let bck = common.make_pio_pin(bck);
+    let shield = common.make_pio_pin(shield);
     let lrck = common.make_pio_pin(lrck);
 
     let mut cfg = Config::default();
-    cfg.use_program(&common.load_program(&prg.program), &[&bck, &lrck]);
+    cfg.use_program(&common.load_program(&prg.program), &[&lrck, &shield, &bck]);
     cfg.set_out_pins(&[&data]);
     cfg.shift_out = ShiftConfig {
         auto_fill: true,
@@ -302,7 +328,7 @@ pub fn master_tx<'d, P: Instance, const SM: usize>(
     cfg.fifo_join = FifoJoin::TxOnly;
     cfg.clock_divider = master_divider(sys_hz, rate).to_fixed();
     sm.set_config(&cfg);
-    sm.set_pin_dirs(Direction::Out, &[&data, &bck, &lrck]);
+    sm.set_pin_dirs(Direction::Out, &[&data, &bck, &shield, &lrck]);
 }
 
 /// Clock divider that makes a master state machine produce `rate` Hz.

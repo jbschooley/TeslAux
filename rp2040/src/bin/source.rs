@@ -53,6 +53,9 @@ use core::cell::RefCell;
 mod audio_pipe;
 #[path = "../i2s_pio.rs"]
 mod i2s_pio;
+#[macro_use]
+#[path = "../pins.rs"]
+mod pins;
 #[path = "../status.rs"]
 mod status;
 #[path = "../ws2812.rs"]
@@ -467,18 +470,26 @@ async fn main(spawner: Spawner) {
     // buffer, the slips and the 10.7 ms cushion are paying for.
     #[cfg(feature = "clock-steered")]
     let mut i2s_sm = {
+        let (data, bck, shield, lrck) = source_i2s_pins!(p);
         i2s_pio::master_tx(
             &mut common,
             &mut sm0,
-            p.PIN_2,
-            p.PIN_3,
-            p.PIN_4,
+            data,
+            bck,
+            shield,
+            lrck,
             embassy_rp::clocks::clk_sys_freq(),
             RATE,
         );
         sm0.set_enable(true);
         sm0
     };
+    // NOTE: this fallback keeps the ORIGINAL three-wire pinout (GP2/3/4) and has
+    // no shield. Upstream's driver owns its own side-set and needs BCK and LRCK
+    // adjacent, so a pin cannot be placed between them. The soldered two-board
+    // layout in `pins` therefore only applies to the `clock-steered` build —
+    // build the source with that feature, or this binary will expect the old
+    // jumpers.
     #[cfg(not(feature = "clock-steered"))]
     let program = PioI2sOutProgram::new(&mut common);
     #[cfg(not(feature = "clock-steered"))]

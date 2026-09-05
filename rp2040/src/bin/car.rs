@@ -43,6 +43,9 @@ use core::cell::RefCell;
 mod audio_pipe;
 #[path = "../i2s_pio.rs"]
 mod i2s_pio;
+#[macro_use]
+#[path = "../pins.rs"]
+mod pins;
 #[path = "../status.rs"]
 mod status;
 #[path = "../ws2812.rs"]
@@ -317,17 +320,24 @@ async fn main(spawner: Spawner) {
     let Pio { mut common, mut sm0, .. } = Pio::new(p.PIO0, Irqs);
 
     #[cfg(all(not(feature = "clock-locked"), not(feature = "packet-stress")))]
-    i2s_pio::slave_rx(&mut common, &mut sm0, p.PIN_2, p.PIN_3, p.PIN_4);
+    {
+        let (data, bck, lrck) = sink_i2s_pins!(p);
+        i2s_pio::slave_rx(&mut common, &mut sm0, data, bck, lrck);
+    }
     #[cfg(all(feature = "clock-locked", not(feature = "packet-stress")))]
-    i2s_pio::master_rx(
-        &mut common,
-        &mut sm0,
-        p.PIN_2,
-        p.PIN_3,
-        p.PIN_4,
-        embassy_rp::clocks::clk_sys_freq(),
-        ADVERTISED.load(core::sync::atomic::Ordering::Relaxed),
-    );
+    {
+        let (data, bck, lrck) = sink_i2s_pins!(p);
+        i2s_pio::master_rx(
+            &mut common,
+            &mut sm0,
+            data,
+            bck,
+            sink_shield_pin!(p),
+            lrck,
+            embassy_rp::clocks::clk_sys_freq(),
+            ADVERTISED.load(core::sync::atomic::Ordering::Relaxed),
+        );
+    }
     #[cfg(not(feature = "packet-stress"))]
     sm0.set_enable(true);
 
