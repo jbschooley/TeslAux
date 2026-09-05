@@ -288,28 +288,58 @@ impl<const N: usize> Pipe<N> {
         if mode == PaceMode::Locked || n == 0 {
             return n;
         }
-        // Nothing to pace until the buffer has filled once. An unprimed pipe is
-        // empty by definition, so the drift test below would fire on every
-        // packet and log a correction per frame — which is what a car board
-        // streaming to a host with no source connected did: ~1000 "slips" a
-        // second, none of them real.
-        if !self.primed {
-            return n;
-        }
         if mode == PaceMode::Stress {
             // Alternate -1/+1 so the long-run average stays exact and the buffer
             // does not walk; only the packet size moves.
             self.stress = !self.stress;
             return if self.stress { n + 1 } else { n - 1 };
         }
+        // Pace whether or not the pipe has primed, but only *count* once it
+        // has.
+        //
+        // Taking one frame fewer while the level is low is not a correction
+        // against drift — it is the only mechanism that builds the cushion.
+        // With producer and consumer both at exactly one packet per millisecond
+        // and the buffer starting empty, the level stays at zero forever unless
+        // the consumer takes slightly less, so the pipe never primes and `pop()`
+        // returns held samples: audible as crustiness, in proportion to signal
+        // level. That is what the single-chip build did in the car.
+        //
+        // An earlier version returned `n` while unprimed, to stop a pipe with no
+        // source logging a thousand corrections a second. Right observation
+        // about the counters, wrong conclusion about the pacing.
         if self.len > self.target + self.hyst {
-            self.stats.adj_up = self.stats.adj_up.saturating_add(1);
+            if self.primed {
+                self.stats.adj_up = self.stats.adj_up.saturating_add(1);
+            }
             n + 1
-        } else if self.len + self.hyst < self.target {
-            self.stats.adj_down = self.stats.adj_down.saturating_add(1);
+        } else if self.len < self.refill_floor() {
+            if self.primed {
+                self.stats.adj_down = self.stats.adj_down.saturating_add(1);
+            }
             n - 1
         } else {
             n
+        }
+    }
+
+    /// The level below which the pacer takes one frame fewer.
+    ///
+    /// Once primed this is the bottom of the deadband, so the pacer ignores
+    /// ordinary jitter. Before priming it is the target itself, because the
+    /// deadband would otherwise stop the refill at `target - hyst` — below the
+    /// level priming requires. Against a source that matches the sink exactly,
+    /// that difference is the whole game: the level parks just under the
+    /// deadband, the pipe never primes, and `pop()` returns held samples
+    /// forever, which is audible as crustiness in proportion to signal level.
+    ///
+    /// There is no jitter to ignore while the buffer is still filling, so there
+    /// is nothing to trade away by removing the deadband there.
+    fn refill_floor(&self) -> usize {
+        if self.primed {
+            self.target.saturating_sub(self.hyst)
+        } else {
+            self.target
         }
     }
 
@@ -743,16 +773,45 @@ mod tests {
     }
 
     #[test]
-    fn unprimed_pipe_does_not_pace() {
-        // A host can be streaming before any source is connected. That is an
-        // empty buffer, not drift, and must not be counted as corrections.
+    fn unprimed_pipe_paces_but_does_not_count() {
+        // A host can stream before any source is connected. That is an empty
+        // buffer, not drift, so nothing is counted — but the short packet must
+        // still be emitted, because it is what lets the buffer fill once a
+        // source does appear.
         let mut p = Pipe::<512>::new(48000);
         let mut out = [0u8; 256];
+        let n = p.take(&mut out, PaceMode::Elastic) / 4;
+        assert_eq!(n, p.nominal() - 1, "unprimed pipe must still shed a frame");
         for _ in 0..100 {
             p.take(&mut out, PaceMode::Elastic);
         }
-        assert_eq!(p.stats.adj_up, 0, "paced up while unprimed");
-        assert_eq!(p.stats.adj_down, 0, "paced down while unprimed");
+        assert_eq!(p.stats.adj_up, 0, "counted while unprimed");
+        assert_eq!(p.stats.adj_down, 0, "counted while unprimed");
+    }
+
+    #[test]
+    fn a_matched_source_and_sink_still_prime() {
+        // The case that made the single-chip build crackle: producer and
+        // consumer both at exactly one packet per millisecond, buffer starting
+        // empty. Taking one frame fewer while low is the only thing that builds
+        // the cushion; without it the level never leaves zero.
+        let mut p = Pipe::<256>::new_with_hysteresis(48000, 64);
+        let mut out = [0u8; 256];
+        for _ in 0..2000 {
+            for _ in 0..48 {
+                p.push([1234, -1234]);
+            }
+            p.take(&mut out, PaceMode::Elastic);
+            if p.primed() {
+                break;
+            }
+        }
+        assert!(p.primed(), "never primed against a matched source");
+        assert!(
+            p.off_target().abs() <= 64,
+            "primed but not near target: {}",
+            p.off_target()
+        );
     }
 
     #[test]
