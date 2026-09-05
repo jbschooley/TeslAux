@@ -71,6 +71,7 @@ Researched rather than assumed, though not yet confirmed on the car:
 | Behaviour | Consequence |
 |---|---|
 | Plays WAV, MP3, FLAC; **not** AAC | WAV, which is also the high-bitrate option the read trick wants |
+| Filesystem: "exFAT, MS-DOS FAT (for Mac), ext3, or ext4 (NTFS is currently not supported)" | FAT32 is "MS-DOS FAT" and is supported; exFAT is too, and is the community's choice for large music drives |
 | **Re-indexes on every wake**, not just insertion | expect a scan burst each drive; the detector needs a settle period, and the volume should stay small |
 | Orders by tag title, else filename; no other ordering | zero-padded numeric names make playback order equal track index |
 | Missing tags fall back to filenames | no metadata needed; artwork simply does not appear |
@@ -159,6 +160,24 @@ sustained read: 957,643 bytes/sec
 So the descriptors, Bulk-Only Transport, the SCSI subset and the synthetic FAT32
 are all right, and a deep read exercises `locate()` across thousands of clusters
 correctly. The car is now the only unknown.
+
+### If the car rejects the volume
+
+FAT32 is listed as supported by Tesla's own service documentation, so it is
+worth testing before anything is rebuilt. Two things to try first, in order,
+because both are far cheaper than the alternative:
+
+**Grow the volume.** Ours is 2.3 GB, and Tesla's documentation mentions a 64 GB
+minimum — that figure is for Dashcam rather than music, and small music drives
+are used routinely, but it is the cheapest thing to rule out. Every sector is
+synthesised, so more tracks or longer ones cost no flash at all: change
+`N_TRACKS` or `TRACK_SECONDS` in `fat.rs`. More tracks is useful regardless,
+since the track count *is* the range of the counter for rapid button presses.
+
+**Then exFAT.** A real job rather than a tweak: an upcase table, an allocation
+bitmap, and directory *entry sets* with checksums, against FAT32's flat table
+and 32-byte entries. Worth doing only once FAT32 has actually been shown to
+fail, since the documentation says it should not.
 
 ### Read pacing is load-bearing, not polish
 
