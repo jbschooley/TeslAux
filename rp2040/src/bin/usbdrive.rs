@@ -267,6 +267,12 @@ fn note_event(ev: Option<Event>) {
             bump(16, n);
             flash(2);
         }
+        // The car restarts the current track on the first `previous` press once
+        // a track is under way, so this is that press.
+        Some(Event::Restart) => {
+            bump(16, 1);
+            flash(2);
+        }
         Some(Event::Paused) => PLAYBACK_PAUSED.store(true, Ordering::Relaxed),
         Some(Event::Resumed) => PLAYBACK_PAUSED.store(false, Ordering::Relaxed),
         None => {}

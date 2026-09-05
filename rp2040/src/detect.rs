@@ -28,6 +28,9 @@ pub enum Event {
     Next(u32),
     /// The user pressed previous `n` times.
     Prev(u32),
+    /// The player restarted the current track, which is what most do on the
+    /// first `previous` press once a track is under way.
+    Restart,
     /// Playback stopped: reads have gone quiet while a track was open.
     Paused,
     /// Playback resumed after a pause.
@@ -84,6 +87,10 @@ pub struct Detector {
     candidate: Option<u32>,
     candidate_reads: u32,
 
+    /// Consecutive reads seen well behind `high_water`, for telling a restart
+    /// from a stray backwards read.
+    rewind_reads: u32,
+
     last_read_ms: u32,
     paused: bool,
 }
@@ -97,6 +104,7 @@ impl Detector {
             high_water: 0,
             candidate: None,
             candidate_reads: 0,
+            rewind_reads: 0,
             last_read_ms: 0,
             paused: false,
         }
@@ -142,9 +150,30 @@ impl Detector {
         };
 
         if pos.track == current {
-            self.high_water = self.high_water.max(pos.offset);
             self.candidate = None;
             self.candidate_reads = 0;
+
+            // A read well behind the furthest one so far *might* be the player
+            // restarting the track — the first `previous` press, on most
+            // players, once a track is under way.
+            //
+            // A single such read means nothing: hosts re-read a header for
+            // metadata, seek to fill a buffer, or re-read after a gap, and an
+            // earlier version reported every one of those as a press. What
+            // distinguishes a restart is that playback *continues* from the
+            // earlier point, so require a run of them before believing it.
+            if pos.offset + END_TOLERANCE_BYTES < self.high_water {
+                self.rewind_reads += 1;
+                if self.rewind_reads >= SETTLE_READS {
+                    self.high_water = pos.offset;
+                    self.rewind_reads = 0;
+                    return Some(Event::Restart);
+                }
+                return if resumed { Some(Event::Resumed) } else { None };
+            }
+
+            self.rewind_reads = 0;
+            self.high_water = self.high_water.max(pos.offset);
             return if resumed { Some(Event::Resumed) } else { None };
         }
 
@@ -165,9 +194,14 @@ impl Detector {
         let played_out = self.high_water + END_TOLERANCE_BYTES >= self.track_bytes;
 
         self.current = Some(pos.track);
-        self.high_water = pos.offset;
+        // Start the new track's high-water mark at zero rather than at wherever
+        // this read landed. The player reads a new file's header early on, and
+        // starting from a read-ahead offset would make that header read look
+        // like a rewind.
+        self.high_water = 0;
         self.candidate = None;
         self.candidate_reads = 0;
+        self.rewind_reads = 0;
 
         // A track that was played to its end and advanced by one is the playlist
         // doing its job, not a button.
@@ -181,20 +215,6 @@ impl Detector {
             d => Some(Event::Prev((-d) as u32)),
         }
     }
-
-    // There is deliberately no restart detection.
-    //
-    // Most players make the first `previous` press restart the current track
-    // rather than move back, and detecting that looked easy: a read landing
-    // much earlier in the file than the furthest one so far. In the car it fired
-    // constantly. Hosts read out of order as a matter of course — a header for
-    // metadata, a seek to fill a buffer, a re-read after a gap — and every one
-    // of those looks like a backwards seek.
-    //
-    // It reported a press on almost every genuine track change, because after
-    // moving to a new track the car reads its header at offset zero. Since a
-    // false press is directly audible on the source and the feature only saves
-    // the user a second press, it is not worth having on those terms.
 
     /// Call periodically. Reports a pause once reads have been quiet.
     pub fn tick(&mut self, now_ms: u32) -> Option<Event> {
@@ -368,6 +388,46 @@ mod tests {
             Some(Event::Resumed)
         );
         assert!(!d.is_paused());
+    }
+
+    #[test]
+    fn restarting_the_track_is_reported() {
+        // Most players restart the current track on the first `previous` press
+        // once a track is under way, so this is the only signal that press
+        // gives us — no track changes, so nothing else would see it.
+        let mut d = det();
+        reads(&mut d, 7, TRACK_BYTES / 2, SETTLE_READS + 2, 0);
+        // Playback resumes from the top and continues.
+        let mut got = None;
+        for i in 0..SETTLE_READS {
+            let e = d.on_read(Position { track: 7, offset: i * 65536 }, 1000 + i * 10);
+            if e.is_some() {
+                got = e;
+            }
+        }
+        assert_eq!(got, Some(Event::Restart));
+        assert_eq!(d.track(), Some(7), "a restart moved the track");
+    }
+
+    #[test]
+    fn a_single_backwards_read_is_not_a_restart() {
+        // The failure that made restart detection unusable: hosts re-read a
+        // header, seek to fill a buffer, or re-read after a gap. One backwards
+        // read is not a rewind.
+        let mut d = det();
+        reads(&mut d, 7, TRACK_BYTES / 2, SETTLE_READS + 2, 0);
+        assert_eq!(d.on_read(Position { track: 7, offset: 0 }, 1000), None);
+        // ...and playback carrying on from where it was clears the suspicion.
+        assert_eq!(
+            d.on_read(Position { track: 7, offset: TRACK_BYTES / 2 + 4096 }, 1010),
+            None
+        );
+        assert_eq!(d.on_read(Position { track: 7, offset: 0 }, 1020), None);
+        assert_eq!(
+            d.on_read(Position { track: 7, offset: TRACK_BYTES / 2 + 8192 }, 1030),
+            None,
+            "scattered backwards reads reported a restart"
+        );
     }
 
     #[test]
