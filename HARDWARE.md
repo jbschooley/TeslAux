@@ -145,6 +145,23 @@ clock again. The F4 has a dedicated `PLLI2S` with a fractional divider built for
 hitting audio rates exactly, so that is a solved problem there rather than a
 repeat of the PIO fight.
 
+## A board with no jumper wires
+
+`HARDWARE-PCB.md` specifies a single-board version of the STM32 build: the same
+F407, both USB connectors on the PCB, everything else stripped.
+
+The motivation is signal integrity rather than tidiness. The dev-board build
+reaches the phone through four inches of unshielded jumper carrying what is
+meant to be a 90 Ω differential pair, and that is the leading suspect for the
+occasional pops — a failed CRC on an isochronous packet is discarded silently by
+the host, which is invisible to every counter in the firmware. Measurement
+during a click showed a completely healthy buffer: no underrun, no overrun, no
+timeout, no dropped stream.
+
+The firmware does not change — same pins, same build — which is what makes it a
+clean experiment. If the pops survive a board with no jumpers, wiring was never
+the cause.
+
 ## External PHY route
 
 Any STM32 with `OTG_HS` and ULPI pins can reach true high speed with an external

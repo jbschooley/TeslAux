@@ -49,6 +49,29 @@ mod status;
 
 use defmt_rtt as _;
 
+/// Anomaly logging, for correlating an audible click against what the firmware
+/// saw at that moment.
+///
+/// Deliberately quiet: a heartbeat every few seconds, and a line the instant
+/// anything notable happens. A log that prints every second buries the one line
+/// that matters, and the question here is "what happened *just then*".
+mod watch {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    pub static UNDERRUNS: AtomicU32 = AtomicU32::new(0);
+    pub static OVERRUNS: AtomicU32 = AtomicU32::new(0);
+    pub static WRITE_TIMEOUTS: AtomicU32 = AtomicU32::new(0);
+    pub static SOURCE_STALLS: AtomicU32 = AtomicU32::new(0);
+    pub static EP_DISABLED: AtomicU32 = AtomicU32::new(0);
+    pub static SHORT_PACKETS: AtomicU32 = AtomicU32::new(0);
+
+    pub fn bump(c: &AtomicU32) -> u32 {
+        let n = c.load(Ordering::Relaxed).wrapping_add(1);
+        c.store(n, Ordering::Relaxed);
+        n
+    }
+}
+
 use audio_pipe::{PaceMode, Pipe};
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -162,6 +185,54 @@ async fn usb_car_task(mut d: UsbDevice<'static, CarDriver>) -> ! {
 #[embassy_executor::task]
 async fn usb_phone_task(mut d: UsbDevice<'static, PhoneDriver>) -> ! {
     d.run().await
+}
+
+/// Report anything the pipe recorded, the moment it changes.
+///
+/// The pipe counts underruns and overruns exactly, so there is nothing to infer
+/// — the only question is *when*. Polling ten times a second keeps a report
+/// within about 100 ms of the sound it explains, which is close enough to
+/// correlate against someone saying "there".
+#[embassy_executor::task]
+async fn watch_task() -> ! {
+    let (mut under, mut over) = (0u32, 0u32);
+    let mut ticks = 0u32;
+    loop {
+        embassy_time::Timer::after_millis(100).await;
+        let (st, off, primed) = PIPE.lock(|p| {
+            let b = p.borrow();
+            (b.stats, b.off_target(), b.primed())
+        });
+        if st.underruns != under {
+            defmt::warn!(
+                "UNDERRUN x{} (level {}) - buffer ran dry, held sample sent",
+                st.underruns - under,
+                off
+            );
+            under = st.underruns;
+        }
+        if st.overruns != over {
+            defmt::warn!(
+                "OVERRUN x{} (level {}) - buffer full, oldest audio discarded",
+                st.overruns - over,
+                off
+            );
+            over = st.overruns;
+        }
+        ticks += 1;
+        if ticks % 50 == 0 {
+            defmt::info!(
+                "ok: level {} primed {} | under {} over {} timeouts {} stalls {} epdis {}",
+                off,
+                primed,
+                st.underruns,
+                st.overruns,
+                watch::WRITE_TIMEOUTS.load(Ordering::Relaxed),
+                watch::SOURCE_STALLS.load(Ordering::Relaxed),
+                watch::EP_DISABLED.load(Ordering::Relaxed),
+            );
+        }
+    }
 }
 
 #[embassy_executor::task]
@@ -302,6 +373,7 @@ async fn main(spawner: Spawner) {
     };
 
     spawner.spawn(status_task(led).unwrap());
+    spawner.spawn(watch_task().unwrap());
 
 
     // Producer and consumer both live here rather than in spawned tasks: an
@@ -342,6 +414,8 @@ async fn sink(mut ep: impl EndpointOut) -> ! {
                 // real silence and re-primes cleanly when audio returns. The
                 // endpoint is still enabled, so keep waiting on it.
                 Err(_) => {
+                    let n = watch::bump(&watch::SOURCE_STALLS);
+                    defmt::warn!("source stalled ({}) - phone stopped sending", n);
                     SOURCE_LIVE.store(false, Ordering::Relaxed);
                     PIPE.lock(|p| p.borrow_mut().reset());
                 }
@@ -449,6 +523,10 @@ async fn pump(mut iso_in: impl EndpointIn) -> ! {
             let attempt = match attempt {
                 Ok(r) => r,
                 Err(_) => {
+                    // Each of these discards a packet the car never collected:
+                    // about a millisecond of audio, which is audible.
+                    let n = watch::bump(&watch::WRITE_TIMEOUTS);
+                    defmt::warn!("WRITE TIMEOUT ({}) - packet dropped", n);
                     // Belt and braces: the same flush on the recovery path, so
                     // a stall from any other cause cannot become permanent.
                     flush_car_tx_fifo();
