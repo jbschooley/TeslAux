@@ -340,6 +340,47 @@ def walk(ref, rec, off, tol=1, blk=2400, search=8000):
     return {"worst_lsb": worst, "diff_samples": diffs, "compared": total}, edits
 
 
+def report_lead_in(ref, rec, tol, rate):
+    """Say what happened in the seconds before the alignment anchor.
+
+    Reported apart from the main walk because the two answer different
+    questions. The walk asks whether a settled stream stayed intact. This asks
+    whether it started intact — which is where priming, the first packets and
+    the pacer's first corrections live, and so where a fault heard "right at the
+    beginning" actually is. Silence here used to be indistinguishable from
+    having looked.
+    """
+    n = len(ref)
+    if n == 0:
+        print("      lead-in: none (recording starts at the reference)")
+        return True
+    secs = n / rate
+    if np.array_equal(ref, rec):
+        print(f"      lead-in: first {secs:.1f} s match exactly")
+        return True
+    if n > 2400:
+        _, edits = walk(ref, rec, 0, tol=tol)
+        if edits:
+            kinds = ", ".join(f"{k} {c}" for _, k, c in edits[:4])
+            print(f"      lead-in: {len(edits)} edit(s) in the first {secs:.1f} s ({kinds})")
+            for pos, kind, cnt in edits[:4]:
+                print(f"        ref frame {pos:>9}  {pos / rate:6.3f} s  {kind} {cnt} frames")
+            return False
+    # No splice explains it, so say how big the difference actually is: at the
+    # start of a stream this is usually one file having signal where the other
+    # still has silence, which is not a fault and should not read like one.
+    d = np.abs(ref.astype(np.int32) - rec.astype(np.int32))
+    bad = int(np.count_nonzero(d.max(axis=1)))
+    worst = int(d.max())
+    print(
+        f"      lead-in: {bad} of {n} frames differ in the first {secs:.1f} s, "
+        f"by at most {worst} LSB ({20 * np.log10(max(worst, 1) / 32768.0):+.0f} dBFS)"
+    )
+    # A handful of near-silent frames at a stream's edge is the recorder finding
+    # the signal, not a fault. Anything louder is real.
+    return worst <= 32
+
+
 def compare(ref_path, rec_path):
     ref, ref_rate = read_wav(ref_path)
     rec, rec_rate = read_wav(rec_path)
@@ -409,7 +450,17 @@ def compare(ref_path, rec_path):
         ref = ref[-off:]
     else:
         rec = rec[off:]
-    # Start comparing from the anchor, not from the very beginning.
+    # The anchor is where alignment was MEASURED, not where comparison starts.
+    # Skipping it entirely hid the opening seconds of every stream — priming,
+    # the first packets, the moment a glitch is most likely — from every report:
+    # a capture whose first two seconds were visibly wrong came back "bit-exact"
+    # because the only region anyone doubted was the one never looked at.
+    #
+    # So hold the lead-in aside and compare it separately. It stays out of the
+    # main walk because a stream's first moments are exactly where one file
+    # holds material the other does not, which no shift reconciles; a failure
+    # there should be reported, not allowed to derail the rest.
+    lead_ref, lead_rec = ref[:anchor], rec[:anchor]
     ref = ref[anchor:]
     rec = rec[anchor:]
     n = min(len(ref), len(rec))
@@ -417,8 +468,12 @@ def compare(ref_path, rec_path):
         print("FAIL  no overlap after alignment")
         return 1
 
-    if np.array_equal(ref[:n], rec[:n]):
-        print(f"compared {n} frames ({n / ref_rate:.1f} s)")
+    lead_n = min(len(lead_ref), len(lead_rec))
+    lead_clean = lead_n == 0 or np.array_equal(lead_ref[:lead_n], lead_rec[:lead_n])
+
+    if lead_clean and np.array_equal(ref[:n], rec[:n]):
+        total = n + lead_n
+        print(f"compared {total} frames ({total / ref_rate:.1f} s), lead-in included")
         print("PASS  bit-exact: every sample matches")
         return 0
 
@@ -432,6 +487,7 @@ def compare(ref_path, rec_path):
         # Not a level error at all; fall through to the bulk explanation.
         tol = 0
     stats, edits = walk(ref, rec, 0, tol=max(tol, 1))
+    lead_ok = report_lead_in(lead_ref[:lead_n], lead_rec[:lead_n], max(tol, 1), ref_rate)
     lost = sum(e[2] for e in edits if e[1] == "missing")
     gained = sum(e[2] for e in edits if e[1] == "extra")
     corrupt = sum(e[2] for e in edits if e[1] == "corrupt")
@@ -480,8 +536,13 @@ def compare(ref_path, rec_path):
     print(f"compared {n} frames ({n / ref_rate:.1f} s)")
 
     if not notes:
-        print("PASS  bit-exact: every sample matches")
-        return 0
+        if lead_ok:
+            print("PASS  bit-exact: every sample matches")
+            return 0
+        # Saying PASS while having just printed edits is how the anchor hid them
+        # in the first place.
+        print("FAIL  bit-exact after the lead-in, but the lead-in has edits above")
+        return 1
 
     pct = 100.0 * total / n
     print(f"FAIL  {total} frames differ ({pct:.4f}%)")
@@ -599,8 +660,69 @@ def _self_test():
         print(f"  FAIL resample-like: {why}")
         ok = False
 
+    ok = _check_lead_in() and ok
+
     print("\nself-test:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
+
+
+def _check_lead_in():
+    """A fault inside the alignment anchor must be reported, not skipped.
+
+    This is the regression the rest of the suite could not catch, because every
+    other case drives find_offset and classify directly and never exercises what
+    compare() chooses to look at. A recording whose opening was visibly wrong
+    came back "bit-exact" while the anchor quietly excluded the only region in
+    doubt, so the test has to go through compare() end to end.
+    """
+    import contextlib
+    import io
+    import os
+    import tempfile
+    import wave as wavemod
+
+    rng = np.random.default_rng(7)
+    rate = 48000
+    ref = rng.integers(-20000, 20000, size=(10 * rate, 2)).astype(np.int16)
+    cut = rate // 2  # half a second in: well inside the two-second anchor
+    spliced = np.concatenate([ref[:cut], ref[cut + 64 :]])
+
+    def run(rec):
+        d = tempfile.mkdtemp()
+        a, b = os.path.join(d, "ref.wav"), os.path.join(d, "rec.wav")
+        for path, data in ((a, ref), (b, rec)):
+            with wavemod.open(path, "wb") as w:
+                w.setnchannels(CHANNELS)
+                w.setsampwidth(2)
+                w.setframerate(rate)
+                w.writeframes(data.astype("<i2").tobytes())
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            compare(a, b)
+        os.remove(a)
+        os.remove(b)
+        os.rmdir(d)
+        return buf.getvalue()
+
+    good = True
+
+    out = run(spliced)
+    if "lead-in" in out and "64 frames" in out:
+        print("  ok   64-frame splice inside the anchor -> reported in the lead-in")
+    else:
+        good = False
+        print("  FAIL splice inside the anchor was not reported")
+        print("\n".join("        " + l for l in out.splitlines()))
+
+    out = run(ref.copy())
+    if "PASS" in out and "lead-in included" in out:
+        print("  ok   clean recording -> passes with the lead-in counted")
+    else:
+        good = False
+        print("  FAIL clean recording did not report the lead-in as compared")
+        print("\n".join("        " + l for l in out.splitlines()))
+
+    return good
 
 
 def main(argv):
