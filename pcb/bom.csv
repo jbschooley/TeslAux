@@ -1,0 +1,26 @@
+Designator,Quantity,Value,Package,Description,Notes
+U1,1,STM32F407VET6,LQFP-100,MCU,firmware assumes 8 MHz HSE
+U2,1,AMS1117-3.3,SOT-223,3.3 V LDO,>=300 mA; board draws ~100 mA
+U3,1,USBLC6-2SC6,SOT-23-6,ESD protection,car USB pair
+U4,1,USBLC6-2SC6,SOT-23-6,ESD protection,phone USB pair
+J1,1,USB-C 16P,SMD,USB-C receptacle - CAR,CC pads must be broken out
+J2,1,USB-C 16P,SMD,USB-C receptacle - PHONE,CC pads must be broken out
+J3,1,Header 1x5,2.54mm,SWD,3V3 / SWDIO / GND / SWCLK / NRST
+J4,1,Header 1x2,2.54mm,BOOT0 jumper,short to 3V3 for DFU
+Y1,1,8MHz,3225,Crystal,load caps per its datasheet
+SW1,1,Tactile,SMD,Reset,to GND
+C1,1,2.2uF,0805,X7R low-ESR,VCAP_1 - REQUIRED
+C2,1,2.2uF,0805,X7R low-ESR,VCAP_2 - REQUIRED
+C3-C12,10,100nF,0402,X7R,one per VDD pin at the pin
+C13,1,10uF,0805,X5R,+3V3 bulk
+C14,1,10uF,0805,X5R,+5V bulk
+C15,1,1uF,0603,X7R,VDDA
+C16,1,100nF,0402,X7R,VDDA
+C17,1,100nF,0402,X7R,NRST
+C18,2,per crystal,0402,C0G,crystal load caps
+R1-R4,4,22R,0402,1%,USB series - place near MCU
+R5-R8,4,5.1k,0402,1%,CC pulldowns - two per connector
+R9,1,10k,0402,1%,BOOT0 pulldown
+R10,1,1k,0402,1%,LED series
+FB1,1,Ferrite 600R@100MHz,0603,Bead,VDDA from +3V3
+D1,1,LED,0603,Status,PA1 sinks to light
