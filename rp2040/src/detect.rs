@@ -241,9 +241,13 @@ mod tests {
         last
     }
 
-    /// Establish playback on a track, mid-file.
-    fn playing(d: &mut Detector, track: u32, t0: u32) {
-        reads(d, track, TRACK_BYTES / 2, SETTLE_READS + 2, t0);
+    /// Establish playback on a track, mid-file. Returns the time of the last
+    /// read, since the quiet window is measured from there rather than from
+    /// when the test started.
+    fn playing(d: &mut Detector, track: u32, t0: u32) -> u32 {
+        let n = SETTLE_READS + 2;
+        reads(d, track, TRACK_BYTES / 2, n, t0);
+        t0 + (n - 1) * 10
     }
 
     #[test]
@@ -334,28 +338,32 @@ mod tests {
     #[test]
     fn a_pause_is_reported_once_reads_go_quiet() {
         let mut d = det();
-        playing(&mut d, 3, 0);
-        // Expressed against the threshold rather than a fixed number, so
-        // tuning it does not silently invalidate the test.
+        let last = playing(&mut d, 3, 0);
+        // Expressed against the threshold, and measured from the last read, so
+        // tuning either cannot silently invalidate the test.
         assert_eq!(
-            d.tick(PAUSE_AFTER_MS - 1),
+            d.tick(last + PAUSE_AFTER_MS - 1),
             None,
             "reported a pause inside the quiet window"
         );
-        assert_eq!(d.tick(PAUSE_AFTER_MS + 1), Some(Event::Paused));
-        assert_eq!(d.tick(PAUSE_AFTER_MS * 3), None, "reported the same pause twice");
+        assert_eq!(d.tick(last + PAUSE_AFTER_MS + 1), Some(Event::Paused));
+        assert_eq!(
+            d.tick(last + PAUSE_AFTER_MS * 3),
+            None,
+            "reported the same pause twice"
+        );
         assert!(d.is_paused());
     }
 
     #[test]
     fn resuming_is_reported_and_is_not_a_press() {
         let mut d = det();
-        playing(&mut d, 3, 0);
-        assert_eq!(d.tick(PAUSE_AFTER_MS + 1), Some(Event::Paused));
+        let last = playing(&mut d, 3, 0);
+        assert_eq!(d.tick(last + PAUSE_AFTER_MS + 1), Some(Event::Paused));
         assert_eq!(
             d.on_read(
                 Position { track: 3, offset: TRACK_BYTES / 2 + 4096 },
-                PAUSE_AFTER_MS + 100
+                last + PAUSE_AFTER_MS + 100
             ),
             Some(Event::Resumed)
         );
