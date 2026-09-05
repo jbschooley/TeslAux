@@ -142,9 +142,52 @@ def find_offset(ref, rec, probe=48000, search=None):
     hay = rec[: (search or len(rec)), 0].astype(np.float64)
     if len(hay) < len(needle):
         return None
-    corr = np.correlate(hay, needle, mode="valid")
-    peak = int(np.argmax(np.abs(corr)))
+    corr = _xcorr_valid(hay, needle)
+    # Normalise by the energy under each window, which turns a dot product into
+    # a correlation coefficient. Unnormalised, the largest product is simply the
+    # loudest place in the recording rather than the matching one: this file
+    # ends about three times louder than it begins, so a probe taken from the
+    # quiet opening peaked in the finale and the whole comparison was reported
+    # as different material. Short captures never showed it.
+    energy = np.concatenate(([0.0], np.cumsum(hay * hay)))
+    window = energy[len(needle) :] - energy[: -len(needle)]
+    denom = np.sqrt(window) * np.linalg.norm(needle)
+    denom[denom <= 0] = np.inf
+    peak = int(np.argmax(np.abs(corr / denom)))
     return peak - start
+
+
+def _xcorr_valid(hay, needle):
+    """Cross-correlation of `needle` against `hay` at every valid offset.
+
+    Identical in result to np.correlate(hay, needle, mode="valid"), but that
+    does the sum directly, in O(len(hay) * len(needle)). Against a ten-minute
+    recording — thirty million frames, a one-second probe — that is on the order
+    of 10^12 multiply-adds and never finishes; the first attempt at this had to
+    be killed. Overlap-save with an FFT gives the same numbers in O(n log n) and
+    in memory bounded by the segment size rather than the recording.
+    """
+    m = len(needle)
+    n_out = len(hay) - m + 1
+    # Segments a few times the needle keep the discarded wrap-around region a
+    # small fraction of each transform.
+    seg = max(1 << (4 * m - 1).bit_length(), 1 << 16)
+    step = seg - m + 1
+    # Correlation is convolution with the needle reversed.
+    fr = np.fft.rfft(needle[::-1], seg)
+    out = np.empty(n_out, dtype=np.float64)
+    pos = 0
+    while pos < n_out:
+        block = hay[pos : pos + seg]
+        if len(block) < seg:
+            block = np.pad(block, (0, seg - len(block)))
+        prod = np.fft.irfft(np.fft.rfft(block, seg) * fr, seg)
+        # The first m-1 samples of a circular convolution are corrupted by
+        # wrap-around; everything after them is the linear result.
+        take = min(step, n_out - pos)
+        out[pos : pos + take] = prod[m - 1 : m - 1 + take]
+        pos += take
+    return out
 
 
 def classify(ref, rec, limit=20):
@@ -266,6 +309,31 @@ def walk(ref, rec, off, tol=1, blk=2400, search=8000):
                 i, j = pos, jb + sh
                 break
         if found is None:
+            # No shift reconciles the streams, so nothing was inserted or lost.
+            # Before giving up, check whether they simply carry on in step a few
+            # frames later: that means the frames in between kept their place
+            # and changed their value, which is a different fault entirely — a
+            # sample corrupted in transit rather than a frame dropped, and the
+            # signature of a bit error on the wire. Treating it as unresolved
+            # ended the walk at the first occurrence and left the rest of an
+            # eleven-minute recording unexamined.
+            run = 0
+            while (
+                pos + run < len(ref)
+                and jb + run < len(rec)
+                and run < blk
+                and np.abs(
+                    ref[pos + run].astype(np.int32) - rec[jb + run].astype(np.int32)
+                ).max()
+                > tol
+            ):
+                run += 1
+            a = ref[pos + run : pos + run + 512].astype(np.int32)
+            b = rec[jb + run : jb + run + 512].astype(np.int32)
+            if run and a.shape == b.shape and a.size and np.abs(a - b).max() <= tol:
+                edits.append((pos, "corrupt", run))
+                i, j = pos + run, jb + run
+                continue
             edits.append((pos, "unresolved", 0))
             break
         edits.append((pos, "missing" if found < 0 else "extra", abs(found)))
@@ -296,15 +364,39 @@ def compare(ref_path, rec_path):
     # match a musically similar passage. Without this check a recording of
     # entirely different material was reported as one unresolved splice, which
     # reads like a firmware fault instead of "wrong file".
+    #
+    # The offset is measured once, near the start, but it does not hold for the
+    # whole file: the pacer inserts and drops frames to absorb the difference
+    # between the player's clock and the recorder's, so the lag creeps. Over
+    # eleven minutes it crept by about fifty frames. Requiring the single
+    # starting offset to line up a third of the way in therefore compares music
+    # against itself shifted by a fraction of a millisecond, which correlates at
+    # about 0.14 and reads exactly like the wrong file — it rejected a recording
+    # that turned out to correlate at 1.000 once the drift was allowed for.
+    #
+    # So search a window around the expected position and take the best match.
+    # Wrong material still correlates with nothing at any lag, which is the
+    # distinction this check exists to make.
     probe_n = min(48000, len(ref) // 4)
-    a = ref[len(ref) // 3 : len(ref) // 3 + probe_n, 0].astype(np.float64)
-    bstart = len(ref) // 3 + off
-    b = rec[bstart : bstart + probe_n, 0].astype(np.float64)
-    if len(b) == len(a) and a.size:
+    slack = min(2 * ref_rate, probe_n)
+    i = len(ref) // 3
+    a = ref[i : i + probe_n, 0].astype(np.float64)
+    lo = max(0, i + off - slack)
+    hay = rec[lo : i + off + probe_n + slack, 0].astype(np.float64)
+    if len(hay) > len(a) and a.size and a.any():
         a = a - a.mean()
-        b = b - b.mean()
-        den = np.sqrt((a * a).sum() * (b * b).sum())
-        ncc = float((a * b).sum() / den) if den else 0.0
+        corr = _xcorr_valid(hay, a)
+        energy = np.concatenate(([0.0], np.cumsum(hay * hay)))
+        window = energy[len(a) :] - energy[: -len(a)]
+        # Subtracting the window mean is what makes this a correlation
+        # coefficient rather than a dot product biased by any DC offset.
+        counts = float(len(a))
+        sums = np.concatenate(([0.0], np.cumsum(hay)))
+        wsum = sums[len(a) :] - sums[: -len(a)]
+        var = np.maximum(window - wsum * wsum / counts, 0.0)
+        den = np.sqrt(var * (a * a).sum())
+        den[den <= 0] = np.inf
+        ncc = float(np.abs(corr / den).max())
         if ncc < 0.9:
             print(f"FAIL  these are not the same audio (correlation {ncc:+.3f})")
             print("      The recording does not contain the reference material.")
@@ -342,6 +434,7 @@ def compare(ref_path, rec_path):
     stats, edits = walk(ref, rec, 0, tol=max(tol, 1))
     lost = sum(e[2] for e in edits if e[1] == "missing")
     gained = sum(e[2] for e in edits if e[1] == "extra")
+    corrupt = sum(e[2] for e in edits if e[1] == "corrupt")
     print(f"compared {stats['compared'] // CHANNELS} frames between edits")
     if stats["worst_lsb"]:
         pct = 100.0 * stats["diff_samples"] / max(stats["compared"], 1)
@@ -363,10 +456,15 @@ def compare(ref_path, rec_path):
         print("      converts int16 -> float -> int16 without rounding. It loses no")
         print("      audio, but it is not bit-exact, so fix it before trusting a pass.")
     if edits:
-        print(f"      {len(edits)} splice(s): {lost} frames missing, {gained} extra")
+        print(
+            f"      {len(edits)} edit(s): {lost} frames missing, {gained} extra, "
+            f"{corrupt} corrupted in place"
+        )
         for pos, kind, cnt in edits[:12]:
+            # The walk runs on the anchored slice; report where it is in the file.
+            at = pos + anchor
             print(
-                f"        ref frame {pos:>9}  {pos / ref_rate / 60:5.2f} min  "
+                f"        ref frame {at:>9}  {at / ref_rate / 60:5.2f} min  "
                 f"{kind} {cnt} frames ({1000.0 * cnt / ref_rate:.1f} ms)"
             )
         if len(edits) > 12:
