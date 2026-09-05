@@ -87,7 +87,8 @@ const MODE: PaceMode = PaceMode::Locked;
 #[cfg(feature = "packet-stress")]
 const MODE: PaceMode = PaceMode::Stress;
 
-/// 256-point sine, quarter scale. Only used by the `packet-stress` diagnostic.
+/// 256-point sine, quarter scale. Used by the `packet-stress` and `pipe-tone`
+/// diagnostics.
 ///
 /// Indexed by a phase accumulator at **997 Hz**, not 1000 Hz, and interpolated.
 /// Both details matter: 1 kHz at 48 kHz is exactly 48 samples, i.e. exactly one
@@ -96,7 +97,7 @@ const MODE: PaceMode = PaceMode::Stress;
 /// firmware for two months. 997 shares no factor with the frame rate. And
 /// indexing by the top 8 bits alone gives only ~-40 dBFS of phase-truncation
 /// error, audible as a spurious tone, so the low bits interpolate.
-#[cfg(feature = "packet-stress")]
+#[cfg(any(feature = "packet-stress", feature = "pipe-tone"))]
 #[rustfmt::skip]
 const SINE256: [i16; 256] = [
          0,    393,    785,   1177,   1568,   1959,   2348,   2735,
@@ -134,7 +135,7 @@ const SINE256: [i16; 256] = [
 ];
 
 /// Phase step per sample for the diagnostic tone.
-#[cfg(feature = "packet-stress")]
+#[cfg(any(feature = "packet-stress", feature = "pipe-tone"))]
 const TONE_PHASE_INC: u32 = ((997u64 << 32) / 48_000u64) as u32;
 /// Default advertised rate. The board follows the source instead of insisting on
 /// this — see `boot_rate` and the renegotiation in `pump`.
@@ -398,6 +399,12 @@ async fn capture(
     // a memcpy plus the DMA setup.
     let mut work = [0u32; I2S_BLOCK];
     let mut have_work = false;
+    // `pipe-tone` substitutes a generated tone for the captured samples, so the
+    // phase advances once per frame PUSHED — clocked by the I2S DMA, exactly as
+    // real audio is. A producer on its own timer cannot stand in for this: see
+    // the note in the pump, where a 1 ms timer starved every packet.
+    #[cfg(feature = "pipe-tone")]
+    let mut tone_phase = 0u32;
     let mut dma = dma;
     let mut last_block = Instant::now();
     #[cfg(feature = "clock-locked")]
@@ -417,6 +424,24 @@ async fn capture(
             PIPE.lock(|p| {
                 let mut pipe = p.borrow_mut();
                 for w in work.iter() {
+                    // Substituting the VALUES while keeping the timing is the
+                    // whole point of this build. The I2S link still clocks the
+                    // producer, the pipe and the pacer still run, but what comes
+                    // out is known exactly — so a hold in the recording is this
+                    // board's pipe running dry, and cannot be a hold that
+                    // arrived over I2S from the source board.
+                    #[cfg(feature = "pipe-tone")]
+                    {
+                        let _ = w;
+                        let idx = ((tone_phase >> 24) & 0xFF) as usize;
+                        let frac = ((tone_phase >> 16) & 0xFF) as i32;
+                        let a = SINE256[idx] as i32;
+                        let b = SINE256[(idx + 1) & 0xFF] as i32;
+                        let v = (a + (((b - a) * frac) >> 8)) as i16;
+                        tone_phase = tone_phase.wrapping_add(TONE_PHASE_INC);
+                        pipe.push([v, v]);
+                    }
+                    #[cfg(not(feature = "pipe-tone"))]
                     pipe.push([(w >> 16) as u16 as i16, *w as u16 as i16]);
                 }
             });

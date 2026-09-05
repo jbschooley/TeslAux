@@ -29,6 +29,9 @@ build source ultra-low       teslamic-rp-source-ultralow
 build car    ""              teslamic-rp-car-pcm2706
 build car    clock-locked    teslamic-rp-car-locked
 build car    packet-stress   teslamic-rp-car-STRESS-TEST
+# Same cushion and block size as the shipping car image, so it is the shipping
+# pipe under test — only the sample VALUES are substituted.
+build car    low-latency,pipe-tone teslamic-rp-car-PIPETONE
 
 # --- diagnostics ---
 # These were built by hand and went stale: when the I2S pins moved they kept the
