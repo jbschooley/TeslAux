@@ -168,8 +168,34 @@ What actually distinguishes a restart is that playback **continues** from the
 earlier point. So a run of reads behind the high-water mark is required, not
 one — and a new track's high-water mark now starts at zero rather than at
 wherever the first read landed, so reading its header is not behind anything.
-Two tests hold the line: a sustained rewind is a restart, and scattered
-backwards reads are not.
+It also has to wait: opening a track is noisy — the player reads the header,
+often something near the end for duration or tags, and only then plays from the
+beginning. Those scattered reads raise the high-water mark, so playback from
+offset zero looks like a rewind, and a `previous` was reported on *every* track
+change. A restart is only believed once the track has been under way for a few
+seconds, which a button press requires anyway.
+
+Three tests hold the line: a sustained rewind is a restart, scattered backwards
+reads are not, and opening a track is not.
+
+### Known limitation: the car caches what it has already read
+
+Going from track 1 to 2 and straight back to 1 produces no reads at all for a
+while — the car replays the beginning of track 1 from its own cache, and the
+detector sees silence and calls it a pause.
+
+Nothing about the volume can prevent this: caching is by sector address, and the
+sectors have not changed. Two things bound the damage. It is transient, lasting
+only until the cache is exhausted; and it needs the earlier track to have been
+read *recently*, where ten-minute tracks mean a normal `previous` reaches
+something read ten minutes ago and long since evicted. It shows up sharply when
+switching tracks rapidly, which is a testing pattern more than a listening one.
+
+The available lever is a SCSI `UNIT ATTENTION` — reporting that the medium may
+have changed, which obliges a host to discard its cache. That is a real
+mechanism rather than a trick, but it invites the car to re-index the volume
+each time, so it is worth trying only if the caching proves to matter in
+ordinary use.
 
 The LED reports events as they happen: **white flash** for next, **purple** for
 previous, **blue** while paused. Press a button and the colour changes

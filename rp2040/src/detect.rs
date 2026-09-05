@@ -66,6 +66,18 @@ const SETTLE_READS: u32 = 3;
 /// track boundary rather than once.
 const END_TOLERANCE_BYTES: u32 = 512 * 1024;
 
+/// How long a track must have been playing before a rewind is believed.
+///
+/// Opening a track is not a quiet operation: the player reads the header, often
+/// something near the end for duration or tags, and only then settles into
+/// sequential playback. Those scattered reads raise the high-water mark, so
+/// playback starting from the beginning looks exactly like a rewind — and a
+/// `previous` was reported on *every* track change.
+///
+/// A genuine restart happens because someone pressed a button, which cannot
+/// happen before the track has started.
+const RESTART_GUARD_MS: u32 = 4_000;
+
 /// Where in the volume a read landed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Position {
@@ -90,6 +102,8 @@ pub struct Detector {
     /// Consecutive reads seen well behind `high_water`, for telling a restart
     /// from a stray backwards read.
     rewind_reads: u32,
+    /// When the player moved to the current track.
+    track_started_ms: u32,
 
     last_read_ms: u32,
     paused: bool,
@@ -105,6 +119,7 @@ impl Detector {
             candidate: None,
             candidate_reads: 0,
             rewind_reads: 0,
+            track_started_ms: 0,
             last_read_ms: 0,
             paused: false,
         }
@@ -146,6 +161,7 @@ impl Detector {
         let Some(current) = self.current else {
             self.current = Some(pos.track);
             self.high_water = pos.offset;
+            self.track_started_ms = now_ms;
             return None;
         };
 
@@ -162,7 +178,8 @@ impl Detector {
             // earlier version reported every one of those as a press. What
             // distinguishes a restart is that playback *continues* from the
             // earlier point, so require a run of them before believing it.
-            if pos.offset + END_TOLERANCE_BYTES < self.high_water {
+            let settled = now_ms.wrapping_sub(self.track_started_ms) >= RESTART_GUARD_MS;
+            if settled && pos.offset + END_TOLERANCE_BYTES < self.high_water {
                 self.rewind_reads += 1;
                 if self.rewind_reads >= SETTLE_READS {
                     self.high_water = pos.offset;
@@ -202,6 +219,7 @@ impl Detector {
         self.candidate = None;
         self.candidate_reads = 0;
         self.rewind_reads = 0;
+        self.track_started_ms = now_ms;
 
         // A track that was played to its end and advanced by one is the playlist
         // doing its job, not a button.
@@ -397,10 +415,12 @@ mod tests {
         // gives us — no track changes, so nothing else would see it.
         let mut d = det();
         reads(&mut d, 7, TRACK_BYTES / 2, SETTLE_READS + 2, 0);
-        // Playback resumes from the top and continues.
+        // Playback resumes from the top and continues, after the track has been
+        // under way long enough for a button press to be plausible.
+        let t = RESTART_GUARD_MS + 1000;
         let mut got = None;
         for i in 0..SETTLE_READS {
-            let e = d.on_read(Position { track: 7, offset: i * 65536 }, 1000 + i * 10);
+            let e = d.on_read(Position { track: 7, offset: i * 65536 }, t + i * 10);
             if e.is_some() {
                 got = e;
             }
@@ -410,21 +430,52 @@ mod tests {
     }
 
     #[test]
+    fn opening_a_track_is_not_a_restart() {
+        // What was seen in the car: a purple flash on *every* track change.
+        // Opening a track is noisy — the player reads the header, often
+        // something near the end for duration or tags, and only then plays from
+        // the beginning. Those scattered reads raise the high-water mark, and
+        // playback from offset zero then looks like a rewind.
+        let mut d = det();
+        playing(&mut d, 3, 0);
+        assert_eq!(reads(&mut d, 4, 1000, SETTLE_READS, 5_000), Some(Event::Next(1)));
+
+        // The player looks at the end of the new file...
+        let mut t = 5_100;
+        for _ in 0..2 {
+            assert_eq!(
+                d.on_read(Position { track: 4, offset: TRACK_BYTES - 65536 }, t),
+                None
+            );
+            t += 10;
+        }
+        // ...then plays it from the top. None of this is a button press.
+        for i in 0..SETTLE_READS * 2 {
+            assert_eq!(
+                d.on_read(Position { track: 4, offset: i * 65536 }, t + i * 10),
+                None,
+                "opening a track reported a press"
+            );
+        }
+    }
+
+    #[test]
     fn a_single_backwards_read_is_not_a_restart() {
         // The failure that made restart detection unusable: hosts re-read a
         // header, seek to fill a buffer, or re-read after a gap. One backwards
         // read is not a rewind.
         let mut d = det();
         reads(&mut d, 7, TRACK_BYTES / 2, SETTLE_READS + 2, 0);
-        assert_eq!(d.on_read(Position { track: 7, offset: 0 }, 1000), None);
+        let t = RESTART_GUARD_MS + 1000;
+        assert_eq!(d.on_read(Position { track: 7, offset: 0 }, t), None);
         // ...and playback carrying on from where it was clears the suspicion.
         assert_eq!(
-            d.on_read(Position { track: 7, offset: TRACK_BYTES / 2 + 4096 }, 1010),
+            d.on_read(Position { track: 7, offset: TRACK_BYTES / 2 + 4096 }, t + 10),
             None
         );
-        assert_eq!(d.on_read(Position { track: 7, offset: 0 }, 1020), None);
+        assert_eq!(d.on_read(Position { track: 7, offset: 0 }, t + 20), None);
         assert_eq!(
-            d.on_read(Position { track: 7, offset: TRACK_BYTES / 2 + 8192 }, 1030),
+            d.on_read(Position { track: 7, offset: TRACK_BYTES / 2 + 8192 }, t + 30),
             None,
             "scattered backwards reads reported a restart"
         );
