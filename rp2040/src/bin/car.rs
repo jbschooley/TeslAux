@@ -421,27 +421,38 @@ async fn capture(
 
         // Hand the previous block to the pipe while the DMA fills the next one.
         if have_work {
+            // Generate OUTSIDE the lock. PIPE is a critical-section mutex, so
+            // everything under it runs with interrupts disabled; doing a table
+            // lookup, a multiply and a shift per frame in there made the
+            // diagnostic's critical section several times longer than the
+            // shipping build's, which is the one thing a diagnostic must not do.
+            #[cfg(feature = "pipe-tone")]
+            let tone: [i16; I2S_BLOCK] = {
+                let mut t = [0i16; I2S_BLOCK];
+                for slot in t.iter_mut() {
+                    let idx = ((tone_phase >> 24) & 0xFF) as usize;
+                    let frac = ((tone_phase >> 16) & 0xFF) as i32;
+                    let a = SINE256[idx] as i32;
+                    let b = SINE256[(idx + 1) & 0xFF] as i32;
+                    *slot = (a + (((b - a) * frac) >> 8)) as i16;
+                    tone_phase = tone_phase.wrapping_add(TONE_PHASE_INC);
+                }
+                t
+            };
             PIPE.lock(|p| {
                 let mut pipe = p.borrow_mut();
+                // Substituting the VALUES while keeping the timing is the
+                // whole point of this build. The I2S link still clocks the
+                // producer, the pipe and the pacer still run, but what comes out
+                // is known exactly — so a hold in the recording is this board's
+                // pipe running dry, and cannot be a hold that arrived over I2S
+                // from the source board.
+                #[cfg(feature = "pipe-tone")]
+                for v in tone.iter() {
+                    pipe.push([*v, *v]);
+                }
+                #[cfg(not(feature = "pipe-tone"))]
                 for w in work.iter() {
-                    // Substituting the VALUES while keeping the timing is the
-                    // whole point of this build. The I2S link still clocks the
-                    // producer, the pipe and the pacer still run, but what comes
-                    // out is known exactly — so a hold in the recording is this
-                    // board's pipe running dry, and cannot be a hold that
-                    // arrived over I2S from the source board.
-                    #[cfg(feature = "pipe-tone")]
-                    {
-                        let _ = w;
-                        let idx = ((tone_phase >> 24) & 0xFF) as usize;
-                        let frac = ((tone_phase >> 16) & 0xFF) as i32;
-                        let a = SINE256[idx] as i32;
-                        let b = SINE256[(idx + 1) & 0xFF] as i32;
-                        let v = (a + (((b - a) * frac) >> 8)) as i16;
-                        tone_phase = tone_phase.wrapping_add(TONE_PHASE_INC);
-                        pipe.push([v, v]);
-                    }
-                    #[cfg(not(feature = "pipe-tone"))]
                     pipe.push([(w >> 16) as u16 as i16, *w as u16 as i16]);
                 }
             });
