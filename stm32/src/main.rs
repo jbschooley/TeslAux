@@ -490,7 +490,12 @@ async fn pump(mut iso_in: impl EndpointIn) -> ! {
                         WRITE_TIMEOUTS.load(Ordering::Relaxed).wrapping_add(1),
                         Ordering::Relaxed,
                     );
-                    continue;
+                    // Go back and re-arm rather than retrying in place. The car
+                    // sets alt 1/0/1/0/1 in quick succession and then stops; if
+                    // the driver's endpoint state ends up out of step with that,
+                    // retrying the same queued packet forever cannot recover,
+                    // whereas re-entering through wait_enabled() might.
+                    break;
                 }
             };
             match attempt {

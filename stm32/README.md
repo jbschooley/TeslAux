@@ -1,7 +1,8 @@
 # TeslAux on a single STM32F407
 
-> **Status: runs on hardware, verified bit-exact on the bench. Not yet tested in
-> a car.**
+> **Status: bit-exact on the bench. Does NOT work in the car — under
+> investigation.** The two-board RP2040 rig in `../rp2040/` remains the version
+> that works in a car.
 >
 > ```
 > compared 2,784,000 frames (58.0 s)
@@ -131,6 +132,32 @@ header, then `cargo run --release` (the runner is already configured for
 Use SWD for bring-up. Not for the flashing — for the visibility. This port has
 real unknowns and `probe-rs` gives you RTT and breakpoints; the RP2040 LED bug
 cost four wrong theories precisely because there was no way to see inside.
+
+## Open: the car does not receive audio
+
+Works perfectly to a Mac at 1000 packets/second; in the car the audio never
+arrives, though the mic is detected and there is no popup.
+
+Eliminated, each by measurement rather than argument:
+
+| Hypothesis | Result |
+|---|---|
+| Descriptor set differs from the RP2040 | **no** — byte-identical, 143 bytes, verified with `tools/usbdesc.py` |
+| VBUS sensing misconfigured | **no** — enabling it stops enumeration, so PA9 is not wired to VBUS here |
+| Two OTG cores interfering | **no** — identical behaviour with `--features car-only`, OTG_HS never initialised |
+| Missing sampling-frequency control | contributed, but not the cause: the RP2040 also ships `bmAttributes 0x00` and works |
+
+What the trace shows: the car sets `alt 1 -> 0 -> 1 -> 0 -> 1` in quick
+succession — something the Mac never does — then stops issuing requests. Our
+packets are queued and mostly never collected. With the write bounded and the
+endpoint re-armed on timeout, roughly 8% of packets do get through (127 of
+~14,000 expected), which proves the car *is* polling.
+
+Mostly-uncollected isochronous IN packets on an otherwise healthy endpoint is
+the signature of the even/odd frame-parity handling in embassy's Synopsys OTG
+driver, which chooses a packet's frame polarity from `fnsof` at write time and
+corrects it from the `IISOIXFR` interrupt. That is the next thing to
+investigate, and it is upstream of this project rather than in it.
 
 ## Bring-up notes
 
