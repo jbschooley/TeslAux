@@ -55,6 +55,10 @@ static PACKETS_IN: AtomicU32 = AtomicU32::new(0);
 static LAST_N: AtomicU32 = AtomicU32::new(0);
 static NONZERO_IN: AtomicU32 = AtomicU32::new(0);
 static WRITTEN: AtomicU32 = AtomicU32::new(0);
+static ENABLED: AtomicU32 = AtomicU32::new(0);
+static ERR_DIS: AtomicU32 = AtomicU32::new(0);
+static ERR_BIG: AtomicU32 = AtomicU32::new(0);
+static WRITE_TIMEOUTS: AtomicU32 = AtomicU32::new(0);
 static LAST_OUT: AtomicU32 = AtomicU32::new(0);
 
 use audio_pipe::{PaceMode, Pipe};
@@ -71,7 +75,7 @@ use embassy_usb::driver::{EndpointError, EndpointIn, EndpointOut};
 use embassy_usb::{Builder, UsbDevice};
 
 use embassy_usb::class::hid::State as HidState;
-use teslamic::{If3Handler, KeyboardHandler};
+use teslamic::{If3Handler, KeyboardHandler, SampleRateHandler};
 
 /// Frames in one USB packet at 48 kHz. This is the producer's burst size, and
 /// the deadband below has to exceed it.
@@ -192,6 +196,13 @@ async fn report_task() -> ! {
             WRITTEN.load(Ordering::Relaxed),
             LAST_OUT.load(Ordering::Relaxed),
         );
+        defmt::info!(
+            "   car ep: enabled {}x, disabled-err {}, oversize-err {}",
+            ENABLED.load(Ordering::Relaxed),
+            ERR_DIS.load(Ordering::Relaxed),
+            ERR_BIG.load(Ordering::Relaxed),
+        );
+        defmt::info!("   write timeouts: {}", WRITE_TIMEOUTS.load(Ordering::Relaxed));
     }
 }
 
@@ -264,7 +275,10 @@ async fn main(spawner: Spawner) {
     };
 
     let car_drv = usb::Driver::new_fs(p.USB_OTG_FS, Irqs, p.PA12, p.PA11, ep_car, car_cfg);
+    #[cfg(not(feature = "car-only"))]
     let phone_drv = usb::Driver::new_fs(p.USB_OTG_HS, Irqs, p.PB15, p.PB14, ep_phone, phone_cfg);
+    #[cfg(feature = "car-only")]
+    let _ = (p.USB_OTG_HS, p.PB15, p.PB14, ep_phone, phone_cfg);
 
     // --- car side: the TeslaMic, byte-for-byte ---
     let iso_in = {
@@ -277,8 +291,9 @@ async fn main(spawner: Spawner) {
         static mut HID: HidState<'static> = HidState::new();
         static mut KBD: KeyboardHandler = KeyboardHandler;
         static mut IF3: If3Handler = If3Handler;
+        static mut SRATE: SampleRateHandler = SampleRateHandler { rate: 0 };
         // SAFETY: taken once at startup; all outlive `usb` (main never returns).
-        let (cd, bd, md, cb, hid, kbd, if3) = unsafe {
+        let (cd, bd, md, cb, hid, kbd, if3, srate) = unsafe {
             (
                 &mut *core::ptr::addr_of_mut!(CD),
                 &mut *core::ptr::addr_of_mut!(BD),
@@ -287,6 +302,7 @@ async fn main(spawner: Spawner) {
                 &mut *core::ptr::addr_of_mut!(HID),
                 &mut *core::ptr::addr_of_mut!(KBD),
                 &mut *core::ptr::addr_of_mut!(IF3),
+                &mut *core::ptr::addr_of_mut!(SRATE),
             )
         };
         let mut builder = Builder::new(car_drv, teslamic::config(), cd, bd, md, cb);
@@ -298,6 +314,7 @@ async fn main(spawner: Spawner) {
             hid,
             kbd,
             if3,
+            srate,
             teslamic::BYTES_PER_FRAME_ELASTIC as u16,
             teslamic::SAMPLE_RATE,
         );
@@ -306,6 +323,7 @@ async fn main(spawner: Spawner) {
     };
 
     // --- phone side: a UAC1 speaker at 48 kHz ---
+    #[cfg(not(feature = "car-only"))]
     let iso_out = {
         static mut CD: [u8; 256] = [0; 256];
         static mut BD: [u8; 32] = [0; 32];
@@ -332,11 +350,22 @@ async fn main(spawner: Spawner) {
     spawner.spawn(status_task(led).unwrap());
     spawner.spawn(report_task().unwrap());
 
+    #[cfg(feature = "car-only")]
+    {
+        // Diagnostic: car side only, to see whether running two OTG cores at
+        // once is what stops the car polling us.
+        pump(iso_in).await;
+    }
+
     // Producer and consumer both live here rather than in spawned tasks: an
     // `#[embassy_executor::task]` cannot be generic over the endpoint type, and
     // the two drivers have different ones.
+    #[cfg(not(feature = "car-only"))]
     join(sink(iso_out), pump(iso_in)).await;
-    unreachable!()
+    #[allow(unreachable_code)]
+    {
+        unreachable!()
+    }
 }
 
 /// Producer: iso OUT packets from the phone into the pipe.
@@ -423,6 +452,7 @@ async fn pump(mut iso_in: impl EndpointIn) -> ! {
     let mut last_write = embassy_time::Instant::now();
     loop {
         iso_in.wait_enabled().await;
+        ENABLED.store(ENABLED.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
 
         // Drop whatever piled up while the car was not listening.
         //
@@ -442,7 +472,28 @@ async fn pump(mut iso_in: impl EndpointIn) -> ! {
         // stream goes idle — just stop writing and wait to be re-enabled.
         loop {
             let n = PIPE.lock(|p| p.borrow_mut().take(&mut buf, MODE));
-            match iso_in.write(&buf[..n]).await {
+            // Bound the write.
+            //
+            // An isochronous IN packet is collected once per frame, so a write
+            // that has not completed in 20 ms means the host is not collecting
+            // — and a host that stops collecting reports nothing, exactly as a
+            // host that stops polling reports nothing and a source that stops
+            // sending reports nothing. Every one of those has cost this project
+            // a bug. Never block on a host indefinitely.
+            let attempt =
+                embassy_time::with_timeout(embassy_time::Duration::from_millis(20), iso_in.write(&buf[..n]))
+                    .await;
+            let attempt = match attempt {
+                Ok(r) => r,
+                Err(_) => {
+                    WRITE_TIMEOUTS.store(
+                        WRITE_TIMEOUTS.load(Ordering::Relaxed).wrapping_add(1),
+                        Ordering::Relaxed,
+                    );
+                    continue;
+                }
+            };
+            match attempt {
                 Ok(()) => {
                     WRITTEN.store(
                         WRITTEN.load(Ordering::Relaxed).wrapping_add(1),
@@ -461,8 +512,12 @@ async fn pump(mut iso_in: impl EndpointIn) -> ! {
                     }
                     last_write = now;
                 }
-                Err(EndpointError::Disabled) => break,
+                Err(EndpointError::Disabled) => {
+                    ERR_DIS.store(ERR_DIS.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
+                    break;
+                }
                 Err(EndpointError::BufferOverflow) => {
+                    ERR_BIG.store(ERR_BIG.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
                     OVERSIZE.store(true, Ordering::Relaxed);
                     break;
                 }

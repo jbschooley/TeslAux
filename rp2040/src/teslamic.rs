@@ -23,7 +23,7 @@ use embassy_usb::class::hid::{
     Config as HidConfig, HidBootProtocol, HidSubclass, HidWriter, ReportId, RequestHandler,
     State as HidState,
 };
-use embassy_usb::control::{InResponse, OutResponse, Request, RequestType};
+use embassy_usb::control::{InResponse, OutResponse, Recipient, Request, RequestType};
 use embassy_usb::descriptor::{SynchronizationType, UsageType};
 use embassy_usb::driver::Driver;
 use embassy_usb::{Builder, Config, Handler, UsbVersion};
@@ -110,12 +110,70 @@ fn as_format_type_i(rate: u32) -> [u8; 9] {
     ]
 }
 
+/// bmAttributes bit 0 set = **sampling-frequency control present**, which is
+/// what the real mic advertises (`real_mic_dump.md`: "CS_EP: sampling-frequency
+/// control enabled (bmAttributes 0x01)").
+///
+/// We shipped 0x00 for a long time and the car tolerated it on the RP2040 and
+/// the nRF. It does not tolerate it everywhere: the car sends
+/// `SET_CUR(SAMPLING_FREQ)` on this endpoint regardless of what we advertise,
+/// and a device that STALLs it can be abandoned — on the STM32 the car set alt
+/// 1, had its request refused, cycled alt 1/0 a few times and then stopped
+/// polling for audio altogether.
 const AS_ISO_ENDPOINT: [u8; 5] = [
     0x01, // EP_GENERAL
-    0x00, // bmAttributes
+    0x01, // bmAttributes: sampling-frequency control
     0x00, // bLockDelayUnits
     0x00, 0x00, // wLockDelay
 ];
+
+/// UAC1 endpoint control selector for sampling frequency (`wValue` high byte).
+const SAMPLING_FREQ_CONTROL: u8 = 0x01;
+
+/// Answers the car's `SET_CUR` / `GET_CUR` for the endpoint's sampling
+/// frequency.
+///
+/// The real mic answers these; ours refused them, which is a divergence from
+/// the device we are cloning rather than a simplification of it.
+pub struct SampleRateHandler {
+    pub rate: u32,
+}
+
+impl Handler for SampleRateHandler {
+    fn control_out(&mut self, req: Request, data: &[u8]) -> Option<OutResponse> {
+        if req.request_type != RequestType::Class || req.recipient != Recipient::Endpoint {
+            return None;
+        }
+        // bRequest 0x01 = SET_CUR; wValue high byte selects the control.
+        if req.request != 0x01 || (req.value >> 8) as u8 != SAMPLING_FREQ_CONTROL {
+            return None;
+        }
+        if data.len() < 3 {
+            return Some(OutResponse::Rejected);
+        }
+        let hz = u32::from(data[0]) | u32::from(data[1]) << 8 | u32::from(data[2]) << 16;
+        if hz == self.rate {
+            Some(OutResponse::Accepted)
+        } else {
+            Some(OutResponse::Rejected)
+        }
+    }
+
+    fn control_in<'a>(&'a mut self, req: Request, buf: &'a mut [u8]) -> Option<InResponse<'a>> {
+        if req.request_type != RequestType::Class || req.recipient != Recipient::Endpoint {
+            return None;
+        }
+        // bRequest 0x81 = GET_CUR.
+        if req.request != 0x81 || (req.value >> 8) as u8 != SAMPLING_FREQ_CONTROL {
+            return None;
+        }
+        if buf.len() < 3 {
+            return Some(InResponse::Rejected);
+        }
+        buf[..3].copy_from_slice(&self.rate.to_le_bytes()[..3]);
+        Some(InResponse::Accepted(&buf[..3]))
+    }
+}
 
 /// IF2: a standard HID boot keyboard, 65 bytes. The real mic's physical button
 /// sends keystrokes; ours never presses a key.
@@ -227,9 +285,11 @@ pub fn build<'d, D: Driver<'d>>(
     hid_state: &'d mut HidState<'d>,
     kbd: &'d mut KeyboardHandler,
     if3: &'d mut If3Handler,
+    srate: &'d mut SampleRateHandler,
     ep_max_bytes: u16,
     rate: u32,
 ) -> D::EndpointIn {
+    srate.rate = rate;
     // IF0 AudioControl + IF1 AudioStreaming.
     let mut func = builder.function(AUDIO_CLASS, SUBCLASS_AUDIOCONTROL, PROTO_UNDEFINED);
     {
@@ -283,6 +343,7 @@ pub fn build<'d, D: Driver<'d>>(
         a3.descriptor(0x21, &HID_DESC_IF3[2..]);
     }
     builder.handler(if3);
+    builder.handler(srate);
 
     iso_in
 }

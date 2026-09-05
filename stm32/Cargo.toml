@@ -11,7 +11,12 @@ description = "Single-chip TeslAux bridge: phone and car both attach to one STM3
 name = "bridge"
 path = "src/main.rs"
 
-# No feature flags. The two-board build needs them because its cushion is a
+[features]
+# Diagnostic only: bring up the car-facing port alone, leaving OTG_HS
+# uninitialised, to test whether two OTG cores interfere.
+car-only = []
+
+# No other feature flags. The two-board build needs them because its cushion is a
 # guess that different situations want sized differently; here the cushion is
 # measured, so there is one configuration.
 
