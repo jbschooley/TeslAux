@@ -210,6 +210,18 @@ while the BPB says FAT32, and the mismatch makes it unreadable rather than
 merely smaller. Smaller tracks therefore needed smaller clusters to keep the
 count up.
 
+### A tone build, for when the LED is the only witness
+
+`teslamic-rp-USBDRIVE-TONE.uf2` (feature `audible`) fills the tracks with a
+375 Hz tone instead of silence. Production wants silence — the real audio
+arrives over the microphone endpoint and these tracks are only a position
+counter — but a silent track is indistinguishable from a track the car refused
+to play. With a tone the car answers directly: if it plays, you hear it.
+
+The tone is generated from the sample index rather than an accumulator, because
+sectors are produced on demand and in whatever order the host asks for them.
+Verified as a clean 375 Hz at half scale by mounting the image.
+
 ### If the car does not offer it as a media source
 
 Owner reports converge on one cause that has nothing to do with the volume:

@@ -52,6 +52,10 @@ default = []
 # is a WS2812 on GPIO16 — so status has to be driven over PIO1 instead of a
 # GPIO. Everything else (Pico, RP2040-Plus) keeps the simple GPIO25 LED.
 rp2040-zero = []
+# Diagnostic: fill the synthetic drive's tracks with a tone instead of silence,
+# so that a car which plays them can be heard doing so. Production wants
+# silence — the real audio comes over the microphone endpoint.
+audible = []
 # Halve the source board's cushion: ring 512 instead of 1024, and a 32-frame I2S
 # block instead of 64. Saves ~5 ms of ~130 ms end to end, so it is only worth
 # using if it proves as reliable as the default — the deadband is set by how much

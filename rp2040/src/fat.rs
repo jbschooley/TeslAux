@@ -97,6 +97,34 @@ const _LAYOUT: () = {
     );
 };
 
+/// A quarter-cycle of a sine, as 16-bit samples; the rest is reflected from it.
+///
+/// Only used by the `audible` feature. Silence is what production wants — the
+/// real audio arrives over the microphone endpoint and these tracks exist only
+/// as a position counter — but a silent track is indistinguishable from a track
+/// the car refused to play. A tone makes playback audible, so the car answers
+/// the question directly instead of an LED answering it by proxy.
+#[cfg(feature = "audible")]
+const SINE_Q: [i16; 16] = [
+    0, 3196, 6270, 9102, 11585, 13623, 15137, 16069, 16384, 16069, 15137, 13623, 11585, 9102,
+    6270, 3196,
+];
+
+/// Sample `n` of a 375 Hz tone at 48 kHz: 128 samples per cycle, so the phase
+/// is just the low bits of the sample index and no accumulator is needed —
+/// which matters because sectors are generated out of order and must not depend
+/// on any running state.
+#[cfg(feature = "audible")]
+fn tone_sample(n: u32) -> i16 {
+    let phase = (n & 0x7F) as usize; // 128 samples per cycle
+    match phase {
+        0..=31 => SINE_Q[phase / 2],
+        32..=63 => SINE_Q[(63 - phase) / 2],
+        64..=95 => -SINE_Q[(phase - 64) / 2],
+        _ => -SINE_Q[(127 - phase) / 2],
+    }
+}
+
 /// Where a data sector falls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Position {
@@ -326,6 +354,22 @@ pub fn read_sector(lba: u32, buf: &mut [u8; SECTOR]) {
     } else if let Some(pos) = locate_fs(lba) {
         if pos.offset == 0 {
             wav_header(buf);
+        }
+        #[cfg(feature = "audible")]
+        {
+            // Fill the rest of the sector with a tone. The sample index is
+            // derived from the byte offset, so any sector can be generated on
+            // its own and in any order — the host reads them out of sequence.
+            let start = if pos.offset == 0 { WAV_HEADER as usize } else { 0 };
+            let first_byte = pos.offset as usize + start - WAV_HEADER as usize;
+            for (i, frame) in buf[start..].chunks_exact_mut(4).enumerate() {
+                let n = ((first_byte + i * 4) / 4) as u32;
+                let v = tone_sample(n).to_le_bytes();
+                frame[0] = v[0];
+                frame[1] = v[1];
+                frame[2] = v[0];
+                frame[3] = v[1];
+            }
         }
     } else if lba >= DATA_START && lba < DATA_START + SECTORS_PER_CLUSTER {
         root_sector(lba - DATA_START, buf);
