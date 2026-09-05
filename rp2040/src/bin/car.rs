@@ -613,6 +613,19 @@ async fn pump(
             };
             #[cfg(not(feature = "packet-stress"))]
             let n = PIPE.lock(|p| p.borrow_mut().take(&mut buf, MODE));
+            #[cfg(feature = "pipe-watch")]
+            {
+                let (level, floor, unders, primed) = PIPE.lock(|p| {
+                    let b = p.borrow();
+                    (
+                        b.fill() as u32,
+                        b.target().saturating_sub(b.hysteresis()) as u32,
+                        b.stats.underruns,
+                        b.primed(),
+                    )
+                });
+                watch::sample(level, floor, unders, primed);
+            }
             if MUTED.load(Ordering::Relaxed) {
                 buf[..n].fill(0);
             }
@@ -732,11 +745,119 @@ async fn pump(
 /// register cannot be relied on to advance.
 static USB_FRAMES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+// ── pipe-watch: how does the pipe empty? ────────────────────────────────────
+//
+// `pipe-tone` established that the holds are this board's pipe running dry, and
+// that neither cushion mattered: doubling it here and on the source changed
+// nothing. That leaves one question, and it is the one the pacer's design turns
+// on. The pacer corrects by one frame per packet, about 1000 frames per second
+// of authority against a mismatch measured at under 2 ppm, so a gradual drain
+// is something it should never lose. A drain it cannot answer is one that
+// happens faster than it can respond.
+//
+// So measure the fall rather than the level. Sampled once per USB packet, which
+// is 1 ms:
+//
+//   * a slow drain leaves the level below the pacer's refill floor for a long
+//     time before it reaches zero — the pacer being out-argued, which would
+//     mean its deadband or its one-frame step is wrong;
+//   * a stall takes the level from healthy to empty within a few packets — the
+//     producer stopping, which is a scheduling fault and nothing to do with the
+//     pacer.
+//
+// Measured as time spent below the refill floor, NOT as a run of consecutive
+// decreases. The level jitters up and down every packet in normal operation,
+// because the producer arrives in 16-frame blocks while the consumer takes
+// about 48 at a time, so a run of decreases breaks constantly and a genuine
+// slow drain would read as a stall. Crossing a threshold does not care.
+//
+// The verdict latches on the first underrun so a later, milder one cannot
+// overwrite it, and it is shown as a colour because that is the only channel
+// this board has.
+#[cfg(feature = "pipe-watch")]
+mod watch {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    pub static VERDICT: AtomicU32 = AtomicU32::new(0);
+    /// Largest single-packet fall seen, in frames. A stall shows up here as
+    /// roughly one packet's worth; an orderly drain stays small.
+    pub static MAX_DROP: AtomicU32 = AtomicU32::new(0);
+    static PREV: AtomicU32 = AtomicU32::new(0);
+    static BELOW: AtomicU32 = AtomicU32::new(0);
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+
+    /// Below the floor for fewer packets (milliseconds) than this and the pacer
+    /// never had a chance to answer.
+    const BURST_MS: u32 = 10;
+    /// Longer than this and it had ample time.
+    const GRADUAL_MS: u32 = 50;
+
+    pub const NONE: u32 = 0;
+    pub const BURST: u32 = 1;
+    pub const MIXED: u32 = 2;
+    pub const GRADUAL: u32 = 3;
+
+    /// Call once per USB packet, after `take`. Single writer: plain load/store,
+    /// because thumbv6m has no atomic read-modify-write.
+    pub fn sample(level: u32, floor: u32, underruns: u32, primed: bool) {
+        if !primed {
+            PREV.store(0, Ordering::Relaxed);
+            BELOW.store(0, Ordering::Relaxed);
+            SEEN.store(underruns, Ordering::Relaxed);
+            return;
+        }
+        let prev = PREV.load(Ordering::Relaxed);
+        if level < prev {
+            let drop = prev - level;
+            if drop > MAX_DROP.load(Ordering::Relaxed) {
+                MAX_DROP.store(drop, Ordering::Relaxed);
+            }
+        }
+        PREV.store(level, Ordering::Relaxed);
+
+        if level >= floor {
+            BELOW.store(0, Ordering::Relaxed);
+        } else {
+            BELOW.store(BELOW.load(Ordering::Relaxed).saturating_add(1), Ordering::Relaxed);
+        }
+
+        if underruns > SEEN.load(Ordering::Relaxed) {
+            SEEN.store(underruns, Ordering::Relaxed);
+            if VERDICT.load(Ordering::Relaxed) == NONE {
+                let ms = BELOW.load(Ordering::Relaxed);
+                VERDICT.store(
+                    if ms < BURST_MS {
+                        BURST
+                    } else if ms < GRADUAL_MS {
+                        MIXED
+                    } else {
+                        GRADUAL
+                    },
+                    Ordering::Relaxed,
+                );
+            }
+        }
+    }
+}
+
 /// Map the firmware's atomics onto a board-independent status. How it is shown
 /// depends on the board: a blink code on a plain LED, or colour on the
 /// RP2040-Zero's WS2812 (it has no plain LED — see `status.rs`).
 fn current_state() -> status::State {
     use core::sync::atomic::Ordering;
+    // The watch build reports its verdict here, because the WS2812 is the only
+    // channel this board has and the verdict matters more than the usual status
+    // while it is running.
+    #[cfg(feature = "pipe-watch")]
+    {
+        return match watch::VERDICT.load(Ordering::Relaxed) {
+            watch::BURST => status::State::Fault,     // red:   producer stalled
+            watch::MIXED => status::State::Slipping,  // amber: in between
+            watch::GRADUAL => status::State::Waiting, // blue:  pacer out-argued
+            _ => status::State::Ok,                   // green: no underrun yet
+        };
+    }
+    #[cfg(not(feature = "pipe-watch"))]
     if MUTED.load(Ordering::Relaxed) || OVERSIZE.load(Ordering::Relaxed) {
         status::State::Fault
     } else if SOURCE_LIVE.load(Ordering::Relaxed) {

@@ -32,6 +32,9 @@ build car    packet-stress   teslamic-rp-car-STRESS-TEST
 # Same cushion and block size as the shipping car image, so it is the shipping
 # pipe under test — only the sample VALUES are substituted.
 build car    low-latency,pipe-tone teslamic-rp-car-PIPETONE
+# Both together: known data AND the measurement, so one run answers both what
+# the pipe did and how it got there.
+build car    low-latency,pipe-tone,pipe-watch teslamic-rp-car-PIPEWATCH
 
 # --- diagnostics ---
 # These were built by hand and went stale: when the I2S pins moved they kept the
