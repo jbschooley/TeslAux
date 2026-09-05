@@ -26,8 +26,9 @@
 //! | white | **many** (16+) tracks were opened |
 //! | red | a SCSI command was refused mid-scan, or the transport gave up |
 //!
-//! Once the car is playing, the LED reports what the detector makes of its
-//! reads, which is the thing worth watching:
+//! With `--features detect`, the LED also reports what the detector makes of
+//! the car's reads. That is off by default: it works, but it infers presses
+//! from a side effect of playback rather than seeing the presses themselves.
 //!
 //! | LED | meaning |
 //! |-----|---------|
@@ -55,6 +56,7 @@ use embassy_usb::control::{InResponse, OutResponse, Request, RequestType};
 use embassy_usb::driver::{Endpoint, EndpointError, EndpointIn, EndpointOut};
 use embassy_usb::{Builder, Config, Handler, UsbDevice};
 
+#[cfg(feature = "detect")]
 #[path = "../detect.rs"]
 mod detect;
 #[path = "../fat.rs"]
@@ -67,6 +69,7 @@ mod status;
 #[path = "../ws2812.rs"]
 mod ws2812;
 
+#[cfg(feature = "detect")]
 use detect::{Detector, Event};
 use fat::SECTOR;
 use msc::{Action, Cbw, Scsi, Status as CswStatus};
@@ -114,21 +117,28 @@ static TRACKS_SEEN: AtomicU32 = AtomicU32::new(0);
 /// Until there is somewhere to send them, this is the whole output of the
 /// detector — and it is the number worth watching in the car, because a press
 /// nobody made is directly audible as a track skipping by itself.
+#[cfg(feature = "detect")]
 static PRESSES: AtomicU32 = AtomicU32::new(0);
 /// True while the car has stopped reading, i.e. playback is paused.
+#[cfg(feature = "detect")]
 static PLAYBACK_PAUSED: AtomicBool = AtomicBool::new(false);
 /// The most recent detector event and when it happened, so the LED can show it
 /// while it is fresh. 1 = next, 2 = previous.
+#[cfg(feature = "detect")]
 static LAST_EVENT: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "detect")]
 static LAST_EVENT_MS: AtomicU32 = AtomicU32::new(0);
 /// When a sector inside a track was last read. Pause is derived from this
 /// rather than from the detector, so the status task needs no access to it.
+#[cfg(feature = "detect")]
 static LAST_READ_MS: AtomicU32 = AtomicU32::new(0);
 
 /// How long an event stays on the LED.
+#[cfg(feature = "detect")]
 const FLASH_MS: u32 = 1200;
 
 /// Bytes of track data a second of playback consumes: 48 kHz, 16-bit, stereo.
+#[cfg(feature = "detect")]
 const PLAYBACK_BYTES_PER_SEC: u64 = 48_000 * 2 * 2;
 /// How much faster than real time track data is served.
 ///
@@ -137,15 +147,19 @@ const PLAYBACK_BYTES_PER_SEC: u64 = 48_000 * 2 * 2;
 /// memory — so *reads stopping* means nothing, and a pause is invisible until
 /// the buffer drains. Held to barely above real time it can never get ahead,
 /// so it reads continuously and a pause shows up within one read.
+#[cfg(feature = "detect")]
 const PACE_NUMERATOR: u64 = 11;
+#[cfg(feature = "detect")]
 const PACE_DENOMINATOR: u64 = 10;
 /// Track data servable at full speed before pacing applies, per track.
 ///
 /// A player wants a buffer before it starts, and throttling from the first byte
 /// risks a stutter at the start of every track. This is enough to prime one and
 /// not enough to hide a pause behind.
+#[cfg(feature = "detect")]
 const BURST_BYTES: u64 = 2 * PLAYBACK_BYTES_PER_SEC;
 /// Quiet time that counts as playback having stopped. Matches the detector.
+#[cfg(feature = "detect")]
 ///
 /// Three times the ~300 ms gap that paced reads produce. A false pause is worse
 /// than a slow one: it silences music that is playing, where a late one is
@@ -171,21 +185,25 @@ fn current_state() -> status::State {
         // any count, so it outranks them.
         status::State::Fault
     } else if {
-        // A fresh event outranks everything below: it is the thing being
-        // watched for, and it is gone in a moment.
-        let now = embassy_time::Instant::now().as_millis() as u32;
-        LAST_EVENT.load(Ordering::Relaxed) != 0
-            && now.wrapping_sub(LAST_EVENT_MS.load(Ordering::Relaxed)) < FLASH_MS
+        #[cfg(feature = "detect")]
+        {
+            let now = embassy_time::Instant::now().as_millis() as u32;
+            LAST_EVENT.load(Ordering::Relaxed) != 0
+                && now.wrapping_sub(LAST_EVENT_MS.load(Ordering::Relaxed)) < FLASH_MS
+        }
+        #[cfg(not(feature = "detect"))]
+        {
+            false
+        }
     } {
-        return status::State::Flash(LAST_EVENT.load(Ordering::Relaxed) as u8);
-    } else if READ_TRACK_DATA.load(Ordering::Relaxed)
-        && embassy_time::Instant::now()
-            .as_millis()
-            .wrapping_sub(LAST_READ_MS.load(Ordering::Relaxed) as u64)
-            >= PAUSE_AFTER_MS as u64
-    {
-        // Reads have stopped while a track was open: playback is paused.
-        status::State::Flash(3)
+        #[cfg(feature = "detect")]
+        {
+            return status::State::Flash(LAST_EVENT.load(Ordering::Relaxed) as u8);
+        }
+        #[cfg(not(feature = "detect"))]
+        {
+            status::State::Ok
+        }
     } else if READ_TRACK_DATA.load(Ordering::Relaxed) {
         // The host parsed the filesystem and opened files; how many it opened
         // is the question that decides what to try next.
@@ -246,11 +264,13 @@ impl Handler for MscControl {
 /// half — because until there is somewhere to send them, the count *is* the
 /// output. It is also the number worth watching in the car: a press nobody made
 /// is directly audible later as a track skipping by itself.
+#[cfg(feature = "detect")]
 fn flash(code: u32) {
     LAST_EVENT.store(code, Ordering::Relaxed);
     LAST_EVENT_MS.store(embassy_time::Instant::now().as_millis() as u32, Ordering::Relaxed);
 }
 
+#[cfg(feature = "detect")]
 fn note_event(ev: Option<Event>) {
     let bump = |shift: u32, by: u32| {
         let cur = PRESSES.load(Ordering::Relaxed);
@@ -379,10 +399,14 @@ async fn main(spawner: Spawner) {
     }
 
     let mut scsi = Scsi::new(fat::TOTAL_SECTORS, SECTOR as u32);
+    #[cfg(feature = "detect")]
     let mut detector = Detector::new(fat::N_TRACKS, fat::TRACK_FILE_BYTES);
     // Pacing state: a credit of bytes that refills at the playback rate.
-    let mut credit: u64 = BURST_BYTES;
-    let mut credit_ms: u64 = embassy_time::Instant::now().as_millis();
+    #[cfg(feature = "detect")]
+    let (mut credit, mut credit_ms) = (
+        BURST_BYTES,
+        embassy_time::Instant::now().as_millis(),
+    );
     let mut cbw_buf = [0u8; 64];
     let mut reply = [0u8; 64];
     let mut sector = [0u8; SECTOR];
@@ -444,6 +468,7 @@ async fn main(spawner: Spawner) {
                         // Only track data is paced. The FAT, the directory and
                         // the partition table are read while indexing, and
                         // throttling those would make every wake slow.
+                        #[cfg(feature = "detect")]
                         if let Some(pos) = fat::locate(lba + i) {
                             let now = embassy_time::Instant::now().as_millis();
                             let elapsed = now.saturating_sub(credit_ms);
@@ -455,9 +480,6 @@ async fn main(spawner: Spawner) {
                                     .min(BURST_BYTES);
                             }
                             if credit < SECTOR as u64 {
-                                // Wait for roughly the credit a few sectors
-                                // need, so the timer is not re-armed for every
-                                // 512 bytes.
                                 let ms = (16 * SECTOR as u64) * 1000 * PACE_DENOMINATOR
                                     / (PLAYBACK_BYTES_PER_SEC * PACE_NUMERATOR);
                                 embassy_time::Timer::after_millis(ms.max(1)).await;
@@ -471,13 +493,6 @@ async fn main(spawner: Spawner) {
                             }
                             credit = credit.saturating_sub(SECTOR as u64);
 
-                            READ_TRACK_DATA.store(true, Ordering::Relaxed);
-                            if pos.track < 32 {
-                                TRACKS_SEEN.store(
-                                    TRACKS_SEEN.load(Ordering::Relaxed) | (1 << pos.track),
-                                    Ordering::Relaxed,
-                                );
-                            }
                             let now = embassy_time::Instant::now().as_millis() as u32;
                             LAST_READ_MS.store(now, Ordering::Relaxed);
                             let p = detect::Position {
@@ -485,6 +500,10 @@ async fn main(spawner: Spawner) {
                                 offset: pos.offset,
                             };
                             note_event(detector.on_read(p, now));
+                        }
+
+                        if fat::locate(lba + i).is_some() {
+                            READ_TRACK_DATA.store(true, Ordering::Relaxed);
                         }
 
                         fat::read_sector(lba + i, &mut sector);

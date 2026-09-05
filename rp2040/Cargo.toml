@@ -56,6 +56,11 @@ rp2040-zero = []
 # so that a car which plays them can be heard doing so. Production wants
 # silence — the real audio comes over the microphone endpoint.
 audible = []
+# Infer media-button presses from which track the car reads, and pace track
+# reads so a pause is visible. Off by default: it works, but it reads a side
+# effect of playback rather than the presses themselves, and ScreenMate can
+# bind the buttons to its own playback directly. See MEDIA-CONTROLS.md.
+detect = []
 # Halve the source board's cushion: ring 512 instead of 1024, and a 32-frame I2S
 # block instead of 64. Saves ~5 ms of ~130 ms end to end, so it is only worth
 # using if it proves as reliable as the default — the deadband is set by how much

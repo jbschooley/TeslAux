@@ -25,6 +25,7 @@ build source ultra-low       teslamic-rp-source-ultralow
 # --- synthetic USB drive: the car's media player as a control surface ---
 build usbdrive ""        teslamic-rp-USBDRIVE
 build usbdrive audible   teslamic-rp-USBDRIVE-TONE
+build usbdrive detect    teslamic-rp-USBDRIVE-DETECT
 
 # --- alternative pairing: clock-locked chain (fixed 192-B packets to the car) ---
 # source clock-locked is deliberately not built — see the compile_error in
