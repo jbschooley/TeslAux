@@ -78,7 +78,21 @@ pub const CLUSTERS_PER_FILE: u32 = TRACK_FILE_BYTES.div_ceil(CLUSTER_BYTES);
 /// Cluster 2 is the root directory; the files follow it.
 pub const ROOT_CLUSTER: u32 = 2;
 pub const FIRST_FILE_CLUSTER: u32 = 3;
-pub const DATA_CLUSTERS: u32 = 1 + N_TRACKS * CLUSTERS_PER_FILE;
+/// Clusters the root directory and the tracks actually occupy.
+pub const USED_CLUSTERS: u32 = 1 + N_TRACKS * CLUSTERS_PER_FILE;
+
+/// Clusters left unallocated, so the volume has free space.
+///
+/// The first version sized the volume to exactly what the tracks needed, which
+/// left **zero bytes free**. The car found the drive, reported `0 MB`, and
+/// offered to format it — a full disk is not a usable one, and a host that
+/// wants to write an index has nowhere to put it. Real drives always have
+/// slack.
+///
+/// Half the volume is generous, and costs nothing: free clusters are never
+/// read, and every sector is computed anyway.
+pub const FREE_CLUSTERS: u32 = USED_CLUSTERS;
+pub const DATA_CLUSTERS: u32 = USED_CLUSTERS + FREE_CLUSTERS;
 pub const FAT_SECTORS: u32 = ((DATA_CLUSTERS + 2) * 4).div_ceil(SECTOR as u32);
 pub const FAT_START: u32 = RESERVED_SECTORS;
 pub const DATA_START: u32 = FAT_START + 2 * FAT_SECTORS;
@@ -88,6 +102,9 @@ pub const FS_SECTORS: u32 = DATA_START + DATA_CLUSTERS * SECTORS_PER_CLUSTER;
 pub const TOTAL_SECTORS: u32 = PARTITION_START + FS_SECTORS;
 
 const _LAYOUT: () = {
+    // A volume with no free space is not a usable one: the car reported 0 MB and
+    // offered to format it.
+    assert!(FREE_CLUSTERS > 0, "the volume must have free space");
     // Below 65525 clusters a host is required to read the volume as FAT16, and
     // the BPB we emit is FAT32 — the mismatch makes the volume unreadable
     // rather than merely smaller.
@@ -234,8 +251,11 @@ fn boot_sector(buf: &mut [u8; SECTOR]) {
 fn fsinfo_sector(buf: &mut [u8; SECTOR]) {
     le32(buf, 0, 0x4161_5252);
     le32(buf, 484, 0x6141_7272);
-    le32(buf, 488, 0xFFFF_FFFF); // free count unknown
-    le32(buf, 492, 0xFFFF_FFFF); // next free unknown
+    // Report the real figures rather than "unknown". A host is entitled to
+    // trust these, and a host that trusts "unknown" has to walk the whole FAT
+    // to find out — or, worse, assume the worst.
+    le32(buf, 488, FREE_CLUSTERS);
+    le32(buf, 492, FIRST_FILE_CLUSTER + N_TRACKS * CLUSTERS_PER_FILE);
     buf[510] = 0x55;
     buf[511] = 0xAA;
 }
@@ -472,6 +492,39 @@ mod tests {
             );
         }
         assert_eq!(read(ROOT_CLUSTER), 0x0FFF_FFFF, "root chain not terminated");
+    }
+
+    #[test]
+    fn the_volume_has_free_space_and_says_so() {
+        // Sized to exactly what the tracks needed, the volume had zero bytes
+        // free. The car reported 0 MB and offered to format it.
+        assert!(FREE_CLUSTERS > 0, "no free clusters");
+        assert!(
+            FREE_CLUSTERS * CLUSTER_BYTES >= 64 * 1024 * 1024,
+            "free space is not worth calling free"
+        );
+
+        // FSInfo must agree with the FAT, or a host that trusts it is misled.
+        let fsi = sector(1);
+        assert_eq!(
+            u32::from_le_bytes(fsi[488..492].try_into().unwrap()),
+            FREE_CLUSTERS
+        );
+
+        // And the FAT must actually mark them free.
+        let per = SECTOR as u32 / 4;
+        let read = |cluster: u32| -> u32 {
+            let b = sector(FAT_START + cluster / per);
+            let at = ((cluster % per) * 4) as usize;
+            u32::from_le_bytes(b[at..at + 4].try_into().unwrap()) & 0x0FFF_FFFF
+        };
+        let first_free = FIRST_FILE_CLUSTER + N_TRACKS * CLUSTERS_PER_FILE;
+        for c in [first_free, first_free + 1, ROOT_CLUSTER + DATA_CLUSTERS - 1] {
+            assert_eq!(read(c), 0, "cluster {c} should be free");
+        }
+        // The last file cluster must still be allocated, so the boundary is
+        // exactly where it is claimed to be.
+        assert_ne!(read(first_free - 1), 0, "last file cluster is free");
     }
 
     #[test]

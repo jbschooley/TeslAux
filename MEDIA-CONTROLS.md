@@ -263,6 +263,27 @@ later read of that sector returns whatever the layout says belongs there.
 Writes past the end of the device are still refused — accepting a write is not
 the same as accepting nonsense.
 
+### The car said 0 MB: the volume had no free space
+
+The decisive observation. The drive appeared in the car's Safety screen
+reporting **0 MB** and offering to format it — so the car could read the volume
+perfectly well and had concluded it was unusable.
+
+`DATA_CLUSTERS` was sized as exactly what the tracks needed, which left **every
+cluster allocated and zero bytes free**. A full disk is not a usable one: there
+is nowhere to write an index, a lock file or dashcam footage, and a host is
+entitled to treat that as broken. Real drives always have slack.
+
+The volume now carries as many free clusters as used ones — 464 MB total, half
+of it free — and `FSInfo` reports the real free count and next-free cluster
+rather than "unknown". A host that trusts those figures gets the truth, and one
+that does not can still walk the FAT and find the same answer. macOS confirms:
+220 MB used, 220 MB free.
+
+Free clusters cost nothing here. They are never read, and every sector is
+computed on demand, so the volume is larger only in the sense that it *claims*
+to be.
+
 ### If the car does not offer it as a media source
 
 Owner reports converge on one cause that has nothing to do with the volume:
