@@ -19,6 +19,11 @@
 //!   * `bcd_usb` is 0x0200; the real mic is 0x0110.
 //!   * The iso IN endpoint number differs (the host keys on class + format).
 
+// Shared by the car binary and the single-chip build, which size the
+// isochronous endpoint differently — a constant unused by one is used by
+// the other.
+#![allow(dead_code)]
+
 use embassy_usb::class::hid::{
     Config as HidConfig, HidBootProtocol, HidSubclass, HidWriter, ReportId, RequestHandler,
     State as HidState,
