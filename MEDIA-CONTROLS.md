@@ -263,68 +263,42 @@ later read of that sector returns whatever the layout says belongs there.
 Writes past the end of the device are still refused — accepting a write is not
 the same as accepting nonsense.
 
-### The car said 0 MB: the volume had no free space
+### It works: the car plays the synthetic drive
 
-The decisive observation. The drive appeared in the car's Safety screen
-reporting **0 MB** and offering to format it — so the car could read the volume
-perfectly well and had concluded it was unusable.
+**Confirmed in the car.** The volume mounts, the car indexes it, and the tracks
+play — audibly, using the `audible` build, so this is not inferred from an LED.
 
-`DATA_CLUSTERS` was sized as exactly what the tracks needed, which left **every
-cluster allocated and zero bytes free**. A full disk is not a usable one: there
-is nowhere to write an index, a lock file or dashcam footage, and a host is
-entitled to treat that as broken. Real drives always have slack.
+**The blocker was arbitration, not the volume.** Tesla claims a lone USB drive
+for Sentry, and *a dashcam drive is excluded from music indexing*. With the real
+Sentry drive unplugged — done earlier to remove it as a variable — ours became
+the only storage device, so the car took it for dashcam and would not scan it
+for media. Plugging the Sentry drive back in gave the car a dashcam drive it
+preferred and freed ours to be music.
 
-The volume now carries as many free clusters as used ones — 464 MB total, half
-of it free — and `FSInfo` reports the real free count and next-free cluster
-rather than "unknown". A host that trusts those figures gets the truth, and one
-that does not can still walk the FAT and find the same answer. macOS confirms:
-220 MB used, 220 MB free.
+**So a second drive is a requirement, not a coincidence.** Either a real Sentry
+drive stays plugged in, or this device must eventually present a second
+partition carrying a `TeslaCam` folder to absorb the dashcam role itself — which
+is the arrangement teslausb uses.
 
-Free clusters cost nothing here. They are never read, and every sector is
-computed on demand, so the volume is larger only in the sense that it *claims*
-to be.
+The Safety screen showing `0 MB` was a misread on my part: it reports *dashcam*
+storage, and a drive with no `TeslaCam` folder legitimately shows nothing there
+and offers to format. I rebuilt the volume around that number before asking what
+the screen actually meant.
 
-### If the car does not offer it as a media source
+### What the volume needed to get here
 
-Owner reports converge on one cause that has nothing to do with the volume:
-**a dashcam drive suppresses USB music.** When a drive carrying a `TeslaCam`
-folder is present, the USB music option disappears — and a second drive in
-another port does not bring it back. Tesla appears to pick a single storage
-device for media, and dashcam wins.
+Each of these was necessary, and each was found by measurement rather than
+argument:
 
-Using a hub makes it worse on its own: the dashcam icon vanishing and the music
-option disappearing are both commonly reported, needing a reset to recover.
+| Fix | Why |
+|---|---|
+| **MBR partition table** | it was a superfloppy; desktops mount that, embedded players may never have seen one |
+| **A volume small enough to index** | at 958 KB/s a 2.3 GB scan takes 40 minutes, and the car re-indexes on every wake |
+| **Free space** | sized to exactly what the tracks needed, every cluster was allocated; a full disk has nowhere to write an index |
+| **Writes accepted, not refused** | write-protected media may be declined outright; a scanner writing a lock file needs the write to succeed, not persist |
+| **EVPD inquiries answered** | returning standard data to a request for a serial number is a protocol violation |
 
-So the first test is free: **unplug the Sentry drive and leave only this one.**
-
-Two other things that are not the problem here, but are worth knowing because
-they are cheap to get wrong:
-
-* **No folder structure is needed.** Files at the root are indexed by tag or
-  filename, which is what this volume does.
-* **A `Lightshow` folder anywhere on the stick makes Tesla ignore all music.**
-  Not present here, but it shows how easily the media source is suppressed by
-  something unrelated to the audio.
-
-### If the car rejects the volume
-
-FAT32 is listed as supported by Tesla's own service documentation, so it is
-worth testing before anything is rebuilt. Two things to try first, in order,
-because both are far cheaper than the alternative:
-
-**Grow the volume.** Ours is 2.3 GB, and Tesla's documentation mentions a 64 GB
-minimum — that figure is for Dashcam rather than music, and small music drives
-are used routinely, but it is the cheapest thing to rule out. Every sector is
-synthesised, so more tracks or longer ones cost no flash at all: change
-`N_TRACKS` or `TRACK_SECONDS` in `fat.rs`. More tracks is useful regardless,
-since the track count *is* the range of the counter for rapid button presses.
-
-**Then exFAT.** A real job rather than a tweak: an upcase table, an allocation
-bitmap, and directory *entry sets* with checksums, against FAT32's flat table
-and 32-byte entries. Worth doing only once FAT32 has actually been shown to
-fail, since the documentation says it should not.
-
-### Read pacing is load-bearing, not polish
+### Read pacing is load-bearing, not polish### Read pacing is load-bearing, not polish
 
 That throughput measurement changes a design assumption. **958 KB/s is about
 five times real time** — 48 kHz/16-bit stereo playback needs 192 KB/s. A car
