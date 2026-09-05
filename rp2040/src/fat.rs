@@ -21,6 +21,15 @@
 #![allow(dead_code)]
 
 pub const SECTOR: usize = 512;
+
+/// Where the filesystem starts, leaving room for a partition table.
+///
+/// The volume was originally a "superfloppy" — a FAT32 boot sector at LBA 0
+/// with no partition table at all. Desktop operating systems mount that
+/// happily, but real USB sticks are essentially always partitioned, so an
+/// embedded media player may never have been tested against one that is not.
+/// 2048 is the conventional first-partition offset (1 MiB alignment).
+pub const PARTITION_START: u32 = 2048;
 /// 32 KB clusters. Larger clusters mean a smaller FAT to synthesise, and the
 /// cluster count still has to stay above FAT32's minimum — see `_LAYOUT`.
 pub const SECTORS_PER_CLUSTER: u32 = 64;
@@ -58,7 +67,10 @@ pub const DATA_CLUSTERS: u32 = 1 + N_TRACKS * CLUSTERS_PER_FILE;
 pub const FAT_SECTORS: u32 = ((DATA_CLUSTERS + 2) * 4).div_ceil(SECTOR as u32);
 pub const FAT_START: u32 = RESERVED_SECTORS;
 pub const DATA_START: u32 = FAT_START + 2 * FAT_SECTORS;
-pub const TOTAL_SECTORS: u32 = DATA_START + DATA_CLUSTERS * SECTORS_PER_CLUSTER;
+/// Sectors in the filesystem itself, excluding the partition table ahead of it.
+pub const FS_SECTORS: u32 = DATA_START + DATA_CLUSTERS * SECTORS_PER_CLUSTER;
+/// Sectors in the whole device, which is what SCSI reports.
+pub const TOTAL_SECTORS: u32 = PARTITION_START + FS_SECTORS;
 
 const _LAYOUT: () = {
     // Below 65525 clusters a host is required to read the volume as FAT16, and
@@ -100,7 +112,17 @@ pub fn track_first_cluster(track: u32) -> u32 {
 /// closed-form calculation, so watching reads is enough to know where the
 /// player is.
 pub fn locate(lba: u32) -> Option<Position> {
-    if lba < DATA_START || lba >= TOTAL_SECTORS {
+    // Callers address the device; the layout is expressed in filesystem space.
+    locate_fs(lba.checked_sub(PARTITION_START)?)
+}
+
+/// As [`locate`], but taking a filesystem-relative address.
+///
+/// Kept separate rather than folded in, because `read_sector` has already
+/// subtracted the partition offset by the time it needs this — and subtracting
+/// it twice silently attributes every sector to the wrong place.
+fn locate_fs(lba: u32) -> Option<Position> {
+    if lba < DATA_START || lba >= FS_SECTORS {
         return None;
     }
     let cluster = ROOT_CLUSTER + (lba - DATA_START) / SECTORS_PER_CLUSTER;
@@ -147,8 +169,10 @@ fn boot_sector(buf: &mut [u8; SECTOR]) {
     le16(buf, 22, 0); // FAT32 uses the 32-bit field below
     le16(buf, 24, 63);
     le16(buf, 26, 255);
-    le32(buf, 28, 0); // no hidden sectors: this is a whole device, not a partition
-    le32(buf, 32, TOTAL_SECTORS);
+    // Hidden sectors: how far into the device this partition begins. A host
+    // that cross-checks this against the MBR will reject a mismatch.
+    le32(buf, 28, PARTITION_START);
+    le32(buf, 32, FS_SECTORS);
     le32(buf, 36, FAT_SECTORS);
     le16(buf, 40, 0); // no mirroring flags
     le16(buf, 42, 0); // version 0.0
@@ -241,10 +265,41 @@ fn wav_header(buf: &mut [u8]) {
     le32(buf, 40, TRACK_DATA_BYTES);
 }
 
+/// The Master Boot Record: one partition, spanning the filesystem.
+fn mbr(buf: &mut [u8; SECTOR]) {
+    // Partition entry 1 at offset 446.
+    buf[446] = 0x00; // not bootable
+    // CHS start. Meaningless for anything modern, which reads the LBA fields
+    // below, but a zeroed CHS makes some parsers reject the entry outright.
+    buf[447] = 0x00;
+    buf[448] = 0x02;
+    buf[449] = 0x00;
+    buf[450] = 0x0C; // FAT32 with LBA addressing
+    // CHS end, likewise nominal: the "maximum" triple, as tools write when the
+    // real geometry does not fit.
+    buf[451] = 0xFE;
+    buf[452] = 0xFF;
+    buf[453] = 0xFF;
+    le32(buf, 454, PARTITION_START);
+    le32(buf, 458, FS_SECTORS);
+    buf[510] = 0x55;
+    buf[511] = 0xAA;
+}
+
 /// Produce the contents of `lba`. Anything not explicitly described is zero,
 /// which for the audio payload is exactly right: zeros are silence.
 pub fn read_sector(lba: u32, buf: &mut [u8; SECTOR]) {
     buf.fill(0);
+    if lba == 0 {
+        mbr(buf);
+        return;
+    }
+    // Everything below addresses the filesystem, which begins at
+    // `PARTITION_START`. The gap between the MBR and it stays zero.
+    if lba < PARTITION_START {
+        return;
+    }
+    let lba = lba - PARTITION_START;
     if lba == 0 || lba == 6 {
         boot_sector(buf);
     } else if lba == 1 || lba == 7 {
@@ -253,7 +308,7 @@ pub fn read_sector(lba: u32, buf: &mut [u8; SECTOR]) {
         fat_sector(lba - FAT_START, buf);
     } else if (FAT_START + FAT_SECTORS..DATA_START).contains(&lba) {
         fat_sector(lba - FAT_START - FAT_SECTORS, buf); // the mirror
-    } else if let Some(pos) = locate(lba) {
+    } else if let Some(pos) = locate_fs(lba) {
         if pos.offset == 0 {
             wav_header(buf);
         }
@@ -266,10 +321,54 @@ pub fn read_sector(lba: u32, buf: &mut [u8; SECTOR]) {
 mod tests {
     use super::*;
 
+    /// Read a sector by its **filesystem-relative** address, which is how the
+    /// layout below is expressed. The device puts the filesystem after the
+    /// partition table, so that offset is added here in one place.
     fn sector(lba: u32) -> [u8; SECTOR] {
+        let mut b = [0u8; SECTOR];
+        read_sector(PARTITION_START + lba, &mut b);
+        b
+    }
+
+    /// Read a sector by its raw device address.
+    fn device_sector(lba: u32) -> [u8; SECTOR] {
         let mut b = [0u8; SECTOR];
         read_sector(lba, &mut b);
         b
+    }
+
+    #[test]
+    fn mbr_describes_one_partition_covering_the_filesystem() {
+        // Without this the volume is a "superfloppy": a filesystem at LBA 0 with
+        // no partition table. Desktops mount that, but real USB sticks are
+        // always partitioned, so embedded players may never have seen one.
+        let b = device_sector(0);
+        assert_eq!(&b[510..512], &[0x55, 0xAA], "missing MBR signature");
+        assert_eq!(b[450], 0x0C, "partition type must be FAT32 with LBA");
+        assert_eq!(
+            u32::from_le_bytes(b[454..458].try_into().unwrap()),
+            PARTITION_START,
+            "partition must start where the filesystem does"
+        );
+        assert_eq!(
+            u32::from_le_bytes(b[458..462].try_into().unwrap()),
+            FS_SECTORS,
+            "partition must span the whole filesystem"
+        );
+        // The other three entries are unused.
+        assert!(b[462..510].iter().all(|&x| x == 0), "spurious partition entry");
+        // And the partition must fit the device it claims to live on.
+        assert!(PARTITION_START + FS_SECTORS <= TOTAL_SECTORS);
+    }
+
+    #[test]
+    fn the_gap_before_the_filesystem_is_empty() {
+        for lba in [1u32, 2, 63, PARTITION_START - 1] {
+            assert!(
+                device_sector(lba).iter().all(|&x| x == 0),
+                "sector {lba} should be empty"
+            );
+        }
     }
 
     #[test]
@@ -280,7 +379,13 @@ mod tests {
         assert_eq!(b[13] as u32, SECTORS_PER_CLUSTER);
         assert_eq!(b[16], 2, "hosts expect two FATs");
         assert_eq!(u16::from_le_bytes([b[17], b[18]]), 0, "FAT32 root entries must be 0");
-        assert_eq!(u32::from_le_bytes(b[32..36].try_into().unwrap()), TOTAL_SECTORS);
+        // The BPB counts the partition, not the device.
+        assert_eq!(u32::from_le_bytes(b[32..36].try_into().unwrap()), FS_SECTORS);
+        assert_eq!(
+            u32::from_le_bytes(b[28..32].try_into().unwrap()),
+            PARTITION_START,
+            "hidden sectors must match where the partition begins"
+        );
         assert_eq!(u32::from_le_bytes(b[44..48].try_into().unwrap()), ROOT_CLUSTER);
         assert_eq!(sector(6), b, "backup boot sector must match");
     }
@@ -357,7 +462,10 @@ mod tests {
             assert_eq!(&b[8..12], b"WAVE");
             assert_eq!(u32::from_le_bytes(b[24..28].try_into().unwrap()), SAMPLE_RATE);
             assert_eq!(u32::from_le_bytes(b[40..44].try_into().unwrap()), TRACK_DATA_BYTES);
-            assert_eq!(locate(lba), Some(Position { track, offset: 0 }));
+            assert_eq!(
+                locate(PARTITION_START + lba),
+                Some(Position { track, offset: 0 })
+            );
         }
     }
 
@@ -366,7 +474,7 @@ mod tests {
         for track in 0..N_TRACKS {
             let base = DATA_START + (track_first_cluster(track) - ROOT_CLUSTER) * SECTORS_PER_CLUSTER;
             for probe in [0u32, 1, 63, 64, 1000, CLUSTERS_PER_FILE * SECTORS_PER_CLUSTER - 1] {
-                match locate(base + probe) {
+                match locate(PARTITION_START + base + probe) {
                     Some(p) => {
                         assert_eq!(p.track, track, "sector {probe} attributed to the wrong track");
                         assert_eq!(p.offset, probe * SECTOR as u32);
@@ -380,8 +488,16 @@ mod tests {
 
     #[test]
     fn metadata_sectors_are_not_mistaken_for_audio() {
+        // Filesystem metadata, plus the partition table ahead of it.
         for lba in [0u32, 1, 6, FAT_START, FAT_START + FAT_SECTORS, DATA_START] {
-            assert_eq!(locate(lba), None, "sector {lba} looks like track data");
+            assert_eq!(
+                locate(PARTITION_START + lba),
+                None,
+                "sector {lba} looks like track data"
+            );
+        }
+        for lba in [0u32, 1, PARTITION_START - 1] {
+            assert_eq!(locate(lba), None, "device sector {lba} looks like track data");
         }
     }
 

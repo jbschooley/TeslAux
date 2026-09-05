@@ -161,6 +161,24 @@ So the descriptors, Bulk-Only Transport, the SCSI subset and the synthetic FAT32
 are all right, and a deep read exercises `locate()` across thousands of clusters
 correctly. The car is now the only unknown.
 
+### The volume is partitioned
+
+It was originally a "superfloppy" — a FAT32 boot sector at LBA 0 with no
+partition table. Desktop operating systems mount that happily, and macOS did,
+but **real USB sticks are essentially always partitioned**, so an embedded media
+player may never have been tested against one that is not.
+
+There is now an MBR at LBA 0 with a single type `0x0C` (FAT32 LBA) partition
+starting at sector 2048, the conventional 1 MiB alignment. macOS now sees
+`FDisk_partition_scheme` -> `disk4s1 Windows_FAT_32` rather than a bare
+filesystem, which is what a real stick looks like.
+
+Two address spaces exist as a result, and conflating them is the obvious way to
+break this: `read_sector` and `locate` take **device** addresses, while the
+layout constants are **filesystem-relative**. `locate_fs` is the internal form
+for code that has already subtracted the offset — subtracting it twice
+attributes every sector to the wrong track, silently.
+
 ### If the car rejects the volume
 
 FAT32 is listed as supported by Tesla's own service documentation, so it is
