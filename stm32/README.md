@@ -1,8 +1,7 @@
 # TeslAux on a single STM32F407
 
-> **Status: bit-exact on the bench. Does NOT work in the car — under
-> investigation.** The two-board RP2040 rig in `../rp2040/` remains the version
-> that works in a car.
+> **Status: bit-exact on the bench, and working in the car.** Not yet given the
+> three-boot bit-exact repeat that the two-board rig has.
 >
 > ```
 > compared 2,784,000 frames (58.0 s)
@@ -133,54 +132,34 @@ Use SWD for bring-up. Not for the flashing — for the visibility. This port has
 real unknowns and `probe-rs` gives you RTT and breakpoints; the RP2040 LED bug
 cost four wrong theories precisely because there was no way to see inside.
 
-## Open: the car does not receive audio
+## The car needed two fixes
 
-Works perfectly to a Mac at 1000 packets/second; in the car the audio never
-arrives, though the mic is detected and there is no popup.
+Both are in the repository; this section is why, because neither was findable by
+reasoning and both cost a lot of guesses.
 
-Eliminated, each by measurement rather than argument:
+**The endpoint's TX FIFO must be flushed when the host re-enables it.** The car
+sets `alt 1 -> 0 -> 1` in rapid succession, which no host that works does. A
+packet staged in the FIFO when the endpoint is disabled stays there, re-enabling
+does not clear it, and the core cannot stage another behind it — so the endpoint
+can never transmit again while looking completely healthy. It presents as the
+*host* refusing to poll: the bus keeps clocking, the frame counter advances, the
+device is not suspended, and the endpoint reports active, isochronous and the
+right packet size. Only `DIEPCTL.EPENA` staying false across thousands of writes
+gave it away. `embassy-usb` has no API for the flush, so it goes through the PAC.
 
-| Hypothesis | Result |
-|---|---|
-| Descriptor set differs from the RP2040 | **no** — byte-identical, 143 bytes, verified with `tools/usbdesc.py` |
-| VBUS sensing misconfigured | **no** — enabling it stops enumeration, so PA9 is not wired to VBUS here |
-| Two OTG cores interfering | **no** — identical behaviour with `--features car-only`, OTG_HS never initialised |
-| Missing sampling-frequency control | contributed, but not the cause: the RP2040 also ships `bmAttributes 0x00` and works |
+**And the pipe could not build its cushion.** The pacer refills by taking one
+frame fewer while the level is low, but stopped at `target - hyst` where the
+deadband ends, while priming requires `target`. With a source and sink both at
+exactly one packet per millisecond and the buffer starting empty, the level
+parked just under the deadband, the pipe never primed, and `pop()` returned held
+samples — audible as crustiness in proportion to signal level. The two-board
+build masks this: its car board fills from I2S while the car is not yet polling,
+so it passes `target` long before the pump starts.
 
-What the trace shows: the car sets `alt 1 -> 0 -> 1 -> 0 -> 1` in quick
-succession — something the Mac never does — then stops issuing requests. Our
-packets are queued and mostly never collected. With the write bounded and the
-endpoint re-armed on timeout, roughly 8% of packets do get through (127 of
-~14,000 expected), which proves the car *is* polling.
-
-Also eliminated: the driver's isochronous rescheduling. The published
-`embassy-usb-synopsys-otg` 0.3.3 reschedules missed iso IN packets on `EOPF`
-rather than `IISOIXFR`, which upstream replaced on 2026-08-19 and which matches
-open issue #6935. Moving to the git version (0.4.0, which has the fix) changed
-nothing — `out` still stops at 3. Note 0.4.0 cannot be reached from crates.io:
-`embassy-stm32` 0.6.0 pins `^0.3.2`, there is no newer release, and `[patch]`
-cannot bridge 0.3 to 0.4.
-
-Reading the OTG core directly settles what everything above could only infer:
-
-```
-ep1: active true  ena false  nak false  mps 196  type 1 (isochronous)
-frame advancing   suspended false
-```
-
-The bus is alive and the car is driving it — the frame counter increments and
-the device is not suspended. Our endpoint is active, correctly configured as
-isochronous with a 196-byte maximum. `ena false` is expected between frames: the
-core discards an iso packet that missed its frame and clears the bit.
-
-**The car simply never sends an IN token to the endpoint.** It enumerates us,
-raises no popup, sets alt 1, completes the sample-rate handshake, writes 73 IF3
-configuration frames, takes three packets, and then never asks again — while
-continuing to clock the bus. Nothing visible from the device side is wrong.
-
-The descriptors are byte-identical to the RP2040 that works in the same port, so
-whatever the car objects to is behavioural rather than declared. That is where
-this stands.
+Eliminated along the way, each by measurement: the descriptor set
+(byte-identical to the working RP2040 — see `tools/usbdesc.py`), VBUS sensing,
+running two OTG cores at once, the missing sampling-frequency control, and the
+driver's isochronous rescheduling.
 
 ## Bring-up notes
 
