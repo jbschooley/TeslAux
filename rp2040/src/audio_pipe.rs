@@ -274,7 +274,18 @@ impl<const N: usize> Pipe<N> {
         if self.len <= self.target + self.hyst {
             return;
         }
-        while self.len > self.target {
+        // Discard only as far as the top of the deadband, not all the way to
+        // target.
+        //
+        // Every discarded frame is a discontinuity, and the size of the audible
+        // click grows with how many go. Once the level is inside the band the
+        // pacer can close the rest losslessly by varying the packet size, so
+        // discarding further buys nothing but a louder click. The elastic
+        // mechanism cannot shed faster than one frame per packet — the endpoint
+        // is only one frame larger than nominal — which is why the backlog above
+        // the band is worth a splice at all.
+        let floor = self.target + self.hyst;
+        while self.len > floor {
             self.tail = (self.tail + 1) % N;
             self.len -= 1;
         }
@@ -769,9 +780,19 @@ mod tests {
         }
         assert_eq!(p.off_target(), 512 - p.target() as i32);
         p.trim_to_target();
-        assert_eq!(p.off_target(), 0, "trim did not reach target");
-        // The oldest go, so what remains is the most recent audio.
-        assert_eq!(p.pop(), [256, 256], "trim kept the wrong end");
+        // Back inside the deadband, which is as far as it should go: the pacer
+        // closes the rest losslessly, and every extra discarded frame is a
+        // bigger click for nothing.
+        assert_eq!(p.off_target(), p.hysteresis() as i32, "trim went past the deadband");
+        // The oldest go, so what remains is the most recent audio. Computed
+        // rather than hardcoded, so tuning where trim stops does not turn this
+        // into a test of the number instead of the behaviour.
+        let dropped = 512 - (p.target() + p.hysteresis());
+        assert_eq!(
+            p.pop(),
+            [dropped as i16, dropped as i16],
+            "trim kept the wrong end"
+        );
         // Deliberate, so not counted as a fault.
         assert_eq!(p.stats.overruns, 0, "trim counted as overruns");
     }
