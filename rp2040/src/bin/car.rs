@@ -270,10 +270,11 @@ async fn main(spawner: Spawner) {
     static mut HID_STATE: HidState = HidState::new();
     static mut KBD: teslamic::KeyboardHandler = teslamic::KeyboardHandler;
     static mut IF3: teslamic::If3Handler = teslamic::If3Handler;
+    static mut SRATE: teslamic::SampleRateHandler = teslamic::SampleRateHandler { rate: 0 };
 
     // SAFETY: single-threaded startup, each static taken exactly once, and all
     // outlive `usb` (main never returns).
-    let (config_desc, bos_desc, msos_desc, control_buf, hid_state, kbd, if3) = unsafe {
+    let (config_desc, bos_desc, msos_desc, control_buf, hid_state, kbd, if3, srate) = unsafe {
         (
             &mut *core::ptr::addr_of_mut!(CONFIG_DESC),
             &mut *core::ptr::addr_of_mut!(BOS_DESC),
@@ -282,6 +283,7 @@ async fn main(spawner: Spawner) {
             &mut *core::ptr::addr_of_mut!(HID_STATE),
             &mut *core::ptr::addr_of_mut!(KBD),
             &mut *core::ptr::addr_of_mut!(IF3),
+            &mut *core::ptr::addr_of_mut!(SRATE),
         )
     };
 
@@ -307,7 +309,7 @@ async fn main(spawner: Spawner) {
     #[cfg(not(feature = "clock-locked"))]
     let ep_max = ((frames_max + 1) * CHANNELS_X_BYTES) as u16;
     debug_assert!(ep_max <= 1023, "over the full-speed isochronous limit");
-    let iso_in = teslamic::build(&mut builder, hid_state, kbd, if3, ep_max, rate);
+    let iso_in = teslamic::build(&mut builder, hid_state, kbd, if3, srate, ep_max, rate);
     let usb = builder.build();
 
     // ── I2S capture ─────────────────────────────────────────────────────────
