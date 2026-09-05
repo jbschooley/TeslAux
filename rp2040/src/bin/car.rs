@@ -24,15 +24,15 @@
 //! Status LED on GPIO25.
 
 use embassy_executor::Spawner;
-use embassy_futures::yield_now;
 use embassy_rp::bind_interrupts;
+#[cfg(not(feature = "rp2040-zero"))]
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{PIO0, USB};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Instant};
 use embassy_usb::class::hid::State as HidState;
 use embassy_usb::driver::{EndpointError, EndpointIn};
 use embassy_usb::Builder;
@@ -503,10 +503,17 @@ async fn pump(
 ) -> ! {
     use core::sync::atomic::Ordering;
     let (mut agree_rate, mut agree_count) = (0u32, 0u32);
+    // Consecutive windows whose measured rate made no sense. One is not
+    // evidence of anything — see where this is used.
+    let mut nonsense_count = 0u32;
 
     let mut buf = [0u8; teslamic::BYTES_PER_FRAME + 8];
-    let mut detect = RateDetect::new(1000);
-    let mut last_captured = CAPTURED.load(Ordering::Relaxed);
+    // Declared without a value: the loop below resets both whenever the stream
+    // opens, so any initialiser here would be dead.
+    #[cfg(not(feature = "packet-stress"))]
+    let mut detect: RateDetect;
+    #[cfg(not(feature = "packet-stress"))]
+    let mut last_captured: u32;
     // When the host last actually took a packet.
     let mut last_write = Instant::now();
     #[cfg(feature = "packet-stress")]
@@ -522,8 +529,11 @@ async fn pump(
         // an absurd rate. An unclassifiable rate mutes, so this cost a full
         // second of silence every time the host selected alt 1 — which the car
         // does constantly.
-        detect = RateDetect::new(1000);
-        last_captured = CAPTURED.load(Ordering::Relaxed);
+        #[cfg(not(feature = "packet-stress"))]
+        {
+            detect = RateDetect::new(1000);
+            last_captured = CAPTURED.load(Ordering::Relaxed);
+        }
         MUTED.store(false, Ordering::Relaxed);
 
         // Drop whatever piled up while nobody was listening. Nothing drains the
@@ -635,22 +645,45 @@ async fn pump(
                                 wd.set_scratch(1, r);
                                 wd.trigger_reset();
                             }
-                            MUTED.store(true, Ordering::Relaxed);
+                            nonsense_count = 0;
+                            // Wait for a second agreeing window before going
+                            // quiet. Muting on the first one turns a single bad
+                            // measurement into a second of silence.
+                            MUTED.store(agree_count >= 2, Ordering::Relaxed);
                         }
                         Some(_) => {
                             agree_count = 0;
+                            nonsense_count = 0;
                             MUTED.store(false, Ordering::Relaxed);
                         }
-                        // Unclassifiable means absent or still starting, which is
-                        // not a reason to latch silence.
+                        // A measurement that matches no rate at all.
+                        //
+                        // This used to mute immediately, and that is a real
+                        // dropout: silence persists until the next window
+                        // closes, up to a second later.
+                        //
+                        // It is also easy to provoke, because this detector is
+                        // clocked by *delivered packets* rather than by time.
+                        // `ticks` only advances when the host takes a packet, so
+                        // a host that pauses polling stops the clock while the
+                        // I2S side keeps counting frames — and the window's
+                        // ratio comes out inflated through no fault of the
+                        // source. `classify` rejects anything beyond 2%, and
+                        // the audio went quiet.
+                        //
+                        // Three consecutive nonsense windows is a source that
+                        // really has gone wrong. One is the host having paused.
                         None => {
                             agree_count = 0;
-                            MUTED.store(hz > 1000, Ordering::Relaxed);
+                            nonsense_count = nonsense_count.saturating_add(1);
+                            MUTED.store(
+                                nonsense_count >= 3 && hz > 1000,
+                                Ordering::Relaxed,
+                            );
                         }
                     }
                 }
             }
-            let _ = &mut detect;
         }
     }
 }

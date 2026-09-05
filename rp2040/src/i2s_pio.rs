@@ -29,6 +29,11 @@
 //! test signal will tell you which. Check that first if audio comes out
 //! distorted or channel-swapped.
 
+// Shared by several binaries, each of which uses a different subset: the car
+// board never transmits, the source board never receives. Dead code here is a
+// property of the caller, not of the module.
+#![allow(dead_code)]
+
 use embassy_rp::dma::Channel;
 use embassy_rp::gpio::Pull;
 use embassy_rp::pio::{
