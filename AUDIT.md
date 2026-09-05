@@ -47,3 +47,67 @@ what moved the search to the wiring and to the wire protocol.
   a note saying why: they are shared between binaries that use different subsets,
   so unused items are a property of the caller.
 * The car build is now warning-free.
+
+## What the measurements found
+
+Everything below is measured, not inferred. Recordings were compared against the
+file that was played (`tools/bitcompare.py`) or against the tone the firmware
+generates (`tools/tonecompare.py`).
+
+**The pops were line coupling, and they are fixed.** An eleven-minute recording
+held 112 corrupted samples in its first two and a half minutes. All but one were
+the right channel, and every one had been replaced by its own sign bit —
+`(sample & 0xFFFF) >> 15` exactly, on all 54 checked by hand — with jumps up to
+44% of full scale in a single sample. That is a right slot read fifteen
+bit-clocks early: fifteen bits of the left slot's zero padding, then one bit of
+the real sample, which happens when `wait 1 pin` on LRCK releases before the
+true edge. LRCK idles low during the left slot, so only a positive glitch
+corrupts the right channel, which is why the damage was one-sided.
+
+Soldering the boards edge to edge with a driven shield between BCK and LRCK
+removed it: **zero corrupted samples across five recordings since**, against 112
+in two and a half minutes before.
+
+**The remaining artifact is a 16-frame hold, and it is not the buffer.** Three
+per ten minutes at first, each a sample held for 0.33 ms. Doubling the source's
+cushion changed nothing (3 -> 3); doubling the car's changed nothing (3 -> 3).
+The hold stayed exactly 16 frames while the source's I2S block moved 16 -> 32
+and the car's moved 16 -> 64, so it is not either board's block size.
+
+`packet-stress`, which generates a tone with no phone, no source board and no
+I2S, ran **411 seconds without a single frame added, dropped or altered** —
+while swinging packet sizes 47/49 every frame. That clears the USB transmit
+path, the variable packet sizing, and the capture on the Mac.
+
+`pipe-tone`, which substitutes a known tone for the captured samples while
+keeping the capture timing, then put the holds in the car board's own pipe:
+three in eight minutes with the I2S data discarded, so none of them could have
+arrived from the source.
+
+**Then it stopped reproducing.** Nearly thirty minutes across three
+configurations, zero holds:
+
+| car build | source build | duration | holds |
+|---|---|---|---|
+| `pipe-tone` | before the idle fix | 7.9 min | **3** |
+| `pipe-tone` + `pipe-watch` | before the idle fix | 9.6 min | 0 |
+| `pipe-tone` + `pipe-watch` | after | 10.1 min | 0 |
+| `pipe-tone` | after | 10.2 min | 0 |
+
+At the original rate, thirty clean minutes is about a 1-in-90,000 outcome, so
+something did change. But no single variable explains it: the instrumentation
+cannot be the cause, because the last run has none; and the idle fix cannot be
+the whole cause, because the second run predates it.
+
+The idle fix is still the best mechanism on offer. Before it, a momentary
+starvation of the source's pipe un-primed it, the steering loop read a whole
+target low, and the I2S clock wound down to 47488 Hz — at which the car's pipe
+loses 512 frames a second and underruns about a quarter of a second later. That
+chain produces exactly this artifact, from a cause on the source board, showing
+up on the car board, with neither board's buffer able to prevent it. It is also
+consistent with the counts falling as the source's cushion grew (6 -> 3) while
+the car's made no difference.
+
+What no hypothesis has explained is why the hold was **exactly 16 frames every
+time**, across four different block-size configurations. That remains open, and
+it is the reason none of this is stated as settled.
