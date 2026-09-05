@@ -23,6 +23,26 @@ link disappears and with it the PIO driver, one ring buffer, the clock-steering
 loop, `RateDetect`, and the only code path that could ever duplicate or discard a
 sample.
 
+**RP2350 with two USB-C ports** (Waveshare RP2350-USB-C and similar) comes up
+repeatedly and does not work, for a reason worth writing down because the usual
+explanation — "one port does not support audio" — is right about the conclusion
+and wrong about the cause.
+
+The second port is real and *can* run in device mode; Waveshare fit CC resistors
+for exactly that. What it cannot do is **isochronous**, because Pico-PIO-USB does
+not implement it. `EP_ATTR_ISOCHRONOUS` appears once in that repository, as a
+spec constant in a header, with no reference anywhere in the host or device
+implementation — whose transfer handling is ACK-based, which is precisely what
+isochronous is not.
+
+USB audio is isochronous, so this is not a driver setting. Adding it would mean
+implementing a transfer type in a C library that lacks one, meeting per-frame
+deadlines while bit-banging 12 Mbps on PIO, doing so alongside the native
+controller running its own isochronous stream, and writing Rust bindings because
+embassy has no PIO-USB support at all — abandoning the stack this project is
+built on. The result would emulate in software what the STM32F407 already does
+in silicon with two hardware controllers.
+
 Rejected along the way: **RP2040 + PCM2706**, because the PCM2706's hardware
 clock recovery solves a problem this architecture does not have, and it is a
 legacy part. **ESP32 / RP2350 dual-USB-C boards**, because the second connector
