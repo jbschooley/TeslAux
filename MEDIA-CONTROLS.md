@@ -146,10 +146,31 @@ residue tells the host the same thing.
    it touches only the source-facing descriptors, so the cloned mic side the car
    validates stays byte-identical.
 
-**Next test:** flash `teslamic-rp-USBDRIVE.uf2` and plug it into a Mac. If
-`TESLAUX` mounts and `001.WAV` plays, the class implementation is right — the
-image already mounts as a *file*, so this asks whether it also works as a
-*device*. Only then is the car worth trying.
+**Verified on a Mac.** `teslamic-rp-USBDRIVE.uf2` enumerates and mounts as a
+real disk:
+
+```
+/dev/disk4 (external, physical)   TESLAUX   2.3 GB
+20 tracks; ffprobe reads 001.WAV as pcm_s16le 48000 Hz 2ch, 600.000000 s
+4 KB read 50 MB into track 7: all zero, as it should be
+sustained read: 957,643 bytes/sec
+```
+
+So the descriptors, Bulk-Only Transport, the SCSI subset and the synthetic FAT32
+are all right, and a deep read exercises `locate()` across thousands of clusters
+correctly. The car is now the only unknown.
+
+### Read pacing is load-bearing, not polish
+
+That throughput measurement changes a design assumption. **958 KB/s is about
+five times real time** — 48 kHz/16-bit stereo playback needs 192 KB/s. A car
+reading that fast can buffer five seconds of audio for every second it plays, so
+"reads stopped" would lag a pause by five seconds or more, against the ~300 ms
+this design assumed.
+
+Pacing the reads to just above real time is therefore what makes play/pause
+detection work at all, and the ratio it has to correct is now measured rather
+than guessed.
 
 ## Ruled out: the car tells the mic nothing
 
