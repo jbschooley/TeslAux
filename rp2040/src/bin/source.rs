@@ -709,9 +709,32 @@ async fn i2s_out_steered(
         ticks += 1;
         if ticks >= 75 {
             ticks = 0;
-            let off = PIPE.lock(|p| p.borrow().off_target()) as i64;
-            let cmd = ((RATE as i64) * 1000 + off * 2000)
-                .clamp((RATE as i64 - 2000) * 1000, (RATE as i64 + 2000) * 1000);
+            // Steering an unprimed pipe is meaningless, and not harmless.
+            // `off_target` reads a whole target low when the buffer is empty,
+            // so the loop winds the clock down to nearly its clamp — 47488 Hz
+            // with this cushion — and holds it there for as long as nothing is
+            // playing. `pan-test` already carries a note about this: steering on
+            // a pipe it bypasses drove the clock to 46 kHz and the car board
+            // rightly muted an unrecognised rate.
+            //
+            // The same thing happens on every pause, and it is audible: a buzz
+            // while the phone is stopped, and a car-side pipe that drains at
+            // 512 frames a second until it underruns about a quarter of a second
+            // later. That underrun is not a fault, but it looks exactly like one
+            // — it latched the pipe-watch verdict on a stop rather than on
+            // anything that happened while audio was flowing.
+            //
+            // With nothing to track, hold the nominal rate.
+            let (off, primed) = PIPE.lock(|p| {
+                let b = p.borrow();
+                (b.off_target() as i64, b.primed())
+            });
+            let cmd = if primed {
+                ((RATE as i64) * 1000 + off * 2000)
+                    .clamp((RATE as i64 - 2000) * 1000, (RATE as i64 + 2000) * 1000)
+            } else {
+                (RATE as i64) * 1000
+            };
             i2s_pio::set_master_rate(&mut sm, embassy_rp::clocks::clk_sys_freq(), cmd as u64);
         }
         }
