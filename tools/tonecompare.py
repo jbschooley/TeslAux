@@ -121,10 +121,16 @@ def main(path):
           f"{sum(c for _, k, c in edits if k == 'missing')} missing, "
           f"{held} extra, "
           f"{sum(c for _, k, c in edits if k == 'corrupt')} corrupted")
+    # Edit positions are in the generated sequence; the recording drifts from it
+    # by every edit already passed. Indexing the recording without carrying that
+    # lag reads the wrong samples and mislabels a hold as ordinary audio, which
+    # is exactly what it did the first time this was pointed at real data.
+    lag = 0
     for pos, kind, cnt in edits[:20]:
-        seg = rec[pos : pos + cnt]
-        hold = "hold" if cnt and len(set(map(tuple, seg))) == 1 else ""
-        print(f"   frame {pos:>9}  {pos / rate / 60:6.3f} min  {kind} {cnt} {hold}")
+        seg = rec[pos + lag : pos + lag + cnt]
+        hold = "  hold" if cnt and len(set(map(tuple, seg))) == 1 else ""
+        print(f"   frame {pos:>9}  {pos / rate / 60:6.3f} min  {kind} {cnt}{hold}")
+        lag += cnt if kind == "extra" else (-cnt if kind == "missing" else 0)
     if len(edits) > 20:
         print(f"   ... and {len(edits) - 20} more")
     return 1
