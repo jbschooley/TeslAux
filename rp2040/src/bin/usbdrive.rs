@@ -19,10 +19,14 @@
 //!
 //! | LED | meaning |
 //! |-----|---------|
-//! | blue, slow | enumerated, no host has read anything yet |
-//! | green | the host has read sectors — the volume is being indexed or played |
-//! | amber | a SCSI command failed; check RTT for which |
+//! | blue, slow | enumerated, nothing read yet |
+//! | amber | sectors read, but **metadata only** — the host looked at the volume and stopped before any track |
+//! | green | the host read **inside a track**, so it parsed the filesystem, walked the directory and opened a file |
 //! | red | the transport gave up: a malformed CBW, or an endpoint error |
+//!
+//! Amber versus green is the useful distinction when a host mounts the volume
+//! but will not play it: amber means the filesystem was rejected, green means it
+//! was accepted and something else is wrong.
 //!
 //! Plug it into a Mac first. If `TESLAUX` mounts and `001.WAV` plays, the class
 //! implementation is right and the car is the only remaining unknown.
@@ -69,6 +73,15 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 /// Sectors served since boot. Non-zero means a host is actually reading us,
 /// which is the only evidence that matters at this stage.
 static SECTORS_READ: AtomicU32 = AtomicU32::new(0);
+/// True once the host has read a sector that belongs to a **track**, rather
+/// than to the partition table, the FAT or the directory.
+///
+/// This is the question that matters when a host mounts the volume but does not
+/// offer it as a media source: did it parse the filesystem and go looking at the
+/// files, or did it give up after the metadata? `locate()` already answers it —
+/// it is the same function the media-control detector will be built on, so this
+/// exercises it against a real host at the same time.
+static READ_TRACK_DATA: AtomicBool = AtomicBool::new(false);
 /// A SCSI command failed. Not fatal — hosts probe for optional commands — but
 /// worth seeing during bring-up.
 static CMD_FAILED: AtomicBool = AtomicBool::new(false);
@@ -77,12 +90,18 @@ static WEDGED: AtomicBool = AtomicBool::new(false);
 
 fn current_state() -> status::State {
     if WEDGED.load(Ordering::Relaxed) {
+        // red: the transport gave up
         status::State::Fault
-    } else if CMD_FAILED.load(Ordering::Relaxed) {
-        status::State::Slipping
-    } else if SECTORS_READ.load(Ordering::Relaxed) > 0 {
+    } else if READ_TRACK_DATA.load(Ordering::Relaxed) {
+        // green: the host read inside a track, so it parsed the filesystem,
+        // walked the directory and opened files
         status::State::Ok
+    } else if SECTORS_READ.load(Ordering::Relaxed) > 0 {
+        // amber: sectors were read, but only metadata — the host looked at the
+        // volume and stopped before any track
+        status::State::Slipping
     } else {
+        // blue: nothing read at all
         status::State::Waiting
     }
 }
@@ -269,6 +288,9 @@ async fn main(spawner: Spawner) {
                     let mut sent = 0u32;
                     let mut failed = false;
                     for i in 0..blocks {
+                        if fat::locate(lba + i).is_some() {
+                            READ_TRACK_DATA.store(true, Ordering::Relaxed);
+                        }
                         fat::read_sector(lba + i, &mut sector);
                         if write_all(&mut ep_in, &sector).await.is_err() {
                             failed = true;
