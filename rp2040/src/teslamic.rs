@@ -120,9 +120,25 @@ fn as_format_type_i(rate: u32) -> [u8; 9] {
 /// and a device that STALLs it can be abandoned — on the STM32 the car set alt
 /// 1, had its request refused, cycled alt 1/0 a few times and then stopped
 /// polling for audio altogether.
+/// Whether the endpoint advertises a sampling-frequency control.
+///
+/// The real mic does (`real_mic_dump.md`: "CS_EP: sampling-frequency control
+/// enabled"), and the STM32 build **requires** it: without it the car STALLed
+/// its `SET_CUR`, cycled alt 1/0 a few times and stopped asking for audio.
+///
+/// The RP2040 build does not, and there advertising it has a cost. Accepting
+/// `SET_CUR` means a control transfer with a data stage on every alt-1
+/// selection, where a STALL is answered immediately — and the car toggles alt
+/// settings constantly. Each crate therefore chooses, rather than sharing one
+/// answer that suits neither.
+#[cfg(feature = "sampling-freq-control")]
+const EP_BM_ATTRIBUTES: u8 = 0x01;
+#[cfg(not(feature = "sampling-freq-control"))]
+const EP_BM_ATTRIBUTES: u8 = 0x00;
+
 const AS_ISO_ENDPOINT: [u8; 5] = [
     0x01, // EP_GENERAL
-    0x01, // bmAttributes: sampling-frequency control
+    EP_BM_ATTRIBUTES,
     0x00, // bLockDelayUnits
     0x00, 0x00, // wLockDelay
 ];
@@ -343,7 +359,10 @@ pub fn build<'d, D: Driver<'d>>(
         a3.descriptor(0x21, &HID_DESC_IF3[2..]);
     }
     builder.handler(if3);
+    #[cfg(feature = "sampling-freq-control")]
     builder.handler(srate);
+    #[cfg(not(feature = "sampling-freq-control"))]
+    let _ = srate;
 
     iso_in
 }

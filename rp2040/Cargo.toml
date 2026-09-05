@@ -52,6 +52,13 @@ default = []
 # is a WS2812 on GPIO16 — so status has to be driven over PIO1 instead of a
 # GPIO. Everything else (Pico, RP2040-Plus) keeps the simple GPIO25 LED.
 rp2040-zero = []
+# Advertise the endpoint's sampling-frequency control and answer SET_CUR for it.
+#
+# The real mic does this, and the STM32 build needs it. This board does not:
+# it worked without, and accepting the request costs a control transfer with a
+# data stage on every alt-1 selection where a STALL is answered immediately —
+# and the car toggles alt settings constantly. Off here until measured.
+sampling-freq-control = []
 # Diagnostic: fill the synthetic drive's tracks with a tone instead of silence,
 # so that a car which plays them can be heard doing so. Production wants
 # silence — the real audio comes over the microphone endpoint.

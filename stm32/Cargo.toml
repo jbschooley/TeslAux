@@ -11,8 +11,16 @@ description = "Single-chip TeslAux bridge: phone and car both attach to one STM3
 name = "bridge"
 path = "src/main.rs"
 
-# No feature flags. The two-board build needs them because its cushion is a
-# guess that different situations want sized differently; here the cushion is
+[features]
+# The car will not poll this build's isochronous endpoint without the
+# sampling-frequency control: it STALLed the SET_CUR, cycled alt 1/0 three times
+# and stopped asking for audio. `teslamic.rs` reads this feature, so it is on
+# here and off on the RP2040, which never needed it.
+default = ["sampling-freq-control"]
+sampling-freq-control = []
+
+# No other feature flags: the two-board build has them because its cushion is a
+# guess that different situations want sized differently, while here it is
 # measured, so there is one configuration.
 
 [dependencies]
