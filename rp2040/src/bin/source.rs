@@ -53,6 +53,9 @@ use core::cell::RefCell;
 mod audio_pipe;
 #[path = "../i2s_pio.rs"]
 mod i2s_pio;
+#[macro_use]
+#[path = "../pins.rs"]
+mod pins;
 #[path = "../status.rs"]
 mod status;
 #[path = "../ws2812.rs"]
@@ -467,18 +470,26 @@ async fn main(spawner: Spawner) {
     // buffer, the slips and the 10.7 ms cushion are paying for.
     #[cfg(feature = "clock-steered")]
     let mut i2s_sm = {
+        let (data, bck, shield, lrck) = source_i2s_pins!(p);
         i2s_pio::master_tx(
             &mut common,
             &mut sm0,
-            p.PIN_2,
-            p.PIN_3,
-            p.PIN_4,
+            data,
+            bck,
+            shield,
+            lrck,
             embassy_rp::clocks::clk_sys_freq(),
             RATE,
         );
         sm0.set_enable(true);
         sm0
     };
+    // NOTE: this fallback keeps the ORIGINAL three-wire pinout (GP2/3/4) and has
+    // no shield. Upstream's driver owns its own side-set and needs BCK and LRCK
+    // adjacent, so a pin cannot be placed between them. The soldered two-board
+    // layout in `pins` therefore only applies to the `clock-steered` build —
+    // build the source with that feature, or this binary will expect the old
+    // jumpers.
     #[cfg(not(feature = "clock-steered"))]
     let program = PioI2sOutProgram::new(&mut common);
     #[cfg(not(feature = "clock-steered"))]
@@ -698,9 +709,32 @@ async fn i2s_out_steered(
         ticks += 1;
         if ticks >= 75 {
             ticks = 0;
-            let off = PIPE.lock(|p| p.borrow().off_target()) as i64;
-            let cmd = ((RATE as i64) * 1000 + off * 2000)
-                .clamp((RATE as i64 - 2000) * 1000, (RATE as i64 + 2000) * 1000);
+            // Steering an unprimed pipe is meaningless, and not harmless.
+            // `off_target` reads a whole target low when the buffer is empty,
+            // so the loop winds the clock down to nearly its clamp — 47488 Hz
+            // with this cushion — and holds it there for as long as nothing is
+            // playing. `pan-test` already carries a note about this: steering on
+            // a pipe it bypasses drove the clock to 46 kHz and the car board
+            // rightly muted an unrecognised rate.
+            //
+            // The same thing happens on every pause, and it is audible: a buzz
+            // while the phone is stopped, and a car-side pipe that drains at
+            // 512 frames a second until it underruns about a quarter of a second
+            // later. That underrun is not a fault, but it looks exactly like one
+            // — it latched the pipe-watch verdict on a stop rather than on
+            // anything that happened while audio was flowing.
+            //
+            // With nothing to track, hold the nominal rate.
+            let (off, primed) = PIPE.lock(|p| {
+                let b = p.borrow();
+                (b.off_target() as i64, b.primed())
+            });
+            let cmd = if primed {
+                ((RATE as i64) * 1000 + off * 2000)
+                    .clamp((RATE as i64 - 2000) * 1000, (RATE as i64 + 2000) * 1000)
+            } else {
+                (RATE as i64) * 1000
+            };
             i2s_pio::set_master_rate(&mut sm, embassy_rp::clocks::clk_sys_freq(), cmd as u64);
         }
         }

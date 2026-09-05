@@ -29,4 +29,27 @@ build source ultra-low       teslamic-rp-source-ultralow
 build car    ""              teslamic-rp-car-pcm2706
 build car    clock-locked    teslamic-rp-car-locked
 build car    packet-stress   teslamic-rp-car-STRESS-TEST
+# Same cushion and block size as the shipping car image, so it is the shipping
+# pipe under test — only the sample VALUES are substituted.
+build car    low-latency,pipe-tone teslamic-rp-car-PIPETONE
+# Both together: known data AND the measurement, so one run answers both what
+# the pipe did and how it got there.
+build car    low-latency,pipe-tone,pipe-watch teslamic-rp-car-PIPEWATCH
+
+# --- diagnostics ---
+# These were built by hand and went stale: when the I2S pins moved they kept the
+# old ones, so I2SSNIFF would have reported "no clock" on a working link. Build
+# them with everything else so that cannot happen again.
+#
+# PANTEST and MEASURE take clock-steered because the shielded pinout only exists
+# on that path; without it they fall back to upstream's driver and the original
+# three wires. I2STEST is deliberately left on the old pinout — see the note in
+# its source — so it needs rejumpering to GP2/3/4 at both ends to be useful.
+build ledtest  ""                          teslamic-rp-LEDTEST
+build i2ssniff ""                          teslamic-rp-I2SSNIFF
+build i2srx    ""                          teslamic-rp-I2SRX
+build i2stest  ""                          teslamic-rp-I2STEST
+build source   pan-test,clock-steered      teslamic-rp-source-PANTEST
+build source   measure-excursion,clock-steered teslamic-rp-source-MEASURE
+
 ls -l ./*.uf2

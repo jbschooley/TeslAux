@@ -7,6 +7,11 @@
 //! colour, which is more legible than blink codes anyway. Every other board
 //! (Pico, RP2040-Plus) keeps the simple GPIO25 LED and blinks.
 
+// Shared by every binary, and each shows a different subset of the states:
+// the drive has no notion of slipping, the car board none of counts. Dead
+// code here is a property of the caller, not of the module.
+#![allow(dead_code)]
+
 /// What the firmware is currently doing. The board decides how to show it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -101,4 +106,5 @@ mod imp {
 
 pub use imp::run;
 #[cfg(feature = "rp2040-zero")]
+#[allow(unused_imports)]
 pub use imp::set;

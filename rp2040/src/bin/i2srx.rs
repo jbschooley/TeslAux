@@ -28,6 +28,9 @@ use smart_leds::RGB8;
 
 #[path = "../i2s_pio.rs"]
 mod i2s_pio;
+#[macro_use]
+#[path = "../pins.rs"]
+mod pins;
 #[path = "../ws2812.rs"]
 mod ws2812;
 
@@ -62,7 +65,8 @@ async fn main(_spawner: Spawner) {
         let Pio { common, sm0, .. } = Pio::new(p.PIO0, Irqs);
         (common, sm0)
     };
-    i2s_pio::slave_rx(&mut common, &mut sm, p.PIN_2, p.PIN_3, p.PIN_4);
+    let (data, bck, lrck) = sink_i2s_pins!(p);
+    i2s_pio::slave_rx(&mut common, &mut sm, data, bck, lrck);
     sm.set_enable(true);
 
     let mut dma = p.DMA_CH0;

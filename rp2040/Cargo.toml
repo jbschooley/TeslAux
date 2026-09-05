@@ -77,6 +77,26 @@ ultra-low = ["clock-steered"]
 # Without it, the car board is an I2S slave to a PCM2706 and paces elastically.
 clock-locked = []
 
+# DIAGNOSTIC (car board): substitute a generated tone for the captured I2S
+# samples, keeping the capture TIMING intact. The source board still drives the
+# I2S clock, so the pipe's producer runs at exactly the rate it normally does and
+# the pacer behaves normally — but the data is known, so any hold in a recording
+# is this board's pipe running dry rather than one that arrived over I2S.
+#
+# This is what `packet-stress` cannot answer: that build writes its tone straight
+# into the packet buffer and never touches the pipe at all, so it cannot produce
+# a pipe underrun even if the pipe is the fault. Needs the source board connected
+# and streaming. See src/bin/car.rs.
+pipe-tone = []
+
+# DIAGNOSTIC (car board): measure HOW the pipe empties, not just that it did.
+# Samples the level once per USB packet and latches, on the first underrun,
+# whether the fall before it was long and shallow (the pacer being out-argued)
+# or short and steep (the producer stalling). Shown as a colour: green none,
+# red a stall, amber in between, blue a gradual drain. Combine with pipe-tone to
+# take the source board's data out of the picture. See src/bin/car.rs.
+pipe-watch = []
+
 # DIAGNOSTIC (car board): generate a 1 kHz tone internally and deliberately swing
 # the iso packet size 47/49 every frame. Answers "does Tesla tolerate variable
 # packet sizes?" with no PCM2706, no source board, no wiring — flash, plug into

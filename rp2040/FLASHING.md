@@ -11,10 +11,21 @@ phone ──USB-C──> [SOURCE board] ──I²S──> [CAR board] ──USB-
 
 | source board | | car board |
 |---|---|---|
-| GPIO2 | → | GPIO2 (DATA) |
-| GPIO3 | → | GPIO3 (BCK) |
-| GPIO4 | → | GPIO4 (LRCK) |
+| GPIO12 | → | GPIO10 (DATA) |
+| GPIO11 | → | GPIO11 (BCK) |
+| GPIO10 | → | GPIO12 (SHIELD) |
+| GPIO9 | → | GPIO13 (LRCK) |
 | GND | → | GND |
+
+The pins are the bottom row, so the two boards can be soldered edge to edge with
+one rotated 180 degrees — every pair above sums to 22, which is what facing pads
+do. Four-inch jumpers were corrupting one sample in roughly every 1,400: the
+right channel replaced by its own sign bit, up to 44% of full scale in a single
+sample, which is audible as a pop every few minutes.
+
+SHIELD carries no signal. The source holds it low so a driven conductor sits
+between BCK and LRCK, which is where the coupling was. `rp2040/src/pins.rs` has
+the measurement and refuses to build if the map stops being physically possible.
 
 **Ground is not optional.** The boards are powered from different USB ports;
 without a common reference the I²S has nothing to switch against.
@@ -74,6 +85,8 @@ which is expected.
 | `teslamic-rp-source-PANTEST.uf2` | source | which side does I²S slot 0 come out of? Tone in slot 0, silence in slot 1 |
 | `teslamic-rp-source-MEASURE.uf2` | source | how far does the buffer actually wander? LED: green <64 frames, amber <128, red >=128. Run a full song; the peak is the real lower bound on the cushion |
 | `teslamic-rp-car-STRESS-TEST.uf2` | car | does the car accept variable packet sizes? Self-contained, needs no wiring |
+| `teslamic-rp-car-PIPEWATCH.uf2` | car | **how** does the pipe empty? Same tone as PIPETONE plus the measurement. LED latches on the first underrun: green none yet, **red** the producer stalled (level fell below the pacer's floor and hit zero within 10 ms), **amber** in between, **blue** a gradual drain the pacer failed to answer (50 ms+) |
+| `teslamic-rp-car-PIPETONE.uf2` | car | is a hold coming from THIS board's pipe, or arriving over I²S? Substitutes a known tone for the captured samples while keeping the capture timing. Needs the source board connected and streaming; check with `tools/tonecompare.py` |
 
 **Start with the isolation builds, not with a theory.** Every hard bug in this
 project was found by taking one variable out of the path; several hours were

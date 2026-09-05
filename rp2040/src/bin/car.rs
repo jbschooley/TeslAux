@@ -24,15 +24,15 @@
 //! Status LED on GPIO25.
 
 use embassy_executor::Spawner;
-use embassy_futures::yield_now;
 use embassy_rp::bind_interrupts;
+#[cfg(not(feature = "rp2040-zero"))]
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{PIO0, USB};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Instant};
 use embassy_usb::class::hid::State as HidState;
 use embassy_usb::driver::{EndpointError, EndpointIn};
 use embassy_usb::Builder;
@@ -43,6 +43,9 @@ use core::cell::RefCell;
 mod audio_pipe;
 #[path = "../i2s_pio.rs"]
 mod i2s_pio;
+#[macro_use]
+#[path = "../pins.rs"]
+mod pins;
 #[path = "../status.rs"]
 mod status;
 #[path = "../ws2812.rs"]
@@ -84,7 +87,8 @@ const MODE: PaceMode = PaceMode::Locked;
 #[cfg(feature = "packet-stress")]
 const MODE: PaceMode = PaceMode::Stress;
 
-/// 256-point sine, quarter scale. Only used by the `packet-stress` diagnostic.
+/// 256-point sine, quarter scale. Used by the `packet-stress` and `pipe-tone`
+/// diagnostics.
 ///
 /// Indexed by a phase accumulator at **997 Hz**, not 1000 Hz, and interpolated.
 /// Both details matter: 1 kHz at 48 kHz is exactly 48 samples, i.e. exactly one
@@ -93,7 +97,7 @@ const MODE: PaceMode = PaceMode::Stress;
 /// firmware for two months. 997 shares no factor with the frame rate. And
 /// indexing by the top 8 bits alone gives only ~-40 dBFS of phase-truncation
 /// error, audible as a spurious tone, so the low bits interpolate.
-#[cfg(feature = "packet-stress")]
+#[cfg(any(feature = "packet-stress", feature = "pipe-tone"))]
 #[rustfmt::skip]
 const SINE256: [i16; 256] = [
          0,    393,    785,   1177,   1568,   1959,   2348,   2735,
@@ -131,7 +135,7 @@ const SINE256: [i16; 256] = [
 ];
 
 /// Phase step per sample for the diagnostic tone.
-#[cfg(feature = "packet-stress")]
+#[cfg(any(feature = "packet-stress", feature = "pipe-tone"))]
 const TONE_PHASE_INC: u32 = ((997u64 << 32) / 48_000u64) as u32;
 /// Default advertised rate. The board follows the source instead of insisting on
 /// this — see `boot_rate` and the renegotiation in `pump`.
@@ -319,17 +323,24 @@ async fn main(spawner: Spawner) {
     let Pio { mut common, mut sm0, .. } = Pio::new(p.PIO0, Irqs);
 
     #[cfg(all(not(feature = "clock-locked"), not(feature = "packet-stress")))]
-    i2s_pio::slave_rx(&mut common, &mut sm0, p.PIN_2, p.PIN_3, p.PIN_4);
+    {
+        let (data, bck, lrck) = sink_i2s_pins!(p);
+        i2s_pio::slave_rx(&mut common, &mut sm0, data, bck, lrck);
+    }
     #[cfg(all(feature = "clock-locked", not(feature = "packet-stress")))]
-    i2s_pio::master_rx(
-        &mut common,
-        &mut sm0,
-        p.PIN_2,
-        p.PIN_3,
-        p.PIN_4,
-        embassy_rp::clocks::clk_sys_freq(),
-        ADVERTISED.load(core::sync::atomic::Ordering::Relaxed),
-    );
+    {
+        let (data, bck, lrck) = sink_i2s_pins!(p);
+        i2s_pio::master_rx(
+            &mut common,
+            &mut sm0,
+            data,
+            bck,
+            sink_shield_pin!(p),
+            lrck,
+            embassy_rp::clocks::clk_sys_freq(),
+            ADVERTISED.load(core::sync::atomic::Ordering::Relaxed),
+        );
+    }
     #[cfg(not(feature = "packet-stress"))]
     sm0.set_enable(true);
 
@@ -390,6 +401,12 @@ async fn capture(
     // a memcpy plus the DMA setup.
     let mut work = [0u32; I2S_BLOCK];
     let mut have_work = false;
+    // `pipe-tone` substitutes a generated tone for the captured samples, so the
+    // phase advances once per frame PUSHED — clocked by the I2S DMA, exactly as
+    // real audio is. A producer on its own timer cannot stand in for this: see
+    // the note in the pump, where a 1 ms timer starved every packet.
+    #[cfg(feature = "pipe-tone")]
+    let mut tone_phase = 0u32;
     let mut dma = dma;
     let mut last_block = Instant::now();
     #[cfg(feature = "clock-locked")]
@@ -406,8 +423,37 @@ async fn capture(
 
         // Hand the previous block to the pipe while the DMA fills the next one.
         if have_work {
+            // Generate OUTSIDE the lock. PIPE is a critical-section mutex, so
+            // everything under it runs with interrupts disabled; doing a table
+            // lookup, a multiply and a shift per frame in there made the
+            // diagnostic's critical section several times longer than the
+            // shipping build's, which is the one thing a diagnostic must not do.
+            #[cfg(feature = "pipe-tone")]
+            let tone: [i16; I2S_BLOCK] = {
+                let mut t = [0i16; I2S_BLOCK];
+                for slot in t.iter_mut() {
+                    let idx = ((tone_phase >> 24) & 0xFF) as usize;
+                    let frac = ((tone_phase >> 16) & 0xFF) as i32;
+                    let a = SINE256[idx] as i32;
+                    let b = SINE256[(idx + 1) & 0xFF] as i32;
+                    *slot = (a + (((b - a) * frac) >> 8)) as i16;
+                    tone_phase = tone_phase.wrapping_add(TONE_PHASE_INC);
+                }
+                t
+            };
             PIPE.lock(|p| {
                 let mut pipe = p.borrow_mut();
+                // Substituting the VALUES while keeping the timing is the
+                // whole point of this build. The I2S link still clocks the
+                // producer, the pipe and the pacer still run, but what comes out
+                // is known exactly — so a hold in the recording is this board's
+                // pipe running dry, and cannot be a hold that arrived over I2S
+                // from the source board.
+                #[cfg(feature = "pipe-tone")]
+                for v in tone.iter() {
+                    pipe.push([*v, *v]);
+                }
+                #[cfg(not(feature = "pipe-tone"))]
                 for w in work.iter() {
                     pipe.push([(w >> 16) as u16 as i16, *w as u16 as i16]);
                 }
@@ -505,10 +551,17 @@ async fn pump(
 ) -> ! {
     use core::sync::atomic::Ordering;
     let (mut agree_rate, mut agree_count) = (0u32, 0u32);
+    // Consecutive windows whose measured rate made no sense. One is not
+    // evidence of anything — see where this is used.
+    let mut nonsense_count = 0u32;
 
     let mut buf = [0u8; teslamic::BYTES_PER_FRAME + 8];
-    let mut detect = RateDetect::new(1000);
-    let mut last_captured = CAPTURED.load(Ordering::Relaxed);
+    // Declared without a value: the loop below resets both whenever the stream
+    // opens, so any initialiser here would be dead.
+    #[cfg(not(feature = "packet-stress"))]
+    let mut detect: RateDetect;
+    #[cfg(not(feature = "packet-stress"))]
+    let mut last_captured: u32;
     // When the host last actually took a packet.
     let mut last_write = Instant::now();
     #[cfg(feature = "packet-stress")]
@@ -524,8 +577,11 @@ async fn pump(
         // an absurd rate. An unclassifiable rate mutes, so this cost a full
         // second of silence every time the host selected alt 1 — which the car
         // does constantly.
-        detect = RateDetect::new(1000);
-        last_captured = CAPTURED.load(Ordering::Relaxed);
+        #[cfg(not(feature = "packet-stress"))]
+        {
+            detect = RateDetect::new(1000);
+            last_captured = CAPTURED.load(Ordering::Relaxed);
+        }
         MUTED.store(false, Ordering::Relaxed);
 
         // Drop whatever piled up while nobody was listening. Nothing drains the
@@ -570,6 +626,19 @@ async fn pump(
             };
             #[cfg(not(feature = "packet-stress"))]
             let n = PIPE.lock(|p| p.borrow_mut().take(&mut buf, MODE));
+            #[cfg(feature = "pipe-watch")]
+            {
+                let (level, floor, unders, primed) = PIPE.lock(|p| {
+                    let b = p.borrow();
+                    (
+                        b.fill() as u32,
+                        b.target().saturating_sub(b.hysteresis()) as u32,
+                        b.stats.underruns,
+                        b.primed(),
+                    )
+                });
+                watch::sample(level, floor, unders, primed);
+            }
             if MUTED.load(Ordering::Relaxed) {
                 buf[..n].fill(0);
             }
@@ -637,22 +706,45 @@ async fn pump(
                                 wd.set_scratch(1, r);
                                 wd.trigger_reset();
                             }
-                            MUTED.store(true, Ordering::Relaxed);
+                            nonsense_count = 0;
+                            // Wait for a second agreeing window before going
+                            // quiet. Muting on the first one turns a single bad
+                            // measurement into a second of silence.
+                            MUTED.store(agree_count >= 2, Ordering::Relaxed);
                         }
                         Some(_) => {
                             agree_count = 0;
+                            nonsense_count = 0;
                             MUTED.store(false, Ordering::Relaxed);
                         }
-                        // Unclassifiable means absent or still starting, which is
-                        // not a reason to latch silence.
+                        // A measurement that matches no rate at all.
+                        //
+                        // This used to mute immediately, and that is a real
+                        // dropout: silence persists until the next window
+                        // closes, up to a second later.
+                        //
+                        // It is also easy to provoke, because this detector is
+                        // clocked by *delivered packets* rather than by time.
+                        // `ticks` only advances when the host takes a packet, so
+                        // a host that pauses polling stops the clock while the
+                        // I2S side keeps counting frames — and the window's
+                        // ratio comes out inflated through no fault of the
+                        // source. `classify` rejects anything beyond 2%, and
+                        // the audio went quiet.
+                        //
+                        // Three consecutive nonsense windows is a source that
+                        // really has gone wrong. One is the host having paused.
                         None => {
                             agree_count = 0;
-                            MUTED.store(hz > 1000, Ordering::Relaxed);
+                            nonsense_count = nonsense_count.saturating_add(1);
+                            MUTED.store(
+                                nonsense_count >= 3 && hz > 1000,
+                                Ordering::Relaxed,
+                            );
                         }
                     }
                 }
             }
-            let _ = &mut detect;
         }
     }
 }
@@ -666,11 +758,119 @@ async fn pump(
 /// register cannot be relied on to advance.
 static USB_FRAMES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+// ── pipe-watch: how does the pipe empty? ────────────────────────────────────
+//
+// `pipe-tone` established that the holds are this board's pipe running dry, and
+// that neither cushion mattered: doubling it here and on the source changed
+// nothing. That leaves one question, and it is the one the pacer's design turns
+// on. The pacer corrects by one frame per packet, about 1000 frames per second
+// of authority against a mismatch measured at under 2 ppm, so a gradual drain
+// is something it should never lose. A drain it cannot answer is one that
+// happens faster than it can respond.
+//
+// So measure the fall rather than the level. Sampled once per USB packet, which
+// is 1 ms:
+//
+//   * a slow drain leaves the level below the pacer's refill floor for a long
+//     time before it reaches zero — the pacer being out-argued, which would
+//     mean its deadband or its one-frame step is wrong;
+//   * a stall takes the level from healthy to empty within a few packets — the
+//     producer stopping, which is a scheduling fault and nothing to do with the
+//     pacer.
+//
+// Measured as time spent below the refill floor, NOT as a run of consecutive
+// decreases. The level jitters up and down every packet in normal operation,
+// because the producer arrives in 16-frame blocks while the consumer takes
+// about 48 at a time, so a run of decreases breaks constantly and a genuine
+// slow drain would read as a stall. Crossing a threshold does not care.
+//
+// The verdict latches on the first underrun so a later, milder one cannot
+// overwrite it, and it is shown as a colour because that is the only channel
+// this board has.
+#[cfg(feature = "pipe-watch")]
+mod watch {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    pub static VERDICT: AtomicU32 = AtomicU32::new(0);
+    /// Largest single-packet fall seen, in frames. A stall shows up here as
+    /// roughly one packet's worth; an orderly drain stays small.
+    pub static MAX_DROP: AtomicU32 = AtomicU32::new(0);
+    static PREV: AtomicU32 = AtomicU32::new(0);
+    static BELOW: AtomicU32 = AtomicU32::new(0);
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+
+    /// Below the floor for fewer packets (milliseconds) than this and the pacer
+    /// never had a chance to answer.
+    const BURST_MS: u32 = 10;
+    /// Longer than this and it had ample time.
+    const GRADUAL_MS: u32 = 50;
+
+    pub const NONE: u32 = 0;
+    pub const BURST: u32 = 1;
+    pub const MIXED: u32 = 2;
+    pub const GRADUAL: u32 = 3;
+
+    /// Call once per USB packet, after `take`. Single writer: plain load/store,
+    /// because thumbv6m has no atomic read-modify-write.
+    pub fn sample(level: u32, floor: u32, underruns: u32, primed: bool) {
+        if !primed {
+            PREV.store(0, Ordering::Relaxed);
+            BELOW.store(0, Ordering::Relaxed);
+            SEEN.store(underruns, Ordering::Relaxed);
+            return;
+        }
+        let prev = PREV.load(Ordering::Relaxed);
+        if level < prev {
+            let drop = prev - level;
+            if drop > MAX_DROP.load(Ordering::Relaxed) {
+                MAX_DROP.store(drop, Ordering::Relaxed);
+            }
+        }
+        PREV.store(level, Ordering::Relaxed);
+
+        if level >= floor {
+            BELOW.store(0, Ordering::Relaxed);
+        } else {
+            BELOW.store(BELOW.load(Ordering::Relaxed).saturating_add(1), Ordering::Relaxed);
+        }
+
+        if underruns > SEEN.load(Ordering::Relaxed) {
+            SEEN.store(underruns, Ordering::Relaxed);
+            if VERDICT.load(Ordering::Relaxed) == NONE {
+                let ms = BELOW.load(Ordering::Relaxed);
+                VERDICT.store(
+                    if ms < BURST_MS {
+                        BURST
+                    } else if ms < GRADUAL_MS {
+                        MIXED
+                    } else {
+                        GRADUAL
+                    },
+                    Ordering::Relaxed,
+                );
+            }
+        }
+    }
+}
+
 /// Map the firmware's atomics onto a board-independent status. How it is shown
 /// depends on the board: a blink code on a plain LED, or colour on the
 /// RP2040-Zero's WS2812 (it has no plain LED — see `status.rs`).
 fn current_state() -> status::State {
     use core::sync::atomic::Ordering;
+    // The watch build reports its verdict here, because the WS2812 is the only
+    // channel this board has and the verdict matters more than the usual status
+    // while it is running.
+    #[cfg(feature = "pipe-watch")]
+    {
+        return match watch::VERDICT.load(Ordering::Relaxed) {
+            watch::BURST => status::State::Fault,     // red:   producer stalled
+            watch::MIXED => status::State::Slipping,  // amber: in between
+            watch::GRADUAL => status::State::Waiting, // blue:  pacer out-argued
+            _ => status::State::Ok,                   // green: no underrun yet
+        };
+    }
+    #[cfg(not(feature = "pipe-watch"))]
     if MUTED.load(Ordering::Relaxed) || OVERSIZE.load(Ordering::Relaxed) {
         status::State::Fault
     } else if SOURCE_LIVE.load(Ordering::Relaxed) {

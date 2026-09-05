@@ -142,9 +142,72 @@ def find_offset(ref, rec, probe=48000, search=None):
     hay = rec[: (search or len(rec)), 0].astype(np.float64)
     if len(hay) < len(needle):
         return None
-    corr = np.correlate(hay, needle, mode="valid")
-    peak = int(np.argmax(np.abs(corr)))
+    corr = _xcorr_valid(hay, needle)
+    # Normalise by the energy under each window, which turns a dot product into
+    # a correlation coefficient. Unnormalised, the largest product is simply the
+    # loudest place in the recording rather than the matching one: this file
+    # ends about three times louder than it begins, so a probe taken from the
+    # quiet opening peaked in the finale and the whole comparison was reported
+    # as different material. Short captures never showed it.
+    energy = np.concatenate(([0.0], np.cumsum(hay * hay)))
+    window = energy[len(needle) :] - energy[: -len(needle)]
+    denom = np.sqrt(window) * np.linalg.norm(needle)
+    denom[denom <= 0] = np.inf
+    ncc = np.abs(corr / denom)
+    # Take the EARLIEST offset that matches about as well as the best one, not
+    # the best one itself. A recording left running past the end of the material
+    # contains it twice, both copies correlate at 1.000, and which of them wins
+    # is decided by whichever has fewer edits inside the one-second probe. That
+    # is how a fourteen-minute capture aligned on its own last two minutes and
+    # reported them as the whole result, silently discarding the eleven minutes
+    # actually under test.
+    best = float(ncc.max())
+    if best > 0:
+        # Take the earliest *place* that matches about as well as the best one,
+        # then the exact peak within it. Taking the first index above the
+        # threshold instead is not the same thing and is wrong: neighbouring
+        # lags of smooth material correlate well above 0.98, so it lands a few
+        # frames early — which then reads as a spurious edit at the anchor,
+        # because the walk starts misaligned by exactly that much.
+        good = np.nonzero(ncc >= 0.98 * best)[0]
+        cluster = good[good <= good[0] + len(needle)]
+        peak = int(cluster[np.argmax(ncc[cluster])])
+    else:
+        peak = int(np.argmax(ncc))
     return peak - start
+
+
+def _xcorr_valid(hay, needle):
+    """Cross-correlation of `needle` against `hay` at every valid offset.
+
+    Identical in result to np.correlate(hay, needle, mode="valid"), but that
+    does the sum directly, in O(len(hay) * len(needle)). Against a ten-minute
+    recording — thirty million frames, a one-second probe — that is on the order
+    of 10^12 multiply-adds and never finishes; the first attempt at this had to
+    be killed. Overlap-save with an FFT gives the same numbers in O(n log n) and
+    in memory bounded by the segment size rather than the recording.
+    """
+    m = len(needle)
+    n_out = len(hay) - m + 1
+    # Segments a few times the needle keep the discarded wrap-around region a
+    # small fraction of each transform.
+    seg = max(1 << (4 * m - 1).bit_length(), 1 << 16)
+    step = seg - m + 1
+    # Correlation is convolution with the needle reversed.
+    fr = np.fft.rfft(needle[::-1], seg)
+    out = np.empty(n_out, dtype=np.float64)
+    pos = 0
+    while pos < n_out:
+        block = hay[pos : pos + seg]
+        if len(block) < seg:
+            block = np.pad(block, (0, seg - len(block)))
+        prod = np.fft.irfft(np.fft.rfft(block, seg) * fr, seg)
+        # The first m-1 samples of a circular convolution are corrupted by
+        # wrap-around; everything after them is the linear result.
+        take = min(step, n_out - pos)
+        out[pos : pos + take] = prod[m - 1 : m - 1 + take]
+        pos += take
+    return out
 
 
 def classify(ref, rec, limit=20):
@@ -266,10 +329,79 @@ def walk(ref, rec, off, tol=1, blk=2400, search=8000):
                 i, j = pos, jb + sh
                 break
         if found is None:
+            # No shift reconciles the streams, so nothing was inserted or lost.
+            # Before giving up, check whether they simply carry on in step a few
+            # frames later: that means the frames in between kept their place
+            # and changed their value, which is a different fault entirely — a
+            # sample corrupted in transit rather than a frame dropped, and the
+            # signature of a bit error on the wire. Treating it as unresolved
+            # ended the walk at the first occurrence and left the rest of an
+            # eleven-minute recording unexamined.
+            run = 0
+            while (
+                pos + run < len(ref)
+                and jb + run < len(rec)
+                and run < blk
+                and np.abs(
+                    ref[pos + run].astype(np.int32) - rec[jb + run].astype(np.int32)
+                ).max()
+                > tol
+            ):
+                run += 1
+            a = ref[pos + run : pos + run + 512].astype(np.int32)
+            b = rec[jb + run : jb + run + 512].astype(np.int32)
+            if run and a.shape == b.shape and a.size and np.abs(a - b).max() <= tol:
+                edits.append((pos, "corrupt", run))
+                i, j = pos + run, jb + run
+                continue
             edits.append((pos, "unresolved", 0))
             break
         edits.append((pos, "missing" if found < 0 else "extra", abs(found)))
     return {"worst_lsb": worst, "diff_samples": diffs, "compared": total}, edits
+
+
+def report_lead_in(ref, rec, tol, rate):
+    """Say what happened in the seconds before the alignment anchor.
+
+    Reported apart from the main walk because the two answer different
+    questions. The walk asks whether a settled stream stayed intact. This asks
+    whether it started intact — which is where priming, the first packets and
+    the pacer's first corrections live, and so where a fault heard "right at the
+    beginning" actually is. Silence here used to be indistinguishable from
+    having looked.
+    """
+    n = len(ref)
+    if n == 0:
+        print("      lead-in: none (recording starts at the reference)")
+        return True, 0
+    secs = n / rate
+    if np.array_equal(ref, rec):
+        print(f"      lead-in: first {secs:.1f} s match exactly")
+        return True, 0
+    if n > 2400:
+        _, edits = walk(ref, rec, 0, tol=tol)
+        if edits:
+            kinds = ", ".join(f"{k} {c}" for _, k, c in edits[:4])
+            print(f"      lead-in: {len(edits)} edit(s) in the first {secs:.1f} s ({kinds})")
+            for pos, kind, cnt in edits[:4]:
+                print(f"        ref frame {pos:>9}  {pos / rate:6.3f} s  {kind} {cnt} frames")
+            net = sum(c for _, k, c in edits if k == "extra") - sum(
+                c for _, k, c in edits if k == "missing"
+            )
+            return False, net
+    # No splice explains it, so say how big the difference actually is: at the
+    # start of a stream this is usually one file having signal where the other
+    # still has silence, which is not a fault and should not read like one.
+    d = np.abs(ref.astype(np.int32) - rec.astype(np.int32))
+    bad = int(np.count_nonzero(d.max(axis=1)))
+    worst = int(d.max())
+    print(
+        f"      lead-in: {bad} of {n} frames differ in the first {secs:.1f} s, "
+        f"by at most {worst} LSB ({20 * np.log10(max(worst, 1) / 32768.0):+.0f} dBFS)"
+    )
+    # A handful of near-silent frames at a stream's edge is the recorder finding
+    # the signal, not a fault. Anything louder is real.
+    return worst <= 32, 0
 
 
 def compare(ref_path, rec_path):
@@ -296,15 +428,39 @@ def compare(ref_path, rec_path):
     # match a musically similar passage. Without this check a recording of
     # entirely different material was reported as one unresolved splice, which
     # reads like a firmware fault instead of "wrong file".
+    #
+    # The offset is measured once, near the start, but it does not hold for the
+    # whole file: the pacer inserts and drops frames to absorb the difference
+    # between the player's clock and the recorder's, so the lag creeps. Over
+    # eleven minutes it crept by about fifty frames. Requiring the single
+    # starting offset to line up a third of the way in therefore compares music
+    # against itself shifted by a fraction of a millisecond, which correlates at
+    # about 0.14 and reads exactly like the wrong file — it rejected a recording
+    # that turned out to correlate at 1.000 once the drift was allowed for.
+    #
+    # So search a window around the expected position and take the best match.
+    # Wrong material still correlates with nothing at any lag, which is the
+    # distinction this check exists to make.
     probe_n = min(48000, len(ref) // 4)
-    a = ref[len(ref) // 3 : len(ref) // 3 + probe_n, 0].astype(np.float64)
-    bstart = len(ref) // 3 + off
-    b = rec[bstart : bstart + probe_n, 0].astype(np.float64)
-    if len(b) == len(a) and a.size:
+    slack = min(2 * ref_rate, probe_n)
+    i = len(ref) // 3
+    a = ref[i : i + probe_n, 0].astype(np.float64)
+    lo = max(0, i + off - slack)
+    hay = rec[lo : i + off + probe_n + slack, 0].astype(np.float64)
+    if len(hay) > len(a) and a.size and a.any():
         a = a - a.mean()
-        b = b - b.mean()
-        den = np.sqrt((a * a).sum() * (b * b).sum())
-        ncc = float((a * b).sum() / den) if den else 0.0
+        corr = _xcorr_valid(hay, a)
+        energy = np.concatenate(([0.0], np.cumsum(hay * hay)))
+        window = energy[len(a) :] - energy[: -len(a)]
+        # Subtracting the window mean is what makes this a correlation
+        # coefficient rather than a dot product biased by any DC offset.
+        counts = float(len(a))
+        sums = np.concatenate(([0.0], np.cumsum(hay)))
+        wsum = sums[len(a) :] - sums[: -len(a)]
+        var = np.maximum(window - wsum * wsum / counts, 0.0)
+        den = np.sqrt(var * (a * a).sum())
+        den[den <= 0] = np.inf
+        ncc = float(np.abs(corr / den).max())
         if ncc < 0.9:
             print(f"FAIL  these are not the same audio (correlation {ncc:+.3f})")
             print("      The recording does not contain the reference material.")
@@ -317,16 +473,38 @@ def compare(ref_path, rec_path):
         ref = ref[-off:]
     else:
         rec = rec[off:]
-    # Start comparing from the anchor, not from the very beginning.
+    # The anchor is where alignment was MEASURED, not where comparison starts.
+    # Skipping it entirely hid the opening seconds of every stream — priming,
+    # the first packets, the moment a glitch is most likely — from every report:
+    # a capture whose first two seconds were visibly wrong came back "bit-exact"
+    # because the only region anyone doubted was the one never looked at.
+    #
+    # So hold the lead-in aside and compare it separately. It stays out of the
+    # main walk because a stream's first moments are exactly where one file
+    # holds material the other does not, which no shift reconciles; a failure
+    # there should be reported, not allowed to derail the rest.
+    lead_n0 = min(anchor, len(ref), len(rec))
+    lead_ok, lead_net = report_lead_in(
+        ref[:lead_n0], rec[:lead_n0], 1, ref_rate
+    )
+    # Carry what the lead-in found into the main comparison. Without this the
+    # walk restarts at the anchor still using the original offset, is out by
+    # however many frames the lead-in gained or lost, and rediscovers the same
+    # edit as a second one — a single insertion at startup got reported twice,
+    # once at frame 1 and again at the anchor.
+    lead_ref, lead_rec = ref[:anchor], rec[:anchor]
     ref = ref[anchor:]
-    rec = rec[anchor:]
+    rec = rec[anchor + lead_net :] if anchor + lead_net >= 0 else rec[anchor:]
     n = min(len(ref), len(rec))
     if n == 0:
         print("FAIL  no overlap after alignment")
         return 1
 
-    if np.array_equal(ref[:n], rec[:n]):
-        print(f"compared {n} frames ({n / ref_rate:.1f} s)")
+    lead_n = min(len(lead_ref), len(lead_rec))
+
+    if lead_ok and np.array_equal(ref[:n], rec[:n]):
+        total = n + lead_n
+        print(f"compared {total} frames ({total / ref_rate:.1f} s), lead-in included")
         print("PASS  bit-exact: every sample matches")
         return 0
 
@@ -342,6 +520,7 @@ def compare(ref_path, rec_path):
     stats, edits = walk(ref, rec, 0, tol=max(tol, 1))
     lost = sum(e[2] for e in edits if e[1] == "missing")
     gained = sum(e[2] for e in edits if e[1] == "extra")
+    corrupt = sum(e[2] for e in edits if e[1] == "corrupt")
     print(f"compared {stats['compared'] // CHANNELS} frames between edits")
     if stats["worst_lsb"]:
         pct = 100.0 * stats["diff_samples"] / max(stats["compared"], 1)
@@ -363,10 +542,15 @@ def compare(ref_path, rec_path):
         print("      converts int16 -> float -> int16 without rounding. It loses no")
         print("      audio, but it is not bit-exact, so fix it before trusting a pass.")
     if edits:
-        print(f"      {len(edits)} splice(s): {lost} frames missing, {gained} extra")
+        print(
+            f"      {len(edits)} edit(s): {lost} frames missing, {gained} extra, "
+            f"{corrupt} corrupted in place"
+        )
         for pos, kind, cnt in edits[:12]:
+            # The walk runs on the anchored slice; report where it is in the file.
+            at = pos + anchor
             print(
-                f"        ref frame {pos:>9} ({pos / ref_rate:7.3f}s)  "
+                f"        ref frame {at:>9}  {at / ref_rate / 60:5.2f} min  "
                 f"{kind} {cnt} frames ({1000.0 * cnt / ref_rate:.1f} ms)"
             )
         if len(edits) > 12:
@@ -382,8 +566,13 @@ def compare(ref_path, rec_path):
     print(f"compared {n} frames ({n / ref_rate:.1f} s)")
 
     if not notes:
-        print("PASS  bit-exact: every sample matches")
-        return 0
+        if lead_ok:
+            print("PASS  bit-exact: every sample matches")
+            return 0
+        # Saying PASS while having just printed edits is how the anchor hid them
+        # in the first place.
+        print("FAIL  bit-exact after the lead-in, but the lead-in has edits above")
+        return 1
 
     pct = 100.0 * total / n
     print(f"FAIL  {total} frames differ ({pct:.4f}%)")
@@ -501,8 +690,112 @@ def _self_test():
         print(f"  FAIL resample-like: {why}")
         ok = False
 
+    ok = _check_lead_in() and ok
+    ok = _check_repeated_material() and ok
+
     print("\nself-test:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
+
+
+def _check_repeated_material():
+    """When the material appears twice, align on the FIRST copy.
+
+    A recording left running past the end holds the reference twice. Both copies
+    correlate at 1.000, so the winner is decided by which has fewer edits inside
+    the one-second probe — and the later copy, being shorter and quieter, often
+    wins. A fourteen-minute capture aligned on its own final two minutes and
+    reported them as the whole result.
+    """
+    rng = np.random.default_rng(11)
+    rate = 48000
+    ref = rng.integers(-20000, 20000, size=(4 * rate, 2)).astype(np.int16)
+    flawed = ref.copy()
+    # A blemish inside the probe window, enough to lose a tie but not a match.
+    flawed[1000:1100] = 0
+    gap = np.zeros((rate, CHANNELS), dtype=np.int16)
+    rec = np.concatenate([flawed, gap, ref])
+
+    off = find_offset(ref, rec)
+    if off is not None and abs(off) < 100:
+        print("  ok   material recorded twice -> aligns on the first copy")
+        return True
+    print(f"  FAIL material recorded twice: aligned at {off}, expected ~0")
+    return False
+
+
+def _check_lead_in():
+    """A fault inside the alignment anchor must be reported, not skipped.
+
+    This is the regression the rest of the suite could not catch, because every
+    other case drives find_offset and classify directly and never exercises what
+    compare() chooses to look at. A recording whose opening was visibly wrong
+    came back "bit-exact" while the anchor quietly excluded the only region in
+    doubt, so the test has to go through compare() end to end.
+    """
+    import contextlib
+    import io
+    import os
+    import tempfile
+    import wave as wavemod
+
+    rng = np.random.default_rng(7)
+    rate = 48000
+    ref = rng.integers(-20000, 20000, size=(10 * rate, 2)).astype(np.int16)
+    cut = rate // 2  # half a second in: well inside the two-second anchor
+    spliced = np.concatenate([ref[:cut], ref[cut + 64 :]])
+
+    def run(rec):
+        d = tempfile.mkdtemp()
+        a, b = os.path.join(d, "ref.wav"), os.path.join(d, "rec.wav")
+        for path, data in ((a, ref), (b, rec)):
+            with wavemod.open(path, "wb") as w:
+                w.setnchannels(CHANNELS)
+                w.setsampwidth(2)
+                w.setframerate(rate)
+                w.writeframes(data.astype("<i2").tobytes())
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            compare(a, b)
+        os.remove(a)
+        os.remove(b)
+        os.rmdir(d)
+        return buf.getvalue()
+
+    good = True
+
+    out = run(spliced)
+    if "lead-in" in out and "64 frames" in out:
+        print("  ok   64-frame splice inside the anchor -> reported in the lead-in")
+    else:
+        good = False
+        print("  FAIL splice inside the anchor was not reported")
+        print("\n".join("        " + l for l in out.splitlines()))
+
+    # A fault inside the lead-in must not leak into the main walk. It used to:
+    # the walk restarted at the anchor with the original offset, was out by
+    # however many frames the lead-in had gained, and rediscovered the same
+    # insertion as a second edit of its own.
+    at = 1000
+    inserted = np.concatenate([ref[:at], np.repeat(ref[at - 1 : at], 8, axis=0), ref[at:]])
+    out = run(inserted)
+    main = [l for l in out.splitlines() if "edit(s):" in l]
+    leaked = main and not main[0].strip().startswith("0 edit(s)")
+    if "lead-in:" in out and not leaked:
+        print("  ok   a fault inside the lead-in does not leak into the main walk")
+    else:
+        good = False
+        print("  FAIL lead-in fault leaked into the main walk")
+        print("\n".join("        " + l for l in out.splitlines()))
+
+    out = run(ref.copy())
+    if "PASS" in out and "lead-in included" in out:
+        print("  ok   clean recording -> passes with the lead-in counted")
+    else:
+        good = False
+        print("  FAIL clean recording did not report the lead-in as compared")
+        print("\n".join("        " + l for l in out.splitlines()))
+
+    return good
 
 
 def main(argv):
