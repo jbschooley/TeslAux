@@ -5,6 +5,24 @@ down. The rest cannot, and it is worth being clear about which is which.
 
 ## What is here
 
+* **`teslaux.kicad_sch`** — a KiCad 8 schematic, importable via EasyEDA's
+  **File > Import > KiCad**. It is self-contained: every symbol definition is
+  embedded, so nothing depends on your libraries.
+
+  The MCU symbol is the **official KiCad one**, downloaded rather than typed, so
+  its 100 pin numbers are ST's and not my recollection. `gen_kicad.py` builds the
+  file from one table of nets, which is the point of generating it — the
+  schematic and `netlist.csv` are checked against each other and currently agree
+  on all 27 nets.
+
+  Connectivity is expressed with **global labels on pin stubs** rather than
+  routed wires. A label carries the same netlist weight, and a generated tangle
+  of wire segments is far likelier to be subtly wrong than a label whose text can
+  be diffed against the table.
+
+
+* **`gen_kicad.py`** — regenerates the schematic. Edit the net table there, not
+  the `.kicad_sch`.
 * **`bom.csv`** — every component, value and package. Paste into EasyEDA's BOM
   view or use it as the shopping list. Nothing is optional: `C1`/`C2` feed the
   MCU's internal regulator, and without them the part does not run.
@@ -33,10 +51,12 @@ broken geometry — slower to repair than to draw.
 
 ## Suggested order
 
-1. Draw the schematic in EasyEDA from `netlist.csv`, picking parts from their
-   library so the footprints and JLCPCB part numbers come along.
-2. Run their DRC/ERC. Every net in `netlist.csv` should appear, and nothing else
-   should.
+1. **Import `teslaux.kicad_sch`** into EasyEDA. Expect to reassign footprints:
+   the symbols carry pin numbers and net names, which is what matters for
+   connectivity, but their footprint fields are hints rather than EasyEDA library
+   references.
+2. Run their ERC and check it against `netlist.csv` — every net should appear
+   and nothing else should.
 3. Lay out by hand, following the rules in `../HARDWARE-PCB.md` — four layers,
    solid ground under the pairs, 22 Ω resistors at the MCU, crystal tight.
 4. Let EasyEDA produce the Gerbers and pick-and-place from that.
