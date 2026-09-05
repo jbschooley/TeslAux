@@ -179,6 +179,28 @@ layout constants are **filesystem-relative**. `locate_fs` is the internal form
 for code that has already subtracted the offset — subtracting it twice
 attributes every sector to the wrong track, silently.
 
+### If the car does not offer it as a media source
+
+Owner reports converge on one cause that has nothing to do with the volume:
+**a dashcam drive suppresses USB music.** When a drive carrying a `TeslaCam`
+folder is present, the USB music option disappears — and a second drive in
+another port does not bring it back. Tesla appears to pick a single storage
+device for media, and dashcam wins.
+
+Using a hub makes it worse on its own: the dashcam icon vanishing and the music
+option disappearing are both commonly reported, needing a reset to recover.
+
+So the first test is free: **unplug the Sentry drive and leave only this one.**
+
+Two other things that are not the problem here, but are worth knowing because
+they are cheap to get wrong:
+
+* **No folder structure is needed.** Files at the root are indexed by tag or
+  filename, which is what this volume does.
+* **A `Lightshow` folder anywhere on the stick makes Tesla ignore all music.**
+  Not present here, but it shows how easily the media source is suppressed by
+  something unrelated to the audio.
+
 ### If the car rejects the volume
 
 FAT32 is listed as supported by Tesla's own service documentation, so it is
