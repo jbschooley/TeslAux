@@ -113,23 +113,43 @@ my own assumptions: macOS lists all 20 tracks and `ffprobe` reads each as a vali
 600 s 48 kHz stereo WAV containing silence. Regenerate with
 `tools/mkfatimg.rs`. Nine unit tests cover the layout invariants as well.
 
+**Also built:** `rp2040/src/msc.rs` — USB Mass Storage, Bulk-Only Transport and
+the SCSI subset a host actually issues to a read-only disk. `embassy-usb` has no
+mass-storage class, so this is hand-rolled, like the IF3 handler.
+
+It is pure logic over byte slices — no HAL, no endpoints, no async — because the
+transport is a dozen lines of "read 31 bytes, maybe move data, write 13 bytes"
+while every way this can go wrong lives in the command handling. 14 tests cover
+the parts that bite: a malformed CBW must be rejected rather than guessed at,
+`READ CAPACITY` reports the *last block* rather than the count, a read whose
+`lba + blocks` overflows `u32` must not wrap into a valid range, sense data must
+survive exactly one command, and a write must be refused as write-protected
+rather than silently accepted.
+
+**Also built:** `rp2040/src/bin/usbdrive.rs`, a standalone binary joining that to
+`fat.rs`. Standalone deliberately — adding a mass-storage interface to the mic
+would make it not-a-TeslaMic and risk the popup returning, and a second USB port
+costs nothing by comparison.
+
+One known divergence from the spec, noted rather than left to be rediscovered:
+a failed command should stall the data endpoint, but `embassy-usb` exposes no
+stall for bulk endpoints. Sending nothing and reporting the full amount as
+residue tells the host the same thing.
+
 **Not built:**
 
-1. **USB Mass Storage class** — Bulk-Only Transport plus a SCSI subset
-   (`INQUIRY`, `READ CAPACITY`, `READ(10)`, `TEST UNIT READY`, `REQUEST SENSE`,
-   `MODE SENSE`). `embassy-usb` has no MSC class, so hand-rolled, much like the
-   IF3 handler.
-2. **A standalone `usbdrive` binary**, to plug into a second car port and
-   confirm the car indexes it and the wheel drives it — before any of this goes
-   near the TeslaMic. Testable on a Mac first: if it mounts as a *device* the way
-   the image mounts as a *file*, the class implementation is right.
-3. **The detector** — `locate()` across reads, natural-advance suppression,
+1. **The detector** — `locate()` across reads, natural-advance suppression,
    wrap-around modulo the track count.
-4. **Read pacing** — serve just above real time so a pause shows in ~300 ms.
-5. **A Consumer Control HID interface on the source side**, to send the media
+2. **Read pacing** — serve just above real time so a pause shows in ~300 ms.
+3. **A Consumer Control HID interface on the source side**, to send the media
    keys onward. Standard and well supported by any Android or Linux userspace;
    it touches only the source-facing descriptors, so the cloned mic side the car
    validates stays byte-identical.
+
+**Next test:** flash `teslamic-rp-USBDRIVE.uf2` and plug it into a Mac. If
+`TESLAUX` mounts and `001.WAV` plays, the class implementation is right — the
+image already mounts as a *file*, so this asks whether it also works as a
+*device*. Only then is the car worth trying.
 
 ## Ruled out: the car tells the mic nothing
 

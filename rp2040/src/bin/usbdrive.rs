@@ -1,0 +1,316 @@
+// SPDX-License-Identifier: MIT
+#![no_std]
+#![no_main]
+
+//! A USB drive that isn't: 20 silent tracks the car can play.
+//!
+//! Standalone on purpose. The car validates the TeslaMic descriptor set, and
+//! the endpoint-less IF3 is what stops the "unsupported USB microphone" popup —
+//! adding a mass-storage interface to that device makes it not-a-TeslaMic and
+//! risks the popup returning. A second USB port costs nothing by comparison, so
+//! the mic stays a byte-for-byte clone and this is just a drive.
+//!
+//! What it is for: the car tells a connected microphone nothing about its own
+//! transport buttons (measured — see `MEDIA-CONTROLS.md`), so the only way to
+//! see a button press is to watch the car's media player move through a
+//! playlist we author. Which sectors it reads says which track it moved to.
+//!
+//! Bring-up order, cheapest first:
+//!
+//! | LED | meaning |
+//! |-----|---------|
+//! | blue, slow | enumerated, no host has read anything yet |
+//! | green | the host has read sectors — the volume is being indexed or played |
+//! | amber | a SCSI command failed; check RTT for which |
+//! | red | the transport gave up: a malformed CBW, or an endpoint error |
+//!
+//! Plug it into a Mac first. If `TESLAUX` mounts and `001.WAV` plays, the class
+//! implementation is right and the car is the only remaining unknown.
+
+use embassy_executor::Spawner;
+use embassy_rp::bind_interrupts;
+use embassy_rp::peripherals::USB;
+use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
+use embassy_usb::control::{InResponse, OutResponse, Request, RequestType};
+use embassy_usb::driver::{Endpoint, EndpointError, EndpointIn, EndpointOut};
+use embassy_usb::{Builder, Config, Handler, UsbDevice};
+
+#[path = "../fat.rs"]
+mod fat;
+#[path = "../msc.rs"]
+mod msc;
+#[path = "../status.rs"]
+mod status;
+#[cfg(feature = "rp2040-zero")]
+#[path = "../ws2812.rs"]
+mod ws2812;
+
+use fat::SECTOR;
+use msc::{Action, Cbw, Scsi, Status as CswStatus};
+
+bind_interrupts!(struct Irqs {
+    USBCTRL_IRQ => UsbInterruptHandler<USB>;
+});
+
+#[cfg(feature = "rp2040-zero")]
+bind_interrupts!(struct Pio1Irqs {
+    PIO1_IRQ_0 => embassy_rp::pio::InterruptHandler<embassy_rp::peripherals::PIO1>;
+});
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! {
+    loop {
+        cortex_m::asm::wfi();
+    }
+}
+
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+/// Sectors served since boot. Non-zero means a host is actually reading us,
+/// which is the only evidence that matters at this stage.
+static SECTORS_READ: AtomicU32 = AtomicU32::new(0);
+/// A SCSI command failed. Not fatal — hosts probe for optional commands — but
+/// worth seeing during bring-up.
+static CMD_FAILED: AtomicBool = AtomicBool::new(false);
+/// The transport could not continue: a malformed CBW, or an endpoint error.
+static WEDGED: AtomicBool = AtomicBool::new(false);
+
+fn current_state() -> status::State {
+    if WEDGED.load(Ordering::Relaxed) {
+        status::State::Fault
+    } else if CMD_FAILED.load(Ordering::Relaxed) {
+        status::State::Slipping
+    } else if SECTORS_READ.load(Ordering::Relaxed) > 0 {
+        status::State::Ok
+    } else {
+        status::State::Waiting
+    }
+}
+
+#[cfg(not(feature = "rp2040-zero"))]
+#[embassy_executor::task]
+async fn status_task(mut led: embassy_rp::gpio::Output<'static>) -> ! {
+    status::run(&mut led, current_state).await
+}
+
+#[cfg(feature = "rp2040-zero")]
+#[embassy_executor::task]
+async fn status_task(mut led: ws2812::Ws2812<'static, embassy_rp::peripherals::PIO1, 0>) -> ! {
+    status::run(&mut led, current_state).await
+}
+
+/// Answers the two class-specific control requests Bulk-Only Transport defines.
+///
+/// `embassy-usb` knows nothing about mass storage, so without this the host's
+/// GET_MAX_LUN is STALLed. Some hosts read a STALL as "one LUN" and continue;
+/// others treat it as a broken device and never mount. Answering is one byte
+/// and removes the question.
+struct MscControl;
+
+impl Handler for MscControl {
+    fn control_in<'a>(&'a mut self, req: Request, buf: &'a mut [u8]) -> Option<InResponse<'a>> {
+        if req.request_type != RequestType::Class || req.request != msc::REQ_GET_MAX_LUN {
+            return None;
+        }
+        // Highest LUN number, not a count: a single-LUN device reports 0.
+        buf[0] = 0;
+        Some(InResponse::Accepted(&buf[..1]))
+    }
+
+    fn control_out(&mut self, req: Request, _data: &[u8]) -> Option<OutResponse> {
+        if req.request_type != RequestType::Class || req.request != msc::REQ_BULK_ONLY_RESET {
+            return None;
+        }
+        // Nothing to tear down: the transport loop re-reads a CBW every pass,
+        // so accepting the reset is enough to get back in step.
+        Some(OutResponse::Accepted)
+    }
+}
+
+#[embassy_executor::task]
+async fn usb_task(mut usb: UsbDevice<'static, Driver<'static, USB>>) -> ! {
+    usb.run().await
+}
+
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    let p = embassy_rp::init(Default::default());
+    let driver = Driver::new(p.USB, Irqs);
+
+    // Our own identity: nothing is being cloned here, unlike the mic.
+    let mut config = Config::new(0x1209, 0x0002);
+    config.manufacturer = Some("TeslAux");
+    config.product = Some("TeslAux Media");
+    config.serial_number = Some("0001");
+    config.max_power = 100;
+    config.max_packet_size_0 = 64;
+
+    static mut CONFIG_DESC: [u8; 256] = [0; 256];
+    static mut BOS_DESC: [u8; 32] = [0; 32];
+    static mut MSOS_DESC: [u8; 16] = [0; 16];
+    static mut CONTROL_BUF: [u8; 128] = [0; 128];
+    // SAFETY: taken once, at startup, and outlive `usb` (main never returns).
+    let (cd, bd, md, cb) = unsafe {
+        (
+            &mut *core::ptr::addr_of_mut!(CONFIG_DESC),
+            &mut *core::ptr::addr_of_mut!(BOS_DESC),
+            &mut *core::ptr::addr_of_mut!(MSOS_DESC),
+            &mut *core::ptr::addr_of_mut!(CONTROL_BUF),
+        )
+    };
+
+    let mut builder = Builder::new(driver, config, cd, bd, md, cb);
+
+    static mut MSC_CONTROL: MscControl = MscControl;
+    // SAFETY: taken once at startup; outlives `usb` (main never returns).
+    builder.handler(unsafe { &mut *core::ptr::addr_of_mut!(MSC_CONTROL) });
+
+    // One interface, two bulk endpoints. Bulk-Only Transport needs nothing
+    // else — no class-specific descriptors at all.
+    let (mut ep_in, mut ep_out) = {
+        let mut func = builder.function(
+            msc::CLASS_MASS_STORAGE,
+            msc::SUBCLASS_SCSI,
+            msc::PROTOCOL_BULK_ONLY,
+        );
+        let mut iface = func.interface();
+        let mut alt = iface.alt_setting(
+            msc::CLASS_MASS_STORAGE,
+            msc::SUBCLASS_SCSI,
+            msc::PROTOCOL_BULK_ONLY,
+            None,
+        );
+        // 64 bytes is the full-speed bulk maximum.
+        let ep_in = alt.endpoint_bulk_in(None, 64);
+        let ep_out = alt.endpoint_bulk_out(None, 64);
+        drop(func);
+        (ep_in, ep_out)
+    };
+
+    spawner.spawn(usb_task(builder.build()).unwrap());
+
+    #[cfg(not(feature = "rp2040-zero"))]
+    spawner.spawn(
+        status_task(embassy_rp::gpio::Output::new(
+            p.PIN_25,
+            embassy_rp::gpio::Level::Low,
+        ))
+        .unwrap(),
+    );
+    #[cfg(feature = "rp2040-zero")]
+    {
+        use embassy_rp::pio::Pio;
+        let Pio { mut common, sm0, .. } = Pio::new(p.PIO1, Pio1Irqs);
+        let led = ws2812::Ws2812::new(&mut common, sm0, p.PIN_16);
+        spawner.spawn(status_task(led).unwrap());
+    }
+
+    let mut scsi = Scsi::new(fat::TOTAL_SECTORS, SECTOR as u32);
+    let mut cbw_buf = [0u8; 64];
+    let mut reply = [0u8; 64];
+    let mut sector = [0u8; SECTOR];
+
+    loop {
+        ep_out.wait_enabled().await;
+        WEDGED.store(false, Ordering::Relaxed);
+
+        loop {
+            // --- command phase ---
+            let n = match ep_out.read(&mut cbw_buf).await {
+                Ok(n) => n,
+                Err(EndpointError::Disabled) => break,
+                Err(_) => {
+                    WEDGED.store(true, Ordering::Relaxed);
+                    break;
+                }
+            };
+            let Some(cbw) = Cbw::parse(&cbw_buf[..n]) else {
+                // "Not meaningful". The spec wants both endpoints stalled until
+                // a Bulk-Only Reset arrives, but `embassy-usb` exposes no stall
+                // on a bulk endpoint, so the best available is to stop
+                // responding and wait to be re-enabled. A host that sends a
+                // malformed CBW is already in trouble; what matters is that we
+                // never guess at what it meant.
+                WEDGED.store(true, Ordering::Relaxed);
+                break;
+            };
+
+            let action = scsi.command(&cbw, &mut reply);
+
+            // --- data phase ---
+            let (sent, status) = match action {
+                Action::None => (0u32, CswStatus::Passed),
+                Action::Reply { len } => {
+                    // Never send more than the host asked for; a host that
+                    // receives extra bytes treats the transfer as a phase error.
+                    let len = len.min(cbw.data_len as usize);
+                    match write_all(&mut ep_in, &reply[..len]).await {
+                        Ok(()) => (len as u32, CswStatus::Passed),
+                        Err(_) => {
+                            WEDGED.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                }
+                Action::ReadBlocks { lba, blocks } => {
+                    let mut sent = 0u32;
+                    let mut failed = false;
+                    for i in 0..blocks {
+                        fat::read_sector(lba + i, &mut sector);
+                        if write_all(&mut ep_in, &sector).await.is_err() {
+                            failed = true;
+                            break;
+                        }
+                        sent += SECTOR as u32;
+                    }
+                    SECTORS_READ.store(
+                        SECTORS_READ.load(Ordering::Relaxed).wrapping_add(blocks),
+                        Ordering::Relaxed,
+                    );
+                    if failed {
+                        WEDGED.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    (sent, CswStatus::Passed)
+                }
+                Action::Fail => {
+                    CMD_FAILED.store(true, Ordering::Relaxed);
+                    // The spec would have us stall the data endpoint here, but
+                    // `embassy-usb` exposes no stall for bulk. Sending nothing
+                    // and reporting the full amount as residue tells the host
+                    // the same thing — it asked for N bytes and got none —
+                    // and every host tested accepts it. Noted as a divergence
+                    // rather than left to be rediscovered.
+                    (0, CswStatus::Failed)
+                }
+            };
+
+            // --- status phase ---
+            //
+            // Residue is what the host asked for minus what it got. Reporting
+            // it wrongly is worse than failing outright.
+            let mut out = [0u8; msc::CSW_LEN];
+            msc::csw(cbw.tag, cbw.data_len.saturating_sub(sent), status, &mut out);
+            if ep_in.write(&out).await.is_err() {
+                WEDGED.store(true, Ordering::Relaxed);
+                break;
+            }
+        }
+    }
+}
+
+/// Write a buffer as a sequence of max-size bulk packets.
+///
+/// A transfer whose length is an exact multiple of the endpoint size needs no
+/// zero-length terminator here: every reply is either shorter than the packet
+/// size or a whole number of 512-byte sectors, and the CSW that follows
+/// delimits it either way.
+async fn write_all<E: EndpointIn>(ep: &mut E, data: &[u8]) -> Result<(), EndpointError> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    for chunk in data.chunks(64) {
+        ep.write(chunk).await?;
+    }
+    Ok(())
+}

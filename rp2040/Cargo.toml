@@ -19,6 +19,12 @@ path = "src/bin/car.rs"
 name = "source"
 path = "src/bin/source.rs"
 
+# Synthetic USB drive: 20 silent tracks, so the car's own media player can act
+# as a control surface. Standalone, so the mic stays a byte-for-byte clone.
+[[bin]]
+name = "usbdrive"
+path = "src/bin/usbdrive.rs"
+
 # Standalone WS2812 bring-up test: no USB, no audio, no tasks. See src/bin/ledtest.rs.
 [[bin]]
 name = "ledtest"
