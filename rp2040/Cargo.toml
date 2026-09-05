@@ -97,7 +97,14 @@ clock-locked = []
 #
 # This changes the descriptor set the car validates, which is the whole reason
 # the drive was a separate device until now. Off by default.
-media-drive = []
+# Raises embassy-usb's compile-time limits along with it: the TeslaMic already
+# uses four interfaces, and `Builder` asserts rather than failing gracefully, so
+# a fifth panicked before USB or the LED had started — a board that simply sat
+# dark. Attaching the limits to this feature keeps the default build unchanged.
+media-drive = [
+    "embassy-usb/max-interface-count-8",
+    "embassy-usb/max-handler-count-8",
+]
 
 # DIAGNOSTIC (car board): generate a 1 kHz tone internally and deliberately swing
 # the iso packet size 47/49 every frame. Answers "does Tesla tolerate variable
