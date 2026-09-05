@@ -332,6 +332,28 @@ async fn main(spawner: Spawner) {
                     }
                     (sent, CswStatus::Passed)
                 }
+                Action::DiscardBlocks { blocks } => {
+                    // Read and throw away. The host must see the bytes consumed
+                    // — leaving them queued stalls the transfer just as surely
+                    // as refusing it would.
+                    let mut got = 0u32;
+                    let want = blocks * SECTOR as u32;
+                    let mut failed = false;
+                    while got < want {
+                        match ep_out.read(&mut cbw_buf).await {
+                            Ok(n) => got += n as u32,
+                            Err(_) => {
+                                failed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if failed {
+                        WEDGED.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    (want.min(cbw.data_len), CswStatus::Passed)
+                }
                 Action::Fail => {
                     if READ_TRACK_DATA.load(Ordering::Relaxed) {
                         LATE_CMD_FAILED.store(true, Ordering::Relaxed);

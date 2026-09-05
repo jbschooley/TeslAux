@@ -283,7 +283,10 @@ fn root_sector(index: u32, buf: &mut [u8; SECTOR]) {
         let mut name = [0u8; 11];
         short_name(track, &mut name);
         buf[at..at + 11].copy_from_slice(&name);
-        buf[at + 11] = 0x21; // read-only + archive
+        // Archive only. Marking these read-only would be truthful — nothing
+        // can be stored — but a host that will not write to a volume may
+        // decline it, and the attribute buys nothing here.
+        buf[at + 11] = 0x20;
         let cluster = track_first_cluster(track);
         le16(buf, at + 20, (cluster >> 16) as u16);
         le16(buf, at + 26, cluster as u16);

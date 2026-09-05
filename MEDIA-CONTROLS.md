@@ -240,6 +240,29 @@ refusal to any of those may stop rather than fall back.
 `READ(10)` has 16, so reading it as 16 bits truncates every large transfer
 silently.
 
+### Comparison with teslausb, and what it changed
+
+[teslausb](https://github.com/marcone/teslausb) presents disk images to the car
+from a Raspberry Pi. Its structure matches this one exactly — MBR, partition
+type `0x0C`, `mkfs.vfat -F 32` — which confirms the filesystem shape is right
+and is not what the car objects to. It presents cam, music, lightshow and
+boombox as **separate LUNs of one mass-storage function**, so the car handles
+multi-LUN devices happily.
+
+The difference that stood out is that its disks are ordinary **writable**
+images, while this volume declared itself read-only in three places: the
+`MODE SENSE` write-protect bit, a `WRITE(10)` that failed with
+`WRITE_PROTECTED`, and the read-only attribute on every directory entry.
+
+Refusing a write is not the same as having nowhere to put it. A host that finds
+the medium write-protected may decline it outright, and one that writes an index
+cache or a lock file while scanning needs the write to *succeed*, not to
+persist. Writes are now accepted and discarded: the transfer completes, and a
+later read of that sector returns whatever the layout says belongs there.
+
+Writes past the end of the device are still refused — accepting a write is not
+the same as accepting nonsense.
+
 ### If the car does not offer it as a media source
 
 Owner reports converge on one cause that has nothing to do with the volume:

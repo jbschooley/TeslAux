@@ -52,6 +52,7 @@ const REPORT_LUNS: u8 = 0xA0;
 const SERVICE_ACTION_IN_16: u8 = 0x9E;
 const SAI_READ_CAPACITY_16: u8 = 0x10;
 const WRITE_10: u8 = 0x2A;
+const WRITE_12: u8 = 0xAA;
 const SYNCHRONIZE_CACHE: u8 = 0x35;
 const MODE_SENSE_10: u8 = 0x5A;
 
@@ -158,6 +159,15 @@ pub enum Action {
     Reply { len: usize },
     /// Stream `blocks` sectors starting at `lba`, then a CSW.
     ReadBlocks { lba: u32, blocks: u32 },
+    /// Accept and discard `blocks` sectors from the host, then a CSW.
+    ///
+    /// The volume is synthesised, so there is nowhere to put them — but
+    /// *refusing* is not the same as having nothing to store. A host that finds
+    /// the medium write-protected may decline to use it at all, and one that
+    /// writes an index or a lock file needs the write to succeed, not to
+    /// persist. Discarding is the honest middle: the write completes, and the
+    /// next read of that sector returns what the layout says belongs there.
+    DiscardBlocks { blocks: u32 },
     /// No data phase; just a CSW.
     None,
     /// Fail with the recorded sense, stalling the data phase if one was
@@ -254,10 +264,20 @@ impl Scsi {
                 }
                 Action::ReadBlocks { lba, blocks }
             }
-            WRITE_10 => {
-                // Read-only by construction: there is nowhere to put the data.
-                self.sense = Sense::WRITE_PROTECTED;
-                Action::Fail
+            WRITE_10 | WRITE_12 => {
+                let blocks = if op == WRITE_12 {
+                    u32::from_be_bytes([cbw.cb[6], cbw.cb[7], cbw.cb[8], cbw.cb[9]])
+                } else {
+                    cbw.blocks() as u32
+                };
+                if blocks == 0 {
+                    return Action::None;
+                }
+                if cbw.lba() as u64 + blocks as u64 > self.blocks as u64 {
+                    self.sense = Sense::LBA_OUT_OF_RANGE;
+                    return Action::Fail;
+                }
+                Action::DiscardBlocks { blocks }
             }
             _ => {
                 self.sense = Sense::INVALID_COMMAND;
@@ -390,7 +410,10 @@ impl Scsi {
         }
         out[0] = 3; // mode data length, excluding this byte
         out[1] = 0; // medium type
-        out[2] = 0x80; // write protected
+        // Not write protected. Nothing can be stored, but a host that sees the
+        // write-protect bit may decline the medium outright, and one that wants
+        // to write an index or a lock file needs the attempt to succeed.
+        out[2] = 0x00;
         out[3] = 0; // block descriptor length
         4
     }
@@ -401,7 +424,7 @@ impl Scsi {
         }
         out[..8].fill(0);
         out[1] = 6; // mode data length
-        out[3] = 0x80; // write protected
+        out[3] = 0x00; // not write protected — see mode_sense_6
         8
     }
 
@@ -536,23 +559,37 @@ mod tests {
     }
 
     #[test]
-    fn writes_are_refused_as_write_protected() {
+    fn writes_are_accepted_and_discarded() {
+        // Refusing is not the same as having nowhere to store: a host that finds
+        // the medium write-protected may decline it entirely, and one writing an
+        // index or a lock file needs the write to succeed rather than persist.
         let mut d = disk();
         let mut r = [0u8; 64];
         let c = Cbw::parse(&cbw(1, 512, false, &[WRITE_10, 0, 0, 0, 0, 1, 0, 0, 1, 0])).unwrap();
-        assert_eq!(d.command(&c, &mut r), Action::Fail);
-        assert_eq!(d.sense(), Sense::WRITE_PROTECTED);
+        assert_eq!(d.command(&c, &mut r), Action::DiscardBlocks { blocks: 1 });
+        assert_eq!(d.sense(), Sense::GOOD);
     }
 
     #[test]
-    fn mode_sense_says_write_protected() {
-        // A host that thinks the disk is writable will eventually try, and the
-        // failure is uglier than declaring it up front.
+    fn writes_past_the_end_are_still_refused() {
+        // Accepting a write is not the same as accepting nonsense.
+        let mut d = disk();
+        let mut r = [0u8; 64];
+        let c = Cbw::parse(&cbw(
+            1, 512, false,
+            &[WRITE_10, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0xFF, 0xFF, 0],
+        )).unwrap();
+        assert_eq!(d.command(&c, &mut r), Action::Fail);
+        assert_eq!(d.sense(), Sense::LBA_OUT_OF_RANGE);
+    }
+
+    #[test]
+    fn mode_sense_does_not_claim_write_protection() {
         let mut d = disk();
         let mut r = [0u8; 64];
         let c = Cbw::parse(&cbw(1, 4, true, &[MODE_SENSE_6, 0, 0x3F, 0, 4, 0])).unwrap();
         assert_eq!(d.command(&c, &mut r), Action::Reply { len: 4 });
-        assert_eq!(r[2] & 0x80, 0x80, "write-protect bit not set");
+        assert_eq!(r[2] & 0x80, 0x00, "write-protect bit set");
     }
 
     #[test]
@@ -561,14 +598,15 @@ mod tests {
         let mut d = disk();
         let mut r = [0u8; 64];
 
-        let bad = Cbw::parse(&cbw(1, 512, false, &[WRITE_10, 0, 0, 0, 0, 1, 0, 0, 1, 0])).unwrap();
+        // Any failing command will do; an unknown opcode is the simplest.
+        let bad = Cbw::parse(&cbw(1, 0, false, &[0xEE, 0, 0, 0, 0, 0])).unwrap();
         assert_eq!(d.command(&bad, &mut r), Action::Fail);
 
         let sense = Cbw::parse(&cbw(2, 18, true, &[REQUEST_SENSE, 0, 0, 0, 18, 0])).unwrap();
         assert_eq!(d.command(&sense, &mut r), Action::Reply { len: 18 });
         assert_eq!(r[0], 0x70);
-        assert_eq!(r[2], Sense::WRITE_PROTECTED.key);
-        assert_eq!(r[12], Sense::WRITE_PROTECTED.asc);
+        assert_eq!(r[2], Sense::INVALID_COMMAND.key);
+        assert_eq!(r[12], Sense::INVALID_COMMAND.asc);
 
         // Asking again must report good, not repeat the stale failure.
         assert_eq!(d.command(&sense, &mut r), Action::Reply { len: 18 });
