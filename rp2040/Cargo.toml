@@ -91,6 +91,13 @@ ultra-low = ["clock-steered"]
 # packets (PaceMode::Locked). Requires the `source` board on the other end.
 # Without it, the car board is an I2S slave to a PCM2706 and paces elastically.
 clock-locked = []
+# Add a mass-storage interface to the car-facing device: one silent track, so
+# the car's media controls act on something harmless rather than on a phone
+# connected over Bluetooth for calls.
+#
+# This changes the descriptor set the car validates, which is the whole reason
+# the drive was a separate device until now. Off by default.
+media-drive = []
 
 # DIAGNOSTIC (car board): generate a 1 kHz tone internally and deliberately swing
 # the iso packet size 47/49 every frame. Answers "does Tesla tolerate variable

@@ -34,10 +34,17 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_time::{Duration, Instant, Timer};
 use embassy_usb::class::hid::State as HidState;
-use embassy_usb::driver::{EndpointError, EndpointIn};
+use embassy_usb::driver::{Endpoint, EndpointError, EndpointIn, EndpointOut};
 use embassy_usb::Builder;
 
 use core::cell::RefCell;
+
+#[cfg(feature = "media-drive")]
+#[path = "../fat.rs"]
+mod fat;
+#[cfg(feature = "media-drive")]
+#[path = "../msc.rs"]
+mod msc;
 
 #[path = "../audio_pipe.rs"]
 mod audio_pipe;
@@ -310,6 +317,44 @@ async fn main(spawner: Spawner) {
     let ep_max = ((frames_max + 1) * CHANNELS_X_BYTES) as u16;
     debug_assert!(ep_max <= 1023, "over the full-speed isochronous limit");
     let iso_in = teslamic::build(&mut builder, hid_state, kbd, if3, srate, ep_max, rate);
+
+    // A fifth interface: a mass-storage device holding one silent track.
+    //
+    // Its job is to be something harmless for the car to play, so that the
+    // car's media controls act on it rather than on whatever else is connected
+    // — a phone on Bluetooth for calls should not be skipped by a
+    // steering-wheel press meant for this bridge.
+    //
+    // This is a real risk to take deliberately: **the car validates the TeslaMic
+    // descriptor set**, and the endpoint-less IF3 with its exact report
+    // descriptor is what defeats the "unsupported USB microphone" popup. Adding
+    // an interface changes `bNumInterfaces` and the configuration's total
+    // length, so a car that checks either will notice. It is behind a feature
+    // for that reason, and the default build is unchanged.
+    #[cfg(feature = "media-drive")]
+    let (drive_in, drive_out) = {
+        static mut MSC_CONTROL: msc_control::MscControl = msc_control::MscControl;
+        // SAFETY: taken once at startup; outlives `usb` (main never returns).
+        builder.handler(unsafe { &mut *core::ptr::addr_of_mut!(MSC_CONTROL) });
+
+        let mut func = builder.function(
+            msc::CLASS_MASS_STORAGE,
+            msc::SUBCLASS_SCSI,
+            msc::PROTOCOL_BULK_ONLY,
+        );
+        let mut iface = func.interface();
+        let mut alt = iface.alt_setting(
+            msc::CLASS_MASS_STORAGE,
+            msc::SUBCLASS_SCSI,
+            msc::PROTOCOL_BULK_ONLY,
+            None,
+        );
+        let ep_in = alt.endpoint_bulk_in(None, 64);
+        let ep_out = alt.endpoint_bulk_out(None, 64);
+        drop(func);
+        (ep_in, ep_out)
+    };
+
     let usb = builder.build();
 
     // ── I2S capture ─────────────────────────────────────────────────────────
@@ -359,6 +404,14 @@ async fn main(spawner: Spawner) {
     #[cfg(not(feature = "packet-stress"))]
     spawner.spawn(capture(sm0, p.DMA_CH0).unwrap());
     spawner.spawn(status_task(led).unwrap());
+
+    #[cfg(feature = "media-drive")]
+    {
+        // Both run forever; neither returns.
+        embassy_futures::join::join(pump(iso_in, wd), drive(drive_in, drive_out)).await;
+        unreachable!()
+    }
+    #[cfg(not(feature = "media-drive"))]
     pump(iso_in, wd).await;
 }
 
@@ -367,6 +420,135 @@ type UsbDevice = embassy_usb::UsbDevice<'static, Driver<'static, USB>>;
 #[embassy_executor::task]
 async fn usb_task(mut usb: UsbDevice) -> ! {
     usb.run().await
+}
+
+/// Answers the two class-specific control requests Bulk-Only Transport defines.
+///
+/// `embassy-usb` knows nothing about mass storage, so without this the host's
+/// GET_MAX_LUN is STALLed. Some hosts read a STALL as "one LUN" and carry on;
+/// others treat it as a broken device and never mount.
+#[cfg(feature = "media-drive")]
+mod msc_control {
+    use super::msc;
+    use embassy_usb::control::{InResponse, OutResponse, Request, RequestType};
+    use embassy_usb::Handler;
+
+    pub struct MscControl;
+
+    impl Handler for MscControl {
+        fn control_in<'a>(&'a mut self, req: Request, buf: &'a mut [u8]) -> Option<InResponse<'a>> {
+            if req.request_type != RequestType::Class || req.request != msc::REQ_GET_MAX_LUN {
+                return None;
+            }
+            // Highest LUN number, not a count: a single-LUN device reports 0.
+            buf[0] = 0;
+            Some(InResponse::Accepted(&buf[..1]))
+        }
+
+        fn control_out(&mut self, req: Request, _data: &[u8]) -> Option<OutResponse> {
+            if req.request_type != RequestType::Class || req.request != msc::REQ_BULK_ONLY_RESET {
+                return None;
+            }
+            // Nothing to tear down: the loop re-reads a CBW every pass.
+            Some(OutResponse::Accepted)
+        }
+    }
+}
+
+/// Serve the synthetic drive, alongside the microphone.
+///
+/// Deliberately independent of the audio path: it shares no state with the pipe
+/// or the pump, so a host hammering the drive cannot disturb the stream the car
+/// is listening to.
+#[cfg(feature = "media-drive")]
+async fn drive(mut ep_in: impl EndpointIn, mut ep_out: impl EndpointOut) -> ! {
+    use msc::{Action, Cbw, Scsi, Status as CswStatus};
+
+    let mut scsi = Scsi::new(fat::TOTAL_SECTORS, fat::SECTOR as u32);
+    let mut cbw_buf = [0u8; 64];
+    let mut reply = [0u8; 64];
+    let mut sector = [0u8; fat::SECTOR];
+
+    loop {
+        ep_out.wait_enabled().await;
+        loop {
+            let n = match ep_out.read(&mut cbw_buf).await {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            let Some(cbw) = Cbw::parse(&cbw_buf[..n]) else {
+                // "Not meaningful": stop responding rather than guess at what
+                // the host meant, and wait to be re-enabled.
+                break;
+            };
+
+            let (sent, status) = match scsi.command(&cbw, &mut reply) {
+                Action::None => (0u32, CswStatus::Passed),
+                Action::Reply { len } => {
+                    let len = len.min(cbw.data_len as usize);
+                    let mut ok = true;
+                    for chunk in reply[..len].chunks(64) {
+                        if ep_in.write(chunk).await.is_err() {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok {
+                        break;
+                    }
+                    (len as u32, CswStatus::Passed)
+                }
+                Action::ReadBlocks { lba, blocks } => {
+                    let mut sent = 0u32;
+                    let mut ok = true;
+                    for i in 0..blocks {
+                        fat::read_sector(lba + i, &mut sector);
+                        for chunk in sector.chunks(64) {
+                            if ep_in.write(chunk).await.is_err() {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if !ok {
+                            break;
+                        }
+                        sent += fat::SECTOR as u32;
+                    }
+                    if !ok {
+                        break;
+                    }
+                    (sent, CswStatus::Passed)
+                }
+                Action::DiscardBlocks { blocks } => {
+                    // Consume the data: leaving it queued stalls the transfer as
+                    // surely as refusing it would.
+                    let want = blocks * fat::SECTOR as u32;
+                    let mut got = 0u32;
+                    let mut ok = true;
+                    while got < want {
+                        match ep_out.read(&mut cbw_buf).await {
+                            Ok(n) => got += n as u32,
+                            Err(_) => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !ok {
+                        break;
+                    }
+                    (want.min(cbw.data_len), CswStatus::Passed)
+                }
+                Action::Fail => (0, CswStatus::Failed),
+            };
+
+            let mut out = [0u8; msc::CSW_LEN];
+            msc::csw(cbw.tag, cbw.data_len.saturating_sub(sent), status, &mut out);
+            if ep_in.write(&out).await.is_err() {
+                break;
+            }
+        }
+    }
 }
 
 /// Producer: pull I2S frames and push them into the pipe.

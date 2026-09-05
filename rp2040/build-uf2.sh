@@ -23,6 +23,8 @@ build source clock-steered   teslamic-rp-source-steered
 build source clock-steered,low-latency teslamic-rp-source-steered-lowlat
 build source ultra-low       teslamic-rp-source-ultralow
 # --- synthetic USB drive: the car's media player as a control surface ---
+# One device that is both: the TeslaMic plus a silent drive to hold media focus.
+build car      low-latency,media-drive teslamic-rp-car-MEDIA
 build usbdrive ""        teslamic-rp-USBDRIVE
 build usbdrive audible   teslamic-rp-USBDRIVE-TONE
 build usbdrive detect    teslamic-rp-USBDRIVE-DETECT
