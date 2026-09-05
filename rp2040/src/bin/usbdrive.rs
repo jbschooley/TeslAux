@@ -197,11 +197,24 @@ async fn main(spawner: Spawner) {
         ))
         .unwrap(),
     );
+    // `Common` must outlive the LED, so it is bound here in main — which never
+    // returns — rather than inside a block.
+    //
+    // Dropping it resets GPIO16's pin function, so the boot colour clocks out
+    // and latches and every later write goes to a dead pin. That presents as
+    // "the status task never runs", and it is the same fault `car.rs` documents
+    // at length. Reintroduced here by declaring `common` inside a block, and
+    // found only because the LED was dark in a car where a power problem was
+    // the obvious suspect.
+    #[cfg(feature = "rp2040-zero")]
+    let (mut led_common, led_sm) = {
+        use embassy_rp::pio::Pio;
+        let Pio { common, sm0, .. } = Pio::new(p.PIO1, Pio1Irqs);
+        (common, sm0)
+    };
     #[cfg(feature = "rp2040-zero")]
     {
-        use embassy_rp::pio::Pio;
-        let Pio { mut common, sm0, .. } = Pio::new(p.PIO1, Pio1Irqs);
-        let led = ws2812::Ws2812::new(&mut common, sm0, p.PIN_16);
+        let led = ws2812::Ws2812::new(&mut led_common, led_sm, p.PIN_16);
         spawner.spawn(status_task(led).unwrap());
     }
 
