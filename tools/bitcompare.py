@@ -366,7 +366,7 @@ def compare(ref_path, rec_path):
         print(f"      {len(edits)} splice(s): {lost} frames missing, {gained} extra")
         for pos, kind, cnt in edits[:12]:
             print(
-                f"        ref frame {pos:>9} ({pos / ref_rate:7.3f}s)  "
+                f"        ref frame {pos:>9}  {pos / ref_rate / 60:5.2f} min  "
                 f"{kind} {cnt} frames ({1000.0 * cnt / ref_rate:.1f} ms)"
             )
         if len(edits) > 12:
