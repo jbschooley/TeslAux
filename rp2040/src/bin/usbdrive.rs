@@ -20,13 +20,16 @@
 //! | LED | meaning |
 //! |-----|---------|
 //! | blue, slow | enumerated, nothing read yet |
-//! | amber | sectors read, but **metadata only** — the host looked at the volume and stopped before any track |
-//! | green | the host read **inside a track**, so it parsed the filesystem, walked the directory and opened a file |
+//! | amber | sectors read, but **metadata only** — no track was opened |
+//! | green | exactly **one** track was opened |
+//! | cyan | **several** tracks were opened |
+//! | white | **many** (16+) tracks were opened |
 //! | red | the transport gave up: a malformed CBW, or an endpoint error |
 //!
-//! Amber versus green is the useful distinction when a host mounts the volume
-//! but will not play it: amber means the filesystem was rejected, green means it
-//! was accepted and something else is wrong.
+//! The count is the useful part once a host mounts the volume but will not play
+//! it. One track means it opened a file and rejected something about it; all
+//! twenty means it indexed the volume and is declining it for a reason that has
+//! nothing to do with the files. Those need opposite next steps.
 //!
 //! Plug it into a Mac first. If `TESLAUX` mounts and `001.WAV` plays, the class
 //! implementation is right and the car is the only remaining unknown.
@@ -82,6 +85,13 @@ static SECTORS_READ: AtomicU32 = AtomicU32::new(0);
 /// it is the same function the media-control detector will be built on, so this
 /// exercises it against a real host at the same time.
 static READ_TRACK_DATA: AtomicBool = AtomicBool::new(false);
+/// Bitmask of which tracks the host has read from, one bit per track.
+///
+/// The count is the useful number: a host that opens one file and stops has
+/// rejected something about it, while one that opens all twenty has indexed the
+/// volume and is declining it for a reason that has nothing to do with the
+/// files. Those need completely different next steps.
+static TRACKS_SEEN: AtomicU32 = AtomicU32::new(0);
 /// A SCSI command failed. Not fatal — hosts probe for optional commands — but
 /// worth seeing during bring-up.
 static CMD_FAILED: AtomicBool = AtomicBool::new(false);
@@ -93,9 +103,9 @@ fn current_state() -> status::State {
         // red: the transport gave up
         status::State::Fault
     } else if READ_TRACK_DATA.load(Ordering::Relaxed) {
-        // green: the host read inside a track, so it parsed the filesystem,
-        // walked the directory and opened files
-        status::State::Ok
+        // The host parsed the filesystem and opened files; how many it opened
+        // is the question that decides what to try next.
+        status::State::Count(TRACKS_SEEN.load(Ordering::Relaxed).count_ones() as u8)
     } else if SECTORS_READ.load(Ordering::Relaxed) > 0 {
         // amber: sectors were read, but only metadata — the host looked at the
         // volume and stopped before any track
@@ -288,8 +298,14 @@ async fn main(spawner: Spawner) {
                     let mut sent = 0u32;
                     let mut failed = false;
                     for i in 0..blocks {
-                        if fat::locate(lba + i).is_some() {
+                        if let Some(pos) = fat::locate(lba + i) {
                             READ_TRACK_DATA.store(true, Ordering::Relaxed);
+                            if pos.track < 32 {
+                                TRACKS_SEEN.store(
+                                    TRACKS_SEEN.load(Ordering::Relaxed) | (1 << pos.track),
+                                    Ordering::Relaxed,
+                                );
+                            }
                         }
                         fat::read_sector(lba + i, &mut sector);
                         if write_all(&mut ep_in, &sector).await.is_err() {

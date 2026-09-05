@@ -179,6 +179,23 @@ layout constants are **filesystem-relative**. `locate_fs` is the internal form
 for code that has already subtracted the offset — subtracting it twice
 attributes every sector to the wrong track, silently.
 
+### Measured: the car reads the tracks and still will not play them
+
+With the LED distinguishing metadata reads from track reads:
+
+| Host | Result |
+|---|---|
+| Mac | amber — directory only, which is right: listing a folder opens no file |
+| Car | **green — read inside a track** |
+
+So the car parses the MBR, mounts FAT32, walks the directory, finds the files
+and opens at least one. **The filesystem is accepted; exFAT is not the
+problem**, and neither is the partition table, the mass-storage class or the
+SCSI subset.
+
+Whatever the car objects to is about the files or the volume, not about being
+able to read them.
+
 ### If the car does not offer it as a media source
 
 Owner reports converge on one cause that has nothing to do with the volume:

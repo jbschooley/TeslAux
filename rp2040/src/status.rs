@@ -18,6 +18,11 @@ pub enum State {
     Fault,
     /// Streaming, but correcting drift more than expected (source not tracking).
     Slipping,
+    /// A count worth reading off, shown as a colour rather than a blink code.
+    ///
+    /// Counting blinks is slow and error-prone; four distinguishable colours
+    /// answer a four-way question at a glance.
+    Count(u8),
 }
 
 #[cfg(not(feature = "rp2040-zero"))]
@@ -51,6 +56,16 @@ mod imp {
                     }
                     Timer::after_millis(160).await;
                 }
+                // A plain LED has no colour, so fall back to blinking it out.
+                State::Count(n) => {
+                    for _ in 0..n.max(1) {
+                        led.set_high();
+                        Timer::after_millis(150).await;
+                        led.set_low();
+                        Timer::after_millis(150).await;
+                    }
+                    Timer::after_millis(900).await;
+                }
             }
         }
     }
@@ -78,7 +93,18 @@ mod imp {
             State::Waiting => RGB8::new(0, 0, 12),
             State::Fault => RGB8::new(16, 0, 0),
             State::Slipping => RGB8::new(14, 6, 0),
+            State::Count(n) => count_colour(n),
         });
+    }
+
+    /// Four bands, far enough apart to tell apart in daylight.
+    fn count_colour(n: u8) -> RGB8 {
+        match n {
+            0 => RGB8::new(14, 6, 0),   // amber: none
+            1 => RGB8::new(0, 12, 0),   // green: one
+            2..=15 => RGB8::new(0, 10, 12), // cyan: several
+            _ => RGB8::new(12, 12, 12), // white: many
+        }
     }
 
     pub async fn run(led: &mut Ws2812<'static, PIO1, 0>, state: impl Fn() -> State) -> ! {
@@ -92,6 +118,7 @@ mod imp {
                 State::Waiting => RGB8::new(0, 0, 12),
                 State::Fault => RGB8::new(16, 0, 0),
                 State::Slipping => RGB8::new(14, 6, 0),
+                State::Count(n) => count_colour(n),
             };
             led.set(c);
             Timer::after_millis(200).await;
