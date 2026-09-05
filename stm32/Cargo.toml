@@ -23,12 +23,19 @@ car-only = []
 [dependencies]
 # embassy-usb is the same 0.6 the RP2040 build uses, which is why
 # `teslamic.rs` compiles here unchanged.
-embassy-stm32    = { version = "0.6", features = ["stm32f407ve", "time-driver-any", "memory-x", "unstable-pac", "defmt"] }
-embassy-usb      = { version = "0.6", default-features = false, features = ["defmt"] }
-embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread"] }
-embassy-time     = { version = "0.5" }
-embassy-futures  = { version = "0.1" }
-embassy-sync     = { version = "0.7" }
+# Pinned to git, not crates.io, for one specific reason: the published
+# embassy-usb-synopsys-otg 0.3.3 reschedules missed isochronous IN packets on
+# EOPF rather than on IISOIXFR. Against the car — which sets alt 1/0/1/0/1 in
+# rapid succession, unlike any host that works — the IN endpoint stops being
+# serviced after a few packets and never recovers. Upstream replaced that path
+# on 2026-08-19, and it matches open issue #6935, "ISO IN endpoint becomes
+# unavailable with embassy-usb-synopsys-otg".
+embassy-stm32    = { git = "https://github.com/embassy-rs/embassy", features = ["stm32f407ve", "time-driver-any", "memory-x", "unstable-pac", "defmt"] }
+embassy-usb      = { git = "https://github.com/embassy-rs/embassy", default-features = false, features = ["defmt"] }
+embassy-executor = { git = "https://github.com/embassy-rs/embassy", features = ["platform-cortex-m", "executor-thread"] }
+embassy-time     = { git = "https://github.com/embassy-rs/embassy" }
+embassy-futures  = { git = "https://github.com/embassy-rs/embassy" }
+embassy-sync     = { git = "https://github.com/embassy-rs/embassy" }
 
 cortex-m    = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
 # Bring-up visibility over the ST-Link. Costs nothing when DEFMT_LOG is off.

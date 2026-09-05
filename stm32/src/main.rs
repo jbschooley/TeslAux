@@ -203,6 +203,30 @@ async fn report_task() -> ! {
             ERR_BIG.load(Ordering::Relaxed),
         );
         defmt::info!("   write timeouts: {}", WRITE_TIMEOUTS.load(Ordering::Relaxed));
+
+        // Read the OTG core directly. Everything above is our view of events;
+        // this is the hardware's, and it settles the question I have been
+        // inferring all evening — whether the car is still driving the bus at
+        // all, or has simply stopped asking us for audio.
+        {
+            use embassy_stm32::pac::USB_OTG_FS as R;
+            let dsts = R.dsts().read();
+            let ctl = R.diepctl(1).read();
+            defmt::info!(
+                // usbaep is the one that matters: it says whether the endpoint
+                // is ACTIVE in this configuration at all. If it is clear the
+                // hardware will not answer an IN token no matter what we queue,
+                // and no amount of writing can help.
+                "   OTG: frame {} susp {} | ep1: active {} ena {} nak {} mps {} type {}",
+                dsts.fnsof(),
+                dsts.suspsts(),
+                ctl.usbaep(),
+                ctl.epena(),
+                ctl.naksts(),
+                ctl.mpsiz(),
+                ctl.eptyp().to_bits(),
+            );
+        }
     }
 }
 
@@ -234,19 +258,19 @@ async fn main(spawner: Spawner) {
             freq: Hertz(8_000_000),
             mode: HseMode::Oscillator,
         });
-        config.rcc.pll_src = PllSource::HSE;
+        config.rcc.pll_src = PllSource::Hse;
         config.rcc.pll = Some(Pll {
-            prediv: PllPreDiv::DIV4,
-            mul: PllMul::MUL168,
-            divp: Some(PllPDiv::DIV2), // 8 / 4 * 168 / 2 = 168 MHz sysclk
-            divq: Some(PllQDiv::DIV7), // 8 / 4 * 168 / 7 = 48 MHz, exactly, for USB
+            prediv: PllPreDiv::Div4,
+            mul: PllMul::Mul168,
+            divp: Some(PllPDiv::Div2), // 8 / 4 * 168 / 2 = 168 MHz sysclk
+            divq: Some(PllQDiv::Div7), // 8 / 4 * 168 / 7 = 48 MHz, exactly, for USB
             divr: None,
         });
-        config.rcc.ahb_pre = AHBPrescaler::DIV1;
-        config.rcc.apb1_pre = APBPrescaler::DIV4;
-        config.rcc.apb2_pre = APBPrescaler::DIV2;
-        config.rcc.sys = Sysclk::PLL1_P;
-        config.rcc.mux.clk48sel = mux::Clk48sel::PLL1_Q;
+        config.rcc.ahb_pre = AHBPrescaler::Div1;
+        config.rcc.apb1_pre = APBPrescaler::Div4;
+        config.rcc.apb2_pre = APBPrescaler::Div2;
+        config.rcc.sys = Sysclk::Pll1P;
+        config.rcc.mux.clk48sel = mux::Clk48sel::Pll1Q;
     }
     let p = embassy_stm32::init(config);
 

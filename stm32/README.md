@@ -153,11 +153,34 @@ packets are queued and mostly never collected. With the write bounded and the
 endpoint re-armed on timeout, roughly 8% of packets do get through (127 of
 ~14,000 expected), which proves the car *is* polling.
 
-Mostly-uncollected isochronous IN packets on an otherwise healthy endpoint is
-the signature of the even/odd frame-parity handling in embassy's Synopsys OTG
-driver, which chooses a packet's frame polarity from `fnsof` at write time and
-corrects it from the `IISOIXFR` interrupt. That is the next thing to
-investigate, and it is upstream of this project rather than in it.
+Also eliminated: the driver's isochronous rescheduling. The published
+`embassy-usb-synopsys-otg` 0.3.3 reschedules missed iso IN packets on `EOPF`
+rather than `IISOIXFR`, which upstream replaced on 2026-08-19 and which matches
+open issue #6935. Moving to the git version (0.4.0, which has the fix) changed
+nothing — `out` still stops at 3. Note 0.4.0 cannot be reached from crates.io:
+`embassy-stm32` 0.6.0 pins `^0.3.2`, there is no newer release, and `[patch]`
+cannot bridge 0.3 to 0.4.
+
+Reading the OTG core directly settles what everything above could only infer:
+
+```
+ep1: active true  ena false  nak false  mps 196  type 1 (isochronous)
+frame advancing   suspended false
+```
+
+The bus is alive and the car is driving it — the frame counter increments and
+the device is not suspended. Our endpoint is active, correctly configured as
+isochronous with a 196-byte maximum. `ena false` is expected between frames: the
+core discards an iso packet that missed its frame and clears the bit.
+
+**The car simply never sends an IN token to the endpoint.** It enumerates us,
+raises no popup, sets alt 1, completes the sample-rate handshake, writes 73 IF3
+configuration frames, takes three packets, and then never asks again — while
+continuing to clock the bus. Nothing visible from the device side is wrong.
+
+The descriptors are byte-identical to the RP2040 that works in the same port, so
+whatever the car objects to is behavioural rather than declared. That is where
+this stands.
 
 ## Bring-up notes
 
