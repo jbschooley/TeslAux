@@ -49,21 +49,9 @@ mod status;
 
 use defmt_rtt as _;
 
-/// Counters for bring-up. Written by one task each, read by the reporter.
-static PUSHED: AtomicU32 = AtomicU32::new(0);
-static PACKETS_IN: AtomicU32 = AtomicU32::new(0);
-static LAST_N: AtomicU32 = AtomicU32::new(0);
-static NONZERO_IN: AtomicU32 = AtomicU32::new(0);
-static WRITTEN: AtomicU32 = AtomicU32::new(0);
-static ENABLED: AtomicU32 = AtomicU32::new(0);
-static ERR_DIS: AtomicU32 = AtomicU32::new(0);
-static ERR_BIG: AtomicU32 = AtomicU32::new(0);
-static WRITE_TIMEOUTS: AtomicU32 = AtomicU32::new(0);
-static LAST_OUT: AtomicU32 = AtomicU32::new(0);
-
 use audio_pipe::{PaceMode, Pipe};
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_stm32::gpio::{Level, Output, Speed};
@@ -176,70 +164,6 @@ async fn usb_phone_task(mut d: UsbDevice<'static, PhoneDriver>) -> ! {
     d.run().await
 }
 
-/// Report where the audio actually stops, once a second.
-#[embassy_executor::task]
-async fn report_task() -> ! {
-    loop {
-        embassy_time::Timer::after_millis(1000).await;
-        let (level, primed) = PIPE.lock(|p| {
-            let b = p.borrow();
-            (b.off_target(), b.primed())
-        });
-        defmt::info!(
-            "in: {} pkts (last {} B, {} non-silent) {} frames | pipe: off {} primed {} | out: {} pkts (last {} B)",
-            PACKETS_IN.load(Ordering::Relaxed),
-            LAST_N.load(Ordering::Relaxed),
-            NONZERO_IN.load(Ordering::Relaxed),
-            PUSHED.load(Ordering::Relaxed),
-            level,
-            primed,
-            WRITTEN.load(Ordering::Relaxed),
-            LAST_OUT.load(Ordering::Relaxed),
-        );
-        defmt::info!(
-            "   car ep: enabled {}x, disabled-err {}, oversize-err {}",
-            ENABLED.load(Ordering::Relaxed),
-            ERR_DIS.load(Ordering::Relaxed),
-            ERR_BIG.load(Ordering::Relaxed),
-        );
-        defmt::info!("   write timeouts: {}", WRITE_TIMEOUTS.load(Ordering::Relaxed));
-
-        // Read the OTG core directly. Everything above is our view of events;
-        // this is the hardware's, and it settles the question I have been
-        // inferring all evening — whether the car is still driving the bus at
-        // all, or has simply stopped asking us for audio.
-        {
-            use embassy_stm32::pac::USB_OTG_FS as R;
-            let dsts = R.dsts().read();
-            let ctl = R.diepctl(1).read();
-            defmt::info!(
-                // usbaep is the one that matters: it says whether the endpoint
-                // is ACTIVE in this configuration at all. If it is clear the
-                // hardware will not answer an IN token no matter what we queue,
-                // and no amount of writing can help.
-                "   OTG: frame {} susp {} | ep1: active {} ena {} nak {} mps {} type {}",
-                dsts.fnsof(),
-                dsts.suspsts(),
-                ctl.usbaep(),
-                ctl.epena(),
-                ctl.naksts(),
-                ctl.mpsiz(),
-                ctl.eptyp().to_bits(),
-            );
-            // TX FIFO space, in 32-bit words. A 196-byte packet needs 49. If
-            // this is short, the FIFO is holding something stale — which is
-            // exactly what an interrupted disable/enable of an isochronous IN
-            // endpoint would leave behind, and the car toggles alt 1/0/1 in a
-            // way no working host does.
-            defmt::info!(
-                "   ep1 TX FIFO: {} words free (need 49), fifo base/size {:#x}",
-                R.dtxfsts(1).read().ineptfsav(),
-                R.dieptxf(0).read().0,
-            );
-        }
-    }
-}
-
 #[embassy_executor::task]
 async fn status_task(mut led: Output<'static>) -> ! {
     status::run(&mut led, current_state).await
@@ -309,10 +233,7 @@ async fn main(spawner: Spawner) {
     };
 
     let car_drv = usb::Driver::new_fs(p.USB_OTG_FS, Irqs, p.PA12, p.PA11, ep_car, car_cfg);
-    #[cfg(not(feature = "car-only"))]
     let phone_drv = usb::Driver::new_fs(p.USB_OTG_HS, Irqs, p.PB15, p.PB14, ep_phone, phone_cfg);
-    #[cfg(feature = "car-only")]
-    let _ = (p.USB_OTG_HS, p.PB15, p.PB14, ep_phone, phone_cfg);
 
     // --- car side: the TeslaMic, byte-for-byte ---
     let iso_in = {
@@ -357,7 +278,6 @@ async fn main(spawner: Spawner) {
     };
 
     // --- phone side: a UAC1 speaker at 48 kHz ---
-    #[cfg(not(feature = "car-only"))]
     let iso_out = {
         static mut CD: [u8; 256] = [0; 256];
         static mut BD: [u8; 32] = [0; 32];
@@ -382,21 +302,12 @@ async fn main(spawner: Spawner) {
     };
 
     spawner.spawn(status_task(led).unwrap());
-    spawner.spawn(report_task().unwrap());
 
-    #[cfg(feature = "car-only")]
-    {
-        // Diagnostic: car side only, to see whether running two OTG cores at
-        // once is what stops the car polling us.
-        pump(iso_in).await;
-    }
 
     // Producer and consumer both live here rather than in spawned tasks: an
     // `#[embassy_executor::task]` cannot be generic over the endpoint type, and
     // the two drivers have different ones.
-    #[cfg(not(feature = "car-only"))]
     join(sink(iso_out), pump(iso_in)).await;
-    #[allow(unreachable_code)]
     {
         unreachable!()
     }
@@ -436,21 +347,6 @@ async fn sink(mut ep: impl EndpointOut) -> ! {
                 }
                 Ok(Ok(n)) => {
                     SOURCE_LIVE.store(true, Ordering::Relaxed);
-                    PACKETS_IN.store(
-                        PACKETS_IN.load(Ordering::Relaxed).wrapping_add(1),
-                        Ordering::Relaxed,
-                    );
-                    LAST_N.store(n as u32, Ordering::Relaxed);
-                    if buf[..n].iter().any(|&b| b != 0) {
-                        NONZERO_IN.store(
-                            NONZERO_IN.load(Ordering::Relaxed).wrapping_add(1),
-                            Ordering::Relaxed,
-                        );
-                    }
-                    PUSHED.store(
-                        PUSHED.load(Ordering::Relaxed).wrapping_add((n / 4) as u32),
-                        Ordering::Relaxed,
-                    );
                     PIPE.lock(|p| {
                         let mut pipe = p.borrow_mut();
                         // `chunks_exact` is what makes a frame-alignment error
@@ -503,7 +399,6 @@ async fn pump(mut iso_in: impl EndpointIn) -> ! {
     let mut last_write = embassy_time::Instant::now();
     loop {
         iso_in.wait_enabled().await;
-        ENABLED.store(ENABLED.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
 
         // Flush the endpoint's TX FIFO now that it has been (re-)enabled.
         //
@@ -554,10 +449,6 @@ async fn pump(mut iso_in: impl EndpointIn) -> ! {
             let attempt = match attempt {
                 Ok(r) => r,
                 Err(_) => {
-                    WRITE_TIMEOUTS.store(
-                        WRITE_TIMEOUTS.load(Ordering::Relaxed).wrapping_add(1),
-                        Ordering::Relaxed,
-                    );
                     // Belt and braces: the same flush on the recovery path, so
                     // a stall from any other cause cannot become permanent.
                     flush_car_tx_fifo();
@@ -571,11 +462,6 @@ async fn pump(mut iso_in: impl EndpointIn) -> ! {
             };
             match attempt {
                 Ok(()) => {
-                    WRITTEN.store(
-                        WRITTEN.load(Ordering::Relaxed).wrapping_add(1),
-                        Ordering::Relaxed,
-                    );
-                    LAST_OUT.store(n as u32, Ordering::Relaxed);
                     // `wait_enabled()` above only returns on an alt-setting
                     // change. A host that keeps the interface selected but stops
                     // polling produces no error at all — the write simply blocks
@@ -589,11 +475,9 @@ async fn pump(mut iso_in: impl EndpointIn) -> ! {
                     last_write = now;
                 }
                 Err(EndpointError::Disabled) => {
-                    ERR_DIS.store(ERR_DIS.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
                     break;
                 }
                 Err(EndpointError::BufferOverflow) => {
-                    ERR_BIG.store(ERR_BIG.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
                     OVERSIZE.store(true, Ordering::Relaxed);
                     break;
                 }
