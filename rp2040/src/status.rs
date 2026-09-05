@@ -18,6 +18,13 @@ pub enum State {
     Fault,
     /// Streaming, but correcting drift more than expected (source not tracking).
     Slipping,
+    /// A momentary event, shown as a distinct colour while it is fresh.
+    ///
+    /// For watching a detector work in a car: press a button, see a colour
+    /// change immediately. Counting blinks after the fact cannot tell you
+    /// *which* press was misread, and a press nobody made is exactly the error
+    /// worth catching.
+    Flash(u8),
     /// A count worth reading off, shown as a colour rather than a blink code.
     ///
     /// Counting blinks is slow and error-prone; four distinguishable colours
@@ -57,6 +64,16 @@ mod imp {
                     Timer::after_millis(160).await;
                 }
                 // A plain LED has no colour, so fall back to blinking it out.
+                // A plain LED shows an event as a burst; a count as its digits.
+                State::Flash(n) => {
+                    for _ in 0..n.max(1) {
+                        led.set_high();
+                        Timer::after_millis(60).await;
+                        led.set_low();
+                        Timer::after_millis(60).await;
+                    }
+                    Timer::after_millis(200).await;
+                }
                 State::Count(n) => {
                     for _ in 0..n.max(1) {
                         led.set_high();
@@ -94,7 +111,18 @@ mod imp {
             State::Fault => RGB8::new(16, 0, 0),
             State::Slipping => RGB8::new(14, 6, 0),
             State::Count(n) => count_colour(n),
+            State::Flash(n) => flash_colour(n),
         });
+    }
+
+    /// 1 = next, 2 = previous, 3 = paused. Chosen to be unmistakable at a
+    /// glance rather than pretty.
+    fn flash_colour(n: u8) -> RGB8 {
+        match n {
+            1 => RGB8::new(16, 16, 16), // white: next
+            2 => RGB8::new(12, 0, 14),  // purple: previous
+            _ => RGB8::new(0, 0, 14),   // blue: paused
+        }
     }
 
     /// Four bands, far enough apart to tell apart in daylight.
@@ -119,6 +147,7 @@ mod imp {
                 State::Fault => RGB8::new(16, 0, 0),
                 State::Slipping => RGB8::new(14, 6, 0),
                 State::Count(n) => count_colour(n),
+                State::Flash(n) => flash_colour(n),
             };
             led.set(c);
             Timer::after_millis(200).await;

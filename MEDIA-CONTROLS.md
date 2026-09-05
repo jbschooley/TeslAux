@@ -137,12 +137,32 @@ a failed command should stall the data endpoint, but `embassy-usb` exposes no
 stall for bulk endpoints. Sending nothing and reporting the full amount as
 residue tells the host the same thing.
 
+**Also built:** `rp2040/src/detect.rs` — the detector. Pure logic over
+`(track, offset)` pairs and a millisecond clock, with 14 tests, because every
+judgement it makes is a chance to report a press nobody made — and that error is
+directly audible later as a track skipping by itself.
+
+What the tests pin down:
+
+| Case | Expected |
+|---|---|
+| five rapid presses | `Next(5)`, whether the player opened each file on the way or jumped |
+| a track ending on its own | **no event** — happens at every boundary, so a false positive here fires every ten minutes |
+| a press in the last seconds | still a press, if it lands further than one track on |
+| track 23 to track 0 | `Next(1)`, not `Prev(23)` |
+| a metadata peek at another file | **no event** — hosts read stray headers while indexing |
+| first `previous` restarting the track | `Restart`, distinguished from a skip |
+| a full lap of the playlist | **no events at all** |
+
+The LED reports events as they happen: **white flash** for next, **purple** for
+previous, **blue** while paused. Press a button and the colour changes
+immediately — which is what makes a false positive visible, where a count read
+afterwards could not say *which* press was wrong.
+
 **Not built:**
 
-1. **The detector** — `locate()` across reads, natural-advance suppression,
-   wrap-around modulo the track count.
-2. **Read pacing** — serve just above real time so a pause shows in ~300 ms.
-3. **A Consumer Control HID interface on the source side**, to send the media
+1. **Read pacing** — serve just above real time so a pause shows in ~300 ms.
+2. **A Consumer Control HID interface on the source side**, to send the media
    keys onward. Standard and well supported by any Android or Linux userspace;
    it touches only the source-facing descriptors, so the cloned mic side the car
    validates stays byte-identical.
@@ -298,6 +318,17 @@ argument:
 | **Writes accepted, not refused** | write-protected media may be declined outright; a scanner writing a lock file needs the write to succeed, not persist |
 | **EVPD inquiries answered** | returning standard data to a request for a serial number is a protocol violation |
 
+### The car caches its media index
+
+After the track length changed from 30 seconds to 10 minutes, the car went on
+displaying 30-second tracks while playing the longer files — a stale index, kept
+because the drive still looked like the same drive.
+
+The USB serial number is now derived at compile time from the constants that
+define the layout, so a volume whose shape has changed presents as a different
+drive and the index is rebuilt. It cannot drift out of step with the layout,
+because it is computed from it.
+
 ### Sizing the volume: three constraints, not two
 
 The shipping volume is **24 silent tracks of 10 minutes, 48 kHz 16-bit stereo —
@@ -321,7 +352,18 @@ is stored.
 24 tracks gives the counter a range of about ±12, far more than any burst of
 button presses needs.
 
-### Read pacing is load-bearing, not polish### Sizing the volume: three constraints, not two
+### Read pacing is load-bearing, not polish### The car caches its media index
+
+After the track length changed from 30 seconds to 10 minutes, the car went on
+displaying 30-second tracks while playing the longer files — a stale index, kept
+because the drive still looked like the same drive.
+
+The USB serial number is now derived at compile time from the constants that
+define the layout, so a volume whose shape has changed presents as a different
+drive and the index is rebuilt. It cannot drift out of step with the layout,
+because it is computed from it.
+
+### Sizing the volume: three constraints, not two
 
 The shipping volume is **24 silent tracks of 10 minutes, 48 kHz 16-bit stereo —
 3.46 GB, of which 1.2 MB actually exists.**

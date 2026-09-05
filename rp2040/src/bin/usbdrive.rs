@@ -26,6 +26,19 @@
 //! | white | **many** (16+) tracks were opened |
 //! | red | a SCSI command was refused mid-scan, or the transport gave up |
 //!
+//! Once the car is playing, the LED reports what the detector makes of its
+//! reads, which is the thing worth watching:
+//!
+//! | LED | meaning |
+//! |-----|---------|
+//! | white flash | **next** pressed |
+//! | purple flash | **previous** pressed |
+//! | blue | playback paused — reads have stopped |
+//!
+//! Press a button and the colour should change immediately. A flash with no
+//! press is the error that matters: it becomes a track skipping by itself on
+//! the source.
+//!
 //! The count is the useful part once a host mounts the volume but will not play
 //! it. One track means it opened a file and rejected something about it; all
 //! twenty means it indexed the volume and is declining it for a reason that has
@@ -42,6 +55,8 @@ use embassy_usb::control::{InResponse, OutResponse, Request, RequestType};
 use embassy_usb::driver::{Endpoint, EndpointError, EndpointIn, EndpointOut};
 use embassy_usb::{Builder, Config, Handler, UsbDevice};
 
+#[path = "../detect.rs"]
+mod detect;
 #[path = "../fat.rs"]
 mod fat;
 #[path = "../msc.rs"]
@@ -52,6 +67,7 @@ mod status;
 #[path = "../ws2812.rs"]
 mod ws2812;
 
+use detect::{Detector, Event};
 use fat::SECTOR;
 use msc::{Action, Cbw, Scsi, Status as CswStatus};
 
@@ -92,6 +108,27 @@ static READ_TRACK_DATA: AtomicBool = AtomicBool::new(false);
 /// volume and is declining it for a reason that has nothing to do with the
 /// files. Those need completely different next steps.
 static TRACKS_SEEN: AtomicU32 = AtomicU32::new(0);
+/// Button presses inferred from the car's reads: `next` in the low half,
+/// `prev` in the high half.
+///
+/// Until there is somewhere to send them, this is the whole output of the
+/// detector — and it is the number worth watching in the car, because a press
+/// nobody made is directly audible as a track skipping by itself.
+static PRESSES: AtomicU32 = AtomicU32::new(0);
+/// True while the car has stopped reading, i.e. playback is paused.
+static PLAYBACK_PAUSED: AtomicBool = AtomicBool::new(false);
+/// The most recent detector event and when it happened, so the LED can show it
+/// while it is fresh. 1 = next, 2 = previous.
+static LAST_EVENT: AtomicU32 = AtomicU32::new(0);
+static LAST_EVENT_MS: AtomicU32 = AtomicU32::new(0);
+/// When a sector inside a track was last read. Pause is derived from this
+/// rather than from the detector, so the status task needs no access to it.
+static LAST_READ_MS: AtomicU32 = AtomicU32::new(0);
+
+/// How long an event stays on the LED.
+const FLASH_MS: u32 = 1200;
+/// Quiet time that counts as playback having stopped. Matches the detector.
+const PAUSE_AFTER_MS: u32 = 400;
 /// A SCSI command was refused *after* the host had started reading tracks.
 ///
 /// Failures before that are normal: hosts probe for optional commands and
@@ -110,6 +147,22 @@ fn current_state() -> status::State {
         // A command refused while the host was scanning is a better lead than
         // any count, so it outranks them.
         status::State::Fault
+    } else if {
+        // A fresh event outranks everything below: it is the thing being
+        // watched for, and it is gone in a moment.
+        let now = embassy_time::Instant::now().as_millis() as u32;
+        LAST_EVENT.load(Ordering::Relaxed) != 0
+            && now.wrapping_sub(LAST_EVENT_MS.load(Ordering::Relaxed)) < FLASH_MS
+    } {
+        return status::State::Flash(LAST_EVENT.load(Ordering::Relaxed) as u8);
+    } else if READ_TRACK_DATA.load(Ordering::Relaxed)
+        && embassy_time::Instant::now()
+            .as_millis()
+            .wrapping_sub(LAST_READ_MS.load(Ordering::Relaxed) as u64)
+            >= PAUSE_AFTER_MS as u64
+    {
+        // Reads have stopped while a track was open: playback is paused.
+        status::State::Flash(3)
     } else if READ_TRACK_DATA.load(Ordering::Relaxed) {
         // The host parsed the filesystem and opened files; how many it opened
         // is the question that decides what to try next.
@@ -164,6 +217,45 @@ impl Handler for MscControl {
     }
 }
 
+/// Record what the detector reported.
+///
+/// Presses accumulate in one word — `next` in the low half, `prev` in the high
+/// half — because until there is somewhere to send them, the count *is* the
+/// output. It is also the number worth watching in the car: a press nobody made
+/// is directly audible later as a track skipping by itself.
+fn flash(code: u32) {
+    LAST_EVENT.store(code, Ordering::Relaxed);
+    LAST_EVENT_MS.store(embassy_time::Instant::now().as_millis() as u32, Ordering::Relaxed);
+}
+
+fn note_event(ev: Option<Event>) {
+    let bump = |shift: u32, by: u32| {
+        let cur = PRESSES.load(Ordering::Relaxed);
+        let half = (cur >> shift) & 0xFFFF;
+        let other = cur & (0xFFFF << (16 - shift));
+        PRESSES.store(other | (half.saturating_add(by).min(0xFFFF) << shift), Ordering::Relaxed);
+    };
+    match ev {
+        Some(Event::Next(n)) => {
+            bump(0, n);
+            flash(1);
+        }
+        // A restart is the first press of `previous` on most players, so it
+        // counts as one backwards press rather than as its own thing.
+        Some(Event::Prev(n)) => {
+            bump(16, n);
+            flash(2);
+        }
+        Some(Event::Restart) => {
+            bump(16, 1);
+            flash(2);
+        }
+        Some(Event::Paused) => PLAYBACK_PAUSED.store(true, Ordering::Relaxed),
+        Some(Event::Resumed) => PLAYBACK_PAUSED.store(false, Ordering::Relaxed),
+        None => {}
+    }
+}
+
 #[embassy_executor::task]
 async fn usb_task(mut usb: UsbDevice<'static, Driver<'static, USB>>) -> ! {
     usb.run().await
@@ -178,7 +270,15 @@ async fn main(spawner: Spawner) {
     let mut config = Config::new(0x1209, 0x0002);
     config.manufacturer = Some("TeslAux");
     config.product = Some("TeslAux Media");
-    config.serial_number = Some("0001");
+    // The serial encodes the volume layout, so changing the layout presents a
+    // *different* drive.
+    //
+    // The car caches its media index against the drive identity: after the
+    // track length changed from 30 seconds to 10 minutes, it went on showing
+    // 30-second tracks while happily playing the longer files. Harmless, but
+    // anyone comparing the car's display against the volume would be reading a
+    // stale answer.
+    config.serial_number = Some(fat::LAYOUT_ID);
     config.max_power = 100;
     config.max_packet_size_0 = 64;
 
@@ -256,6 +356,7 @@ async fn main(spawner: Spawner) {
     }
 
     let mut scsi = Scsi::new(fat::TOTAL_SECTORS, SECTOR as u32);
+    let mut detector = Detector::new(fat::N_TRACKS, fat::TRACK_FILE_BYTES);
     let mut cbw_buf = [0u8; 64];
     let mut reply = [0u8; 64];
     let mut sector = [0u8; SECTOR];
@@ -314,6 +415,13 @@ async fn main(spawner: Spawner) {
                                     Ordering::Relaxed,
                                 );
                             }
+                            let now = embassy_time::Instant::now().as_millis() as u32;
+                            LAST_READ_MS.store(now, Ordering::Relaxed);
+                            let p = detect::Position { track: pos.track, offset: pos.offset };
+                            let ev = detector
+                                .note_seek_backwards(p)
+                                .or_else(|| detector.on_read(p, now));
+                            note_event(ev);
                         }
                         fat::read_sector(lba + i, &mut sector);
                         if write_all(&mut ep_in, &sector).await.is_err() {

@@ -149,6 +149,63 @@ fn tone_sample(n: u32) -> i16 {
     }
 }
 
+/// Identifies this volume layout, for use as a USB serial number.
+///
+/// Hosts cache a media index against the drive's identity. After the track
+/// length changed from 30 seconds to 10 minutes, the car went on displaying
+/// 30-second tracks while happily playing the longer files — a stale index, kept
+/// because the drive still looked like the same drive. A volume whose shape has
+/// changed has to look like a different one.
+///
+/// Derived at compile time from the constants that define the layout, so it
+/// cannot drift out of step with them.
+const LAYOUT_HASH: u32 = {
+    let vals = [
+        N_TRACKS,
+        TRACK_SECONDS,
+        SAMPLE_RATE,
+        CHANNELS as u32,
+        BITS as u32,
+        SECTORS_PER_CLUSTER,
+        FREE_CLUSTERS,
+        PARTITION_START,
+    ];
+    let mut h: u32 = 2166136261; // FNV-1a offset basis
+    let mut i = 0;
+    while i < vals.len() {
+        let mut b = 0;
+        while b < 4 {
+            h ^= (vals[i] >> (b * 8)) & 0xFF;
+            h = h.wrapping_mul(16777619); // FNV-1a prime
+            b += 1;
+        }
+        i += 1;
+    }
+    h
+};
+
+const fn hex_nibble(h: u32, i: u32) -> u8 {
+    b"0123456789ABCDEF"[((h >> (28 - i * 4)) & 0xF) as usize]
+}
+
+const LAYOUT_ID_BYTES: [u8; 8] = [
+    hex_nibble(LAYOUT_HASH, 0),
+    hex_nibble(LAYOUT_HASH, 1),
+    hex_nibble(LAYOUT_HASH, 2),
+    hex_nibble(LAYOUT_HASH, 3),
+    hex_nibble(LAYOUT_HASH, 4),
+    hex_nibble(LAYOUT_HASH, 5),
+    hex_nibble(LAYOUT_HASH, 6),
+    hex_nibble(LAYOUT_HASH, 7),
+];
+
+/// The layout identity as a string, for the USB serial number.
+pub const LAYOUT_ID: &str = match core::str::from_utf8(&LAYOUT_ID_BYTES) {
+    Ok(s) => s,
+    // Unreachable: every byte comes from an ASCII table.
+    Err(_) => "BADLAYOUT",
+};
+
 /// Where a data sector falls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Position {
