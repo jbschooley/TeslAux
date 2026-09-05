@@ -153,7 +153,20 @@ def find_offset(ref, rec, probe=48000, search=None):
     window = energy[len(needle) :] - energy[: -len(needle)]
     denom = np.sqrt(window) * np.linalg.norm(needle)
     denom[denom <= 0] = np.inf
-    peak = int(np.argmax(np.abs(corr / denom)))
+    ncc = np.abs(corr / denom)
+    # Take the EARLIEST offset that matches about as well as the best one, not
+    # the best one itself. A recording left running past the end of the material
+    # contains it twice, both copies correlate at 1.000, and which of them wins
+    # is decided by whichever has fewer edits inside the one-second probe. That
+    # is how a fourteen-minute capture aligned on its own last two minutes and
+    # reported them as the whole result, silently discarding the eleven minutes
+    # actually under test.
+    best = float(ncc.max())
+    if best > 0:
+        good = np.nonzero(ncc >= 0.98 * best)[0]
+        peak = int(good[0])
+    else:
+        peak = int(np.argmax(ncc))
     return peak - start
 
 
@@ -661,9 +674,36 @@ def _self_test():
         ok = False
 
     ok = _check_lead_in() and ok
+    ok = _check_repeated_material() and ok
 
     print("\nself-test:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
+
+
+def _check_repeated_material():
+    """When the material appears twice, align on the FIRST copy.
+
+    A recording left running past the end holds the reference twice. Both copies
+    correlate at 1.000, so the winner is decided by which has fewer edits inside
+    the one-second probe — and the later copy, being shorter and quieter, often
+    wins. A fourteen-minute capture aligned on its own final two minutes and
+    reported them as the whole result.
+    """
+    rng = np.random.default_rng(11)
+    rate = 48000
+    ref = rng.integers(-20000, 20000, size=(4 * rate, 2)).astype(np.int16)
+    flawed = ref.copy()
+    # A blemish inside the probe window, enough to lose a tie but not a match.
+    flawed[1000:1100] = 0
+    gap = np.zeros((rate, CHANNELS), dtype=np.int16)
+    rec = np.concatenate([flawed, gap, ref])
+
+    off = find_offset(ref, rec)
+    if off is not None and abs(off) < 100:
+        print("  ok   material recorded twice -> aligns on the first copy")
+        return True
+    print(f"  FAIL material recorded twice: aligned at {off}, expected ~0")
+    return False
 
 
 def _check_lead_in():
