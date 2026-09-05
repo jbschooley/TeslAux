@@ -226,6 +226,16 @@ async fn report_task() -> ! {
                 ctl.mpsiz(),
                 ctl.eptyp().to_bits(),
             );
+            // TX FIFO space, in 32-bit words. A 196-byte packet needs 49. If
+            // this is short, the FIFO is holding something stale — which is
+            // exactly what an interrupted disable/enable of an isochronous IN
+            // endpoint would leave behind, and the car toggles alt 1/0/1 in a
+            // way no working host does.
+            defmt::info!(
+                "   ep1 TX FIFO: {} words free (need 49), fifo base/size {:#x}",
+                R.dtxfsts(1).read().ineptfsav(),
+                R.dieptxf(0).read().0,
+            );
         }
     }
 }
@@ -469,6 +479,23 @@ async fn sink(mut ep: impl EndpointOut) -> ! {
     }
 }
 
+/// Discard anything staged in the car endpoint's TX FIFO.
+///
+/// `embassy-usb` has no API for this — it is a property of the Synopsys core
+/// rather than of the USB model — so it goes through the PAC.
+fn flush_car_tx_fifo() {
+    use embassy_stm32::pac::USB_OTG_FS as R;
+    R.grstctl().modify(|w| {
+        w.set_txfnum(1);
+        w.set_txfflsh(true);
+    });
+    // Bounded: never spin forever on a peripheral that is not answering.
+    let mut spins = 0u32;
+    while R.grstctl().read().txfflsh() && spins < 100_000 {
+        spins += 1;
+    }
+}
+
 /// Consumer: hand the car one packet per USB frame, sized to hold the buffer at
 /// target.
 async fn pump(mut iso_in: impl EndpointIn) -> ! {
@@ -477,6 +504,23 @@ async fn pump(mut iso_in: impl EndpointIn) -> ! {
     loop {
         iso_in.wait_enabled().await;
         ENABLED.store(ENABLED.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
+
+        // Flush the endpoint's TX FIFO now that it has been (re-)enabled.
+        //
+        // This is the fix for the car, and it belongs here because here is where
+        // the damage is done. The car sets alt 1 -> 0 -> 1 in rapid succession —
+        // no host that works does this — and a packet staged in the TX FIFO when
+        // the endpoint is disabled stays there. Re-enabling does not clear it,
+        // the core cannot stage another behind it, and the endpoint goes silent
+        // for good: active, correctly configured as isochronous, and never
+        // transmitting again.
+        //
+        // It presents as the *host* refusing to poll us, which is what made it
+        // hard to find: the bus keeps clocking, the frame counter advances, the
+        // endpoint reports active, and every counter we own looks reasonable.
+        // Only DIEPCTL.EPENA staying false through thousands of writes gave it
+        // away.
+        flush_car_tx_fifo();
 
         // Drop whatever piled up while the car was not listening.
         //
@@ -514,6 +558,9 @@ async fn pump(mut iso_in: impl EndpointIn) -> ! {
                         WRITE_TIMEOUTS.load(Ordering::Relaxed).wrapping_add(1),
                         Ordering::Relaxed,
                     );
+                    // Belt and braces: the same flush on the recovery path, so
+                    // a stall from any other cause cannot become permanent.
+                    flush_car_tx_fifo();
                     // Go back and re-arm rather than retrying in place. The car
                     // sets alt 1/0/1/0/1 in quick succession and then stops; if
                     // the driver's endpoint state ends up out of step with that,
