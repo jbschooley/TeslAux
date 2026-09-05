@@ -30,15 +30,14 @@ pub const SECTOR: usize = 512;
 /// embedded media player may never have been tested against one that is not.
 /// 2048 is the conventional first-partition offset (1 MiB alignment).
 pub const PARTITION_START: u32 = 2048;
-/// 2 KB clusters.
+/// 32 KB clusters, which is what a host would choose for a volume this size.
 ///
-/// Cluster size and volume size pull against each other here. FAT32 is only
-/// FAT32 above 65524 clusters — below that a host must read the volume as
-/// FAT16, and the BPB we emit is FAT32, so the mismatch makes it unreadable
-/// rather than merely smaller. Large clusters keep the FAT small but need a
-/// large volume to clear that floor; the volume now needs to be *small*, so the
-/// clusters shrink instead. See `_LAYOUT`, which enforces it.
-pub const SECTORS_PER_CLUSTER: u32 = 4;
+/// FAT32 is only FAT32 above 65524 clusters: below that a host must read the
+/// volume as FAT16 while the BPB says FAT32, and the mismatch makes it
+/// unreadable rather than merely smaller. Large clusters keep the FAT small but
+/// need a large volume to clear that floor, so cluster size and volume size have
+/// to be chosen together. `_LAYOUT` enforces the result.
+pub const SECTORS_PER_CLUSTER: u32 = 64;
 pub const CLUSTER_BYTES: u32 = SECTORS_PER_CLUSTER * SECTOR as u32;
 pub const RESERVED_SECTORS: u32 = 32;
 
@@ -48,20 +47,28 @@ pub const CHANNELS: u16 = 2;
 pub const BITS: u16 = 16;
 pub const BYTES_PER_SECOND: u32 = SAMPLE_RATE * CHANNELS as u32 * (BITS as u32 / 8);
 
-/// Seconds per track.
+/// Ten minutes per track.
 ///
-/// This trades two things against each other.
+/// Three things pull against each other in this file, and this constant is
+/// where two of them meet.
 ///
-/// **Long tracks** mean a natural end-of-track advance is rare, which keeps the
-/// media-control detector simple. **Short tracks** keep the volume small, which
-/// matters more than it first appears: the device serves about 958 KB/s, so a
-/// host that scans file contents while indexing needs `TOTAL / 958 KB/s` to get
-/// through it — 40 minutes for a 2.3 GB volume. A car that re-indexes on every
-/// wake will never finish that.
+/// **Long tracks** mean the player reaches the end of one rarely, so the
+/// detector rarely has to tell a natural advance from a button press. Every such
+/// judgement is a chance to be wrong, and the cheapest way to be right is to
+/// have fewer of them to make.
 ///
-/// 30 seconds puts the whole volume at ~115 MB, which scans in about two
-/// minutes. Raise it once the car is known to accept the volume at all.
-pub const TRACK_SECONDS: u32 = 30;
+/// **Short tracks** keep the volume small, which matters because the car
+/// re-indexes on **every wake**, not just on insertion.
+///
+/// The third is the sample rate below, and it is the one that is easy to get
+/// backwards. Silence needs no fidelity, so a low rate would shrink the volume
+/// enormously and make long tracks nearly free — but the rate is what forces the
+/// car to keep reading, and *reads stopping* is how a pause is detected. At
+/// 48 kHz stereo the car must read about three times a second; at 8 kHz mono it
+/// would read once every few seconds, and pause detection would slow to match.
+/// The read rate is the signal, so the bitrate stays high and the volume is
+/// paid for in size.
+pub const TRACK_SECONDS: u32 = 600;
 pub const WAV_HEADER: u32 = 44;
 pub const TRACK_DATA_BYTES: u32 = TRACK_SECONDS * BYTES_PER_SECOND;
 pub const TRACK_FILE_BYTES: u32 = TRACK_DATA_BYTES + WAV_HEADER;
@@ -72,7 +79,7 @@ pub const TRACK_FILE_BYTES: u32 = TRACK_DATA_BYTES + WAV_HEADER;
 ///
 /// Raised alongside the shorter tracks: more tracks widen the counter and cost
 /// almost nothing, since every sector is computed.
-pub const N_TRACKS: u32 = 40;
+pub const N_TRACKS: u32 = 24;
 
 pub const CLUSTERS_PER_FILE: u32 = TRACK_FILE_BYTES.div_ceil(CLUSTER_BYTES);
 /// Cluster 2 is the root directory; the files follow it.
@@ -89,9 +96,9 @@ pub const USED_CLUSTERS: u32 = 1 + N_TRACKS * CLUSTERS_PER_FILE;
 /// wants to write an index has nowhere to put it. Real drives always have
 /// slack.
 ///
-/// Half the volume is generous, and costs nothing: free clusters are never
-/// read, and every sector is computed anyway.
-pub const FREE_CLUSTERS: u32 = USED_CLUSTERS;
+/// A quarter of the used space is ample, and costs nothing to claim: free
+/// clusters are never read, and every sector is computed anyway.
+pub const FREE_CLUSTERS: u32 = USED_CLUSTERS / 4;
 pub const DATA_CLUSTERS: u32 = USED_CLUSTERS + FREE_CLUSTERS;
 pub const FAT_SECTORS: u32 = ((DATA_CLUSTERS + 2) * 4).div_ceil(SECTOR as u32);
 pub const FAT_START: u32 = RESERVED_SECTORS;

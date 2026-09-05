@@ -298,7 +298,53 @@ argument:
 | **Writes accepted, not refused** | write-protected media may be declined outright; a scanner writing a lock file needs the write to succeed, not persist |
 | **EVPD inquiries answered** | returning standard data to a request for a serial number is a protocol violation |
 
-### Read pacing is load-bearing, not polish### Read pacing is load-bearing, not polish
+### Sizing the volume: three constraints, not two
+
+The shipping volume is **24 silent tracks of 10 minutes, 48 kHz 16-bit stereo —
+3.46 GB, of which 1.2 MB actually exists.**
+
+* **Long tracks** mean the player reaches the end of one rarely, so the detector
+  rarely has to tell a natural advance from a button press. Every such judgement
+  is a chance to be wrong; the cheapest way to be right is to have fewer to make.
+* **Small volumes** index faster, and the car re-indexes on **every wake**.
+* **High bitrate** is the one that is easy to get backwards. Silence needs no
+  fidelity, so 8 kHz mono would shrink the volume twelvefold and make long tracks
+  nearly free — but the bitrate is what forces the car to keep reading, and
+  *reads stopping* is how a pause is detected. At 48 kHz stereo the car reads
+  about three times a second; at 8 kHz mono it would read once every few seconds
+  and pause detection would slow to match.
+
+**The read rate is the signal.** So the bitrate stays high, the tracks stay long,
+and the volume is paid for in claimed size — which is free, because none of it
+is stored.
+
+24 tracks gives the counter a range of about ±12, far more than any burst of
+button presses needs.
+
+### Read pacing is load-bearing, not polish### Sizing the volume: three constraints, not two
+
+The shipping volume is **24 silent tracks of 10 minutes, 48 kHz 16-bit stereo —
+3.46 GB, of which 1.2 MB actually exists.**
+
+* **Long tracks** mean the player reaches the end of one rarely, so the detector
+  rarely has to tell a natural advance from a button press. Every such judgement
+  is a chance to be wrong; the cheapest way to be right is to have fewer to make.
+* **Small volumes** index faster, and the car re-indexes on **every wake**.
+* **High bitrate** is the one that is easy to get backwards. Silence needs no
+  fidelity, so 8 kHz mono would shrink the volume twelvefold and make long tracks
+  nearly free — but the bitrate is what forces the car to keep reading, and
+  *reads stopping* is how a pause is detected. At 48 kHz stereo the car reads
+  about three times a second; at 8 kHz mono it would read once every few seconds
+  and pause detection would slow to match.
+
+**The read rate is the signal.** So the bitrate stays high, the tracks stay long,
+and the volume is paid for in claimed size — which is free, because none of it
+is stored.
+
+24 tracks gives the counter a range of about ±12, far more than any burst of
+button presses needs.
+
+### Read pacing is load-bearing, not polish
 
 That throughput measurement changes a design assumption. **958 KB/s is about
 five times real time** — 48 kHz/16-bit stereo playback needs 192 KB/s. A car
