@@ -30,9 +30,15 @@ pub const SECTOR: usize = 512;
 /// embedded media player may never have been tested against one that is not.
 /// 2048 is the conventional first-partition offset (1 MiB alignment).
 pub const PARTITION_START: u32 = 2048;
-/// 32 KB clusters. Larger clusters mean a smaller FAT to synthesise, and the
-/// cluster count still has to stay above FAT32's minimum — see `_LAYOUT`.
-pub const SECTORS_PER_CLUSTER: u32 = 64;
+/// 2 KB clusters.
+///
+/// Cluster size and volume size pull against each other here. FAT32 is only
+/// FAT32 above 65524 clusters — below that a host must read the volume as
+/// FAT16, and the BPB we emit is FAT32, so the mismatch makes it unreadable
+/// rather than merely smaller. Large clusters keep the FAT small but need a
+/// large volume to clear that floor; the volume now needs to be *small*, so the
+/// clusters shrink instead. See `_LAYOUT`, which enforces it.
+pub const SECTORS_PER_CLUSTER: u32 = 4;
 pub const CLUSTER_BYTES: u32 = SECTORS_PER_CLUSTER * SECTOR as u32;
 pub const RESERVED_SECTORS: u32 = 32;
 
@@ -42,14 +48,20 @@ pub const CHANNELS: u16 = 2;
 pub const BITS: u16 = 16;
 pub const BYTES_PER_SECOND: u32 = SAMPLE_RATE * CHANNELS as u32 * (BITS as u32 / 8);
 
-/// Ten minutes per track.
+/// Seconds per track.
 ///
-/// Short tracks keep the volume small, which matters because Tesla re-indexes
-/// the drive **every time the car wakes**, not just on insertion. The cost is
-/// that a track occasionally ends on its own; that is distinguishable from a
-/// button press, because a natural advance happens only after the player has
-/// read to the end of the file.
-pub const TRACK_SECONDS: u32 = 600;
+/// This trades two things against each other.
+///
+/// **Long tracks** mean a natural end-of-track advance is rare, which keeps the
+/// media-control detector simple. **Short tracks** keep the volume small, which
+/// matters more than it first appears: the device serves about 958 KB/s, so a
+/// host that scans file contents while indexing needs `TOTAL / 958 KB/s` to get
+/// through it — 40 minutes for a 2.3 GB volume. A car that re-indexes on every
+/// wake will never finish that.
+///
+/// 30 seconds puts the whole volume at ~115 MB, which scans in about two
+/// minutes. Raise it once the car is known to accept the volume at all.
+pub const TRACK_SECONDS: u32 = 30;
 pub const WAV_HEADER: u32 = 44;
 pub const TRACK_DATA_BYTES: u32 = TRACK_SECONDS * BYTES_PER_SECOND;
 pub const TRACK_FILE_BYTES: u32 = TRACK_DATA_BYTES + WAV_HEADER;
@@ -57,7 +69,10 @@ pub const TRACK_FILE_BYTES: u32 = TRACK_DATA_BYTES + WAV_HEADER;
 /// How many tracks. This is the range of the counter, not a musical choice:
 /// with N tracks a burst of presses can be resolved up to about N/2 in either
 /// direction before wrap-around becomes ambiguous.
-pub const N_TRACKS: u32 = 20;
+///
+/// Raised alongside the shorter tracks: more tracks widen the counter and cost
+/// almost nothing, since every sector is computed.
+pub const N_TRACKS: u32 = 40;
 
 pub const CLUSTERS_PER_FILE: u32 = TRACK_FILE_BYTES.div_ceil(CLUSTER_BYTES);
 /// Cluster 2 is the root directory; the files follow it.

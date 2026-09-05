@@ -194,7 +194,21 @@ problem**, and neither is the partition table, the mass-storage class or the
 SCSI subset.
 
 Whatever the car objects to is about the files or the volume, not about being
-able to read them.
+able to read them. The LED then reported **cyan — several tracks opened, but
+not all forty**, which is the pattern of a scan that started and stopped
+partway.
+
+That points at time rather than format. The device serves about **958 KB/s**, so
+a host scanning file contents needs `TOTAL / 958 KB/s` to get through the
+volume — **40 minutes for 2.3 GB**, and the car re-indexes on every wake. The
+volume is now 30-second tracks with 2 KB clusters, **232 MB, about four
+minutes**, which is a tenth of the work.
+
+Shrinking it tripped the FAT32 cluster floor, which is what the `_LAYOUT`
+assertion is for: below 65525 clusters a host must read the volume as FAT16
+while the BPB says FAT32, and the mismatch makes it unreadable rather than
+merely smaller. Smaller tracks therefore needed smaller clusters to keep the
+count up.
 
 ### If the car does not offer it as a media source
 
