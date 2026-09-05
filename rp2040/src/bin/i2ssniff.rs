@@ -27,6 +27,9 @@ use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_time::{Instant, Timer};
 use smart_leds::RGB8;
 
+#[macro_use]
+#[path = "../pins.rs"]
+mod pins;
 #[path = "../ws2812.rs"]
 mod ws2812;
 
@@ -56,8 +59,11 @@ async fn main(_spawner: Spawner) {
     // No pulls: we want to see what the other board is actually driving. A
     // floating input would read noise, which shows up as "both toggling" — so
     // treat green with nothing else working as suspect and check continuity.
-    let bck = Input::new(p.PIN_3, Pull::None);
-    let lrck = Input::new(p.PIN_4, Pull::None);
+    // Must match the sink board's real wiring, or this reports "no clock" on a
+    // link that is working perfectly. See `pins`.
+    let (_, bck, lrck) = sink_i2s_pins!(p);
+    let bck = Input::new(bck, Pull::None);
+    let lrck = Input::new(lrck, Pull::None);
 
     loop {
         let (mut b_edges, mut l_edges) = (0u32, 0u32);

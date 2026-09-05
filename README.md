@@ -30,15 +30,26 @@ at all.
 
 ## Build and flash
 
-Two identical **RP2040-Zero** boards, about $3 each. Wire three signals and a
+Two identical **RP2040-Zero** boards, about $3 each. Solder four signals and a
 ground between them:
 
 | source board | | car board |
 |---|---|---|
-| GPIO2 | → | GPIO2 (data) |
-| GPIO3 | → | GPIO3 (bit clock) |
-| GPIO4 | → | GPIO4 (word clock) |
+| GPIO12 | → | GPIO10 (DATA) |
+| GPIO11 | → | GPIO11 (BCK) |
+| GPIO10 | → | GPIO12 (SHIELD) |
+| GPIO9 | → | GPIO13 (LRCK) |
 | GND | → | GND |
+
+The pins are the bottom row, so the two boards can be soldered edge to edge with
+one rotated 180 degrees — every pair above sums to 22, which is what facing pads
+do. Four-inch jumpers were corrupting one sample in roughly every 1,400: the
+right channel replaced by its own sign bit, up to 44% of full scale in a single
+sample, which is audible as a pop every few minutes.
+
+SHIELD carries no signal. The source holds it low so a driven conductor sits
+between BCK and LRCK, which is where the coupling was. `rp2040/src/pins.rs` has
+the measurement and refuses to build if the map stops being physically possible.
 
 Ground is not optional — the boards are powered from different USB ports.
 

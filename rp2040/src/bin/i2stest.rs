@@ -59,6 +59,10 @@ async fn main(_spawner: Spawner) {
     let Pio { mut common, sm0, .. } = Pio::new(p.PIO0, Irqs);
     let program = PioI2sOutProgram::new(&mut common);
     let mut i2s = PioI2sOut::new(
+        // NOTE: the ORIGINAL three-wire pinout, not the shielded one in `pins`.
+        // Upstream's driver owns its side-set and needs BCK and LRCK adjacent,
+        // so it cannot leave a gap for the shield — which means it can no longer
+        // feed `slave_rx` without rejumpering to GP2/3/4 on both ends.
         &mut common, sm0, p.DMA_CH0, p.PIN_2, p.PIN_3, p.PIN_4, RATE, BIT_DEPTH, &program,
     );
 
