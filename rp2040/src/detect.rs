@@ -28,10 +28,6 @@ pub enum Event {
     Next(u32),
     /// The user pressed previous `n` times.
     Prev(u32),
-    /// The user pressed previous, and the player restarted the current track
-    /// rather than moving back — which is what most players do on the first
-    /// press.
-    Restart,
     /// Playback stopped: reads have gone quiet while a track was open.
     Paused,
     /// Playback resumed after a pause.
@@ -181,15 +177,19 @@ impl Detector {
         }
     }
 
-    /// Call when a read lands in the *current* track at a much earlier offset:
-    /// the player restarted it, which is what most do on the first `previous`.
-    pub fn note_seek_backwards(&mut self, pos: Position) -> Option<Event> {
-        if self.current == Some(pos.track) && pos.offset + END_TOLERANCE_BYTES < self.high_water {
-            self.high_water = pos.offset;
-            return Some(Event::Restart);
-        }
-        None
-    }
+    // There is deliberately no restart detection.
+    //
+    // Most players make the first `previous` press restart the current track
+    // rather than move back, and detecting that looked easy: a read landing
+    // much earlier in the file than the furthest one so far. In the car it fired
+    // constantly. Hosts read out of order as a matter of course — a header for
+    // metadata, a seek to fill a buffer, a re-read after a gap — and every one
+    // of those looks like a backwards seek.
+    //
+    // It reported a press on almost every genuine track change, because after
+    // moving to a new track the car reads its header at offset zero. Since a
+    // false press is directly audible on the source and the feature only saves
+    // the user a second press, it is not worth having on those terms.
 
     /// Call periodically. Reports a pause once reads have been quiet.
     pub fn tick(&mut self, now_ms: u32) -> Option<Event> {
@@ -349,19 +349,18 @@ mod tests {
     }
 
     #[test]
-    fn restarting_the_current_track_is_distinguishable_from_a_skip() {
-        // Most players make the first `previous` restart the track. That is a
-        // backwards seek within one file, not a move between files.
+    fn reading_a_header_after_a_track_change_is_not_a_second_event() {
+        // What restart detection got wrong: on moving to a new track the car
+        // reads its header at offset zero, which looks exactly like seeking
+        // backwards. Reporting that produced a `previous` alongside every
+        // `next`.
         let mut d = det();
-        playing(&mut d, 7, 0);
+        playing(&mut d, 3, 0);
+        assert_eq!(reads(&mut d, 4, 500_000, SETTLE_READS, 1000), Some(Event::Next(1)));
         assert_eq!(
-            d.note_seek_backwards(Position { track: 7, offset: 0 }),
-            Some(Event::Restart)
-        );
-        // And ordinary forward progress is not a restart.
-        assert_eq!(
-            d.note_seek_backwards(Position { track: 7, offset: TRACK_BYTES / 2 }),
-            None
+            d.on_read(Position { track: 4, offset: 0 }, 1100),
+            None,
+            "a header read after a skip reported an event"
         );
     }
 

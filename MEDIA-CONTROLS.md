@@ -151,18 +151,39 @@ What the tests pin down:
 | a press in the last seconds | still a press, if it lands further than one track on |
 | track 23 to track 0 | `Next(1)`, not `Prev(23)` |
 | a metadata peek at another file | **no event** — hosts read stray headers while indexing |
-| first `previous` restarting the track | `Restart`, distinguished from a skip |
 | a full lap of the playlist | **no events at all** |
+
+**Restart detection was removed after testing.** Most players make the first
+`previous` press restart the current track, and spotting that looked easy: a
+read landing much earlier in the file than the furthest one so far. In the car
+it fired constantly — hosts read out of order as a matter of course, and on
+moving to a new track the car reads its header at offset zero, which looks
+exactly like a backwards seek. Every genuine `next` came with a spurious
+`previous` alongside it. A false press is directly audible on the source, and
+the feature only saved the user a second button press.
 
 The LED reports events as they happen: **white flash** for next, **purple** for
 previous, **blue** while paused. Press a button and the colour changes
 immediately — which is what makes a false positive visible, where a count read
 afterwards could not say *which* press was wrong.
 
+**Also built: read pacing.** Track data is served at **1.1x real time** after a
+two-second burst; metadata is never paced, since throttling the FAT and the
+directory would make every wake slow.
+
+This is what makes pause detection possible rather than merely faster. Served at
+full speed the car filled its buffer, stopped reading for seconds, and played
+from memory — so *reads stopping* meant nothing, and the LED flapped between
+"playing" and "paused" throughout normal playback. Held to barely above real
+time the car can never get ahead, so it reads about three times a second and a
+pause shows up within one read.
+
+The two-second burst exists so a player can prime its buffer without stuttering
+at the start of a track; it is small enough that a pause cannot hide behind it.
+
 **Not built:**
 
-1. **Read pacing** — serve just above real time so a pause shows in ~300 ms.
-2. **A Consumer Control HID interface on the source side**, to send the media
+1. **A Consumer Control HID interface on the source side**, to send the media
    keys onward. Standard and well supported by any Android or Linux userspace;
    it touches only the source-facing descriptors, so the cloned mic side the car
    validates stays byte-identical.

@@ -127,6 +127,24 @@ static LAST_READ_MS: AtomicU32 = AtomicU32::new(0);
 
 /// How long an event stays on the LED.
 const FLASH_MS: u32 = 1200;
+
+/// Bytes of track data a second of playback consumes: 48 kHz, 16-bit, stereo.
+const PLAYBACK_BYTES_PER_SEC: u64 = 48_000 * 2 * 2;
+/// How much faster than real time track data is served.
+///
+/// Just above 1, and that is the whole point. Served at full speed the car
+/// fills its buffer, stops reading for seconds at a time, and plays from
+/// memory — so *reads stopping* means nothing, and a pause is invisible until
+/// the buffer drains. Held to barely above real time it can never get ahead,
+/// so it reads continuously and a pause shows up within one read.
+const PACE_NUMERATOR: u64 = 11;
+const PACE_DENOMINATOR: u64 = 10;
+/// Track data servable at full speed before pacing applies, per track.
+///
+/// A player wants a buffer before it starts, and throttling from the first byte
+/// risks a stutter at the start of every track. This is enough to prime one and
+/// not enough to hide a pause behind.
+const BURST_BYTES: u64 = 2 * PLAYBACK_BYTES_PER_SEC;
 /// Quiet time that counts as playback having stopped. Matches the detector.
 const PAUSE_AFTER_MS: u32 = 400;
 /// A SCSI command was refused *after* the host had started reading tracks.
@@ -240,14 +258,8 @@ fn note_event(ev: Option<Event>) {
             bump(0, n);
             flash(1);
         }
-        // A restart is the first press of `previous` on most players, so it
-        // counts as one backwards press rather than as its own thing.
         Some(Event::Prev(n)) => {
             bump(16, n);
-            flash(2);
-        }
-        Some(Event::Restart) => {
-            bump(16, 1);
             flash(2);
         }
         Some(Event::Paused) => PLAYBACK_PAUSED.store(true, Ordering::Relaxed),
@@ -357,6 +369,9 @@ async fn main(spawner: Spawner) {
 
     let mut scsi = Scsi::new(fat::TOTAL_SECTORS, SECTOR as u32);
     let mut detector = Detector::new(fat::N_TRACKS, fat::TRACK_FILE_BYTES);
+    // Pacing state: a credit of bytes that refills at the playback rate.
+    let mut credit: u64 = BURST_BYTES;
+    let mut credit_ms: u64 = embassy_time::Instant::now().as_millis();
     let mut cbw_buf = [0u8; 64];
     let mut reply = [0u8; 64];
     let mut sector = [0u8; SECTOR];
@@ -404,6 +419,32 @@ async fn main(spawner: Spawner) {
                     }
                 }
                 Action::ReadBlocks { lba, blocks } => {
+                    // Pace reads of track data, and only those. Metadata — the
+                    // FAT, the directory, the partition table — is read while
+                    // indexing, and throttling it would make every wake slow.
+                    if fat::locate(lba).is_some() {
+                        let now = embassy_time::Instant::now().as_millis();
+                        let elapsed = now.saturating_sub(credit_ms);
+                        credit_ms = now;
+                        credit = (credit + elapsed * PLAYBACK_BYTES_PER_SEC * PACE_NUMERATOR
+                            / (1000 * PACE_DENOMINATOR))
+                            .min(BURST_BYTES);
+
+                        let want = blocks as u64 * SECTOR as u64;
+                        if credit < want {
+                            // Wait for the credit this read needs rather than
+                            // refusing it: the host is entitled to its data,
+                            // just not to it early.
+                            let short = want - credit;
+                            let ms = short * 1000 * PACE_DENOMINATOR
+                                / (PLAYBACK_BYTES_PER_SEC * PACE_NUMERATOR);
+                            embassy_time::Timer::after_millis(ms.min(2000)).await;
+                            credit = want;
+                            credit_ms = embassy_time::Instant::now().as_millis();
+                        }
+                        credit -= want;
+                    }
+
                     let mut sent = 0u32;
                     let mut failed = false;
                     for i in 0..blocks {
@@ -418,10 +459,7 @@ async fn main(spawner: Spawner) {
                             let now = embassy_time::Instant::now().as_millis() as u32;
                             LAST_READ_MS.store(now, Ordering::Relaxed);
                             let p = detect::Position { track: pos.track, offset: pos.offset };
-                            let ev = detector
-                                .note_seek_backwards(p)
-                                .or_else(|| detector.on_read(p, now));
-                            note_event(ev);
+                            note_event(detector.on_read(p, now));
                         }
                         fat::read_sector(lba + i, &mut sector);
                         if write_all(&mut ep_in, &sector).await.is_err() {
