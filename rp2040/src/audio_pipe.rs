@@ -259,6 +259,21 @@ impl<const N: usize> Pipe<N> {
     /// Dropping it in one step is a single splice, at the one moment the stream
     /// is starting anyway. Not counted as overruns: this is deliberate.
     pub fn trim_to_target(&mut self) {
+        // Only a genuine backlog, never the ordinary working level.
+        //
+        // Discarding down to exactly `target` looked harmless and was not: the
+        // pacer deliberately lets the level sit anywhere inside the deadband, so
+        // a level slightly above target is *normal*, and trimming it throws away
+        // real audio. Called on every stream open — which the car does
+        // constantly, toggling alt 0/1 — that is a click each time, and it was
+        // audible in the car within minutes.
+        //
+        // Above the deadband there is a real backlog and one splice is cheaper
+        // than shedding a frame per packet for a quarter of a second. Inside it,
+        // the pacer is already doing the right thing losslessly.
+        if self.len <= self.target + self.hyst {
+            return;
+        }
         while self.len > self.target {
             self.tail = (self.tail + 1) % N;
             self.len -= 1;
@@ -748,7 +763,7 @@ mod tests {
     #[test]
     fn trim_drops_a_backlog_and_keeps_the_newest() {
         let mut p = Pipe::<512>::new(48000);
-        // Fill past target, as an alt-0 period does.
+        // Fill to capacity, as an alt-0 period does: well past the deadband.
         for i in 0..512 {
             p.push([i as i16, i as i16]);
         }
@@ -759,6 +774,25 @@ mod tests {
         assert_eq!(p.pop(), [256, 256], "trim kept the wrong end");
         // Deliberate, so not counted as a fault.
         assert_eq!(p.stats.overruns, 0, "trim counted as overruns");
+    }
+
+    #[test]
+    fn trim_leaves_the_ordinary_working_level_alone() {
+        // The regression this guards: the pacer holds the level inside the
+        // deadband, so a level above target is normal. Trimming it discards
+        // audio, and on the car board that happened at every alt toggle —
+        // audible as clicking.
+        let mut p = Pipe::<256>::new_with_hysteresis(48000, 64);
+        for _ in 0..(p.target() + 32) {
+            p.push([1234, -1234]);
+        }
+        let before = p.off_target();
+        p.trim_to_target();
+        assert_eq!(
+            p.off_target(),
+            before,
+            "trimmed a level the pacer was already handling"
+        );
     }
 
     #[test]

@@ -763,8 +763,12 @@ async fn pump(
                     // trim above never re-runs while the pipe fills. Catch it
                     // where it actually shows: a gap between delivered packets
                     // far longer than the one-frame polling interval.
+                    // 20 ms was too eager: ordinary jitter in the car's polling
+                    // reaches it, and each trim that fires on a healthy level
+                    // discards audio. A quarter of a second is unambiguously a
+                    // host that stopped listening, not one that hesitated.
                     let now = Instant::now();
-                    if now.duration_since(last_write) > Duration::from_millis(20) {
+                    if now.duration_since(last_write) > Duration::from_millis(250) {
                         PIPE.lock(|p| p.borrow_mut().trim_to_target());
                     }
                     last_write = now;
