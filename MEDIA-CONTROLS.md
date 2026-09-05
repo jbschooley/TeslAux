@@ -1,5 +1,22 @@
 # Media controls from the car's own buttons
 
+> **Current state.** The drive ships as **one silent 10-minute track** whose only
+> job is to be something harmless for the car to play, so the car's media
+> controls act on *it* rather than on whatever else is connected — a phone on
+> Bluetooth for calls, which a steering-wheel press should not skip.
+>
+> The detection scheme below is built, tested and works, but is not in use.
+> Inferring presses from which track the car moved to means reading a side
+> effect, and a player caches what it has read, restarts a track instead of
+> moving back, and reads ahead unevenly. Each of those was worked around; none of
+> them went away. **ScreenMate already sits on the car's CAN buses and can bind
+> the steering wheel's buttons to its own playback directly** — the right end of
+> the problem — so the plan is to wait for that rather than keep refining an
+> inference.
+>
+> `detect.rs` remains, with its tests. Nothing in the shipping build depends on
+> it.
+
 Goal: make the steering wheel's next / previous / play-pause control **whatever
 is feeding the bridge** — a ScreenMate, a phone — rather than the car's own
 media player.

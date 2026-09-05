@@ -30,14 +30,14 @@ pub const SECTOR: usize = 512;
 /// embedded media player may never have been tested against one that is not.
 /// 2048 is the conventional first-partition offset (1 MiB alignment).
 pub const PARTITION_START: u32 = 2048;
-/// 32 KB clusters, which is what a host would choose for a volume this size.
+/// 2 KB clusters.
 ///
 /// FAT32 is only FAT32 above 65524 clusters: below that a host must read the
 /// volume as FAT16 while the BPB says FAT32, and the mismatch makes it
-/// unreadable rather than merely smaller. Large clusters keep the FAT small but
-/// need a large volume to clear that floor, so cluster size and volume size have
-/// to be chosen together. `_LAYOUT` enforces the result.
-pub const SECTORS_PER_CLUSTER: u32 = 64;
+/// unreadable rather than merely smaller. Cluster size and volume size are
+/// therefore chosen together, and with a single track the volume is small — so
+/// the clusters have to be small to keep the count up. `_LAYOUT` enforces it.
+pub const SECTORS_PER_CLUSTER: u32 = 4;
 pub const CLUSTER_BYTES: u32 = SECTORS_PER_CLUSTER * SECTOR as u32;
 pub const RESERVED_SECTORS: u32 = 32;
 
@@ -47,39 +47,32 @@ pub const CHANNELS: u16 = 2;
 pub const BITS: u16 = 16;
 pub const BYTES_PER_SECOND: u32 = SAMPLE_RATE * CHANNELS as u32 * (BITS as u32 / 8);
 
-/// Ten minutes per track.
+/// Ten minutes, which the car loops with repeat enabled.
 ///
-/// Three things pull against each other in this file, and this constant is
-/// where two of them meet.
-///
-/// **Long tracks** mean the player reaches the end of one rarely, so the
-/// detector rarely has to tell a natural advance from a button press. Every such
-/// judgement is a chance to be wrong, and the cheapest way to be right is to
-/// have fewer of them to make.
-///
-/// **Short tracks** keep the volume small, which matters because the car
-/// re-indexes on **every wake**, not just on insertion.
-///
-/// The third is the sample rate below, and it is the one that is easy to get
-/// backwards. Silence needs no fidelity, so a low rate would shrink the volume
-/// enormously and make long tracks nearly free — but the rate is what forces the
-/// car to keep reading, and *reads stopping* is how a pause is detected. At
-/// 48 kHz stereo the car must read about three times a second; at 8 kHz mono it
-/// would read once every few seconds, and pause detection would slow to match.
-/// The read rate is the signal, so the bitrate stays high and the volume is
-/// paid for in size.
+/// Long enough that reaching the end is rare, short enough that the volume stays
+/// small — and the car re-indexes on **every wake**, not just on insertion.
 pub const TRACK_SECONDS: u32 = 600;
 pub const WAV_HEADER: u32 = 44;
 pub const TRACK_DATA_BYTES: u32 = TRACK_SECONDS * BYTES_PER_SECOND;
 pub const TRACK_FILE_BYTES: u32 = TRACK_DATA_BYTES + WAV_HEADER;
 
-/// How many tracks. This is the range of the counter, not a musical choice:
-/// with N tracks a burst of presses can be resolved up to about N/2 in either
-/// direction before wrap-around becomes ambiguous.
+/// One track.
 ///
-/// Raised alongside the shorter tracks: more tracks widen the counter and cost
-/// almost nothing, since every sector is computed.
-pub const N_TRACKS: u32 = 24;
+/// The volume's job is to be **something harmless for the car to play**, so that
+/// the car's media controls act on it rather than on whatever else is connected
+/// — a phone on Bluetooth for calls, say, which should not be skipped by a
+/// steering-wheel press meant for the bridge.
+///
+/// It was a 24-track playlist when the plan was to *infer* button presses from
+/// which track the car moved to. That worked, but only by reading a side effect:
+/// a player caches what it has read, restarts a track instead of moving back,
+/// and reads ahead unevenly, and every one of those had to be worked around.
+/// The detector in `detect.rs` still exists and still passes its tests; nothing
+/// here depends on it any more.
+///
+/// One track also means a `next` press has nowhere to go, which is the point: it
+/// cannot skip anything real.
+pub const N_TRACKS: u32 = 1;
 
 pub const CLUSTERS_PER_FILE: u32 = TRACK_FILE_BYTES.div_ceil(CLUSTER_BYTES);
 /// Cluster 2 is the root directory; the files follow it.
@@ -563,9 +556,11 @@ mod tests {
         // Sized to exactly what the tracks needed, the volume had zero bytes
         // free. The car reported 0 MB and offered to format it.
         assert!(FREE_CLUSTERS > 0, "no free clusters");
+        // A proportion, not a fixed size: what matters is that the volume is
+        // not full, and the volume's size is a tuning decision.
         assert!(
-            FREE_CLUSTERS * CLUSTER_BYTES >= 64 * 1024 * 1024,
-            "free space is not worth calling free"
+            FREE_CLUSTERS * 10 >= DATA_CLUSTERS,
+            "under a tenth of the volume is free"
         );
 
         // FSInfo must agree with the FAT, or a host that trusts it is misled.
