@@ -109,5 +109,30 @@ consistent with the counts falling as the source's cushion grew (6 -> 3) while
 the car's made no difference.
 
 What no hypothesis has explained is why the hold was **exactly 16 frames every
-time**, across four different block-size configurations. That remains open, and
-it is the reason none of this is stated as settled.
+time**, across four different block-size configurations. That remains open.
+
+## Where it ended
+
+The shipping pairing — `car-elastic-lowlat` and `source-ultralow`, the same two
+images that showed six holds in `cap2` — was recorded against the full
+eleven-minute reference after the shield, the idle fix and the rate-detector
+fix:
+
+    compared 30876800 frames (643.3 s), lead-in included
+    PASS  bit-exact: every sample matches
+
+Every sample of the entire reference, including the two seconds the anchor used
+to hide. No corrupted samples, no holds, no missing frames, no startup
+transient.
+
+One run does not prove a rare fault is gone, and the hold was always rare — but
+at `cap2`'s rate this recording should have contained about five, and the
+configuration is the one that produced them. Taken with the thirty clean minutes
+of tone before it, the artifact is no longer reproducible by any means available
+here.
+
+Two of the three faults are closed by measurement rather than argument: the
+sign-bit corruption (a physical fix, confirmed by its absence across six
+recordings) and the idle buzz (a firmware fix with a mechanism). The third is
+recorded here as unreproducible rather than solved, because that is what the
+evidence supports.
