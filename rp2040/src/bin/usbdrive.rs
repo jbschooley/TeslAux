@@ -146,7 +146,12 @@ const PACE_DENOMINATOR: u64 = 10;
 /// not enough to hide a pause behind.
 const BURST_BYTES: u64 = 2 * PLAYBACK_BYTES_PER_SEC;
 /// Quiet time that counts as playback having stopped. Matches the detector.
-const PAUSE_AFTER_MS: u32 = 400;
+///
+/// Three times the ~300 ms gap that paced reads produce. A false pause is worse
+/// than a slow one: it silences music that is playing, where a late one is
+/// barely noticed. A player also serves some reads from its own cache, so real
+/// gaps are occasionally longer than the pacing alone implies.
+const PAUSE_AFTER_MS: u32 = 1_200;
 /// A SCSI command was refused *after* the host had started reading tracks.
 ///
 /// Failures before that are normal: hosts probe for optional commands and
@@ -419,36 +424,47 @@ async fn main(spawner: Spawner) {
                     }
                 }
                 Action::ReadBlocks { lba, blocks } => {
-                    // Pace reads of track data, and only those. Metadata — the
-                    // FAT, the directory, the partition table — is read while
-                    // indexing, and throttling it would make every wake slow.
-                    if fat::locate(lba).is_some() {
-                        let now = embassy_time::Instant::now().as_millis();
-                        let elapsed = now.saturating_sub(credit_ms);
-                        credit_ms = now;
-                        credit = (credit + elapsed * PLAYBACK_BYTES_PER_SEC * PACE_NUMERATOR
-                            / (1000 * PACE_DENOMINATOR))
-                            .min(BURST_BYTES);
-
-                        let want = blocks as u64 * SECTOR as u64;
-                        if credit < want {
-                            // Wait for the credit this read needs rather than
-                            // refusing it: the host is entitled to its data,
-                            // just not to it early.
-                            let short = want - credit;
-                            let ms = short * 1000 * PACE_DENOMINATOR
-                                / (PLAYBACK_BYTES_PER_SEC * PACE_NUMERATOR);
-                            embassy_time::Timer::after_millis(ms.min(2000)).await;
-                            credit = want;
-                            credit_ms = embassy_time::Instant::now().as_millis();
-                        }
-                        credit -= want;
-                    }
-
                     let mut sent = 0u32;
                     let mut failed = false;
                     for i in 0..blocks {
+                        // Pace *within* the transfer, not ahead of it.
+                        //
+                        // Waiting before a large read and then serving it at
+                        // full speed produces exactly the gap this is meant to
+                        // remove: a long silence followed by a burst, which
+                        // looks identical to a pause. Spreading the wait across
+                        // the sectors keeps data moving the whole time.
+                        //
+                        // Only track data is paced. The FAT, the directory and
+                        // the partition table are read while indexing, and
+                        // throttling those would make every wake slow.
                         if let Some(pos) = fat::locate(lba + i) {
+                            let now = embassy_time::Instant::now().as_millis();
+                            let elapsed = now.saturating_sub(credit_ms);
+                            if elapsed > 0 {
+                                credit_ms = now;
+                                credit = (credit
+                                    + elapsed * PLAYBACK_BYTES_PER_SEC * PACE_NUMERATOR
+                                        / (1000 * PACE_DENOMINATOR))
+                                    .min(BURST_BYTES);
+                            }
+                            if credit < SECTOR as u64 {
+                                // Wait for roughly the credit a few sectors
+                                // need, so the timer is not re-armed for every
+                                // 512 bytes.
+                                let ms = (16 * SECTOR as u64) * 1000 * PACE_DENOMINATOR
+                                    / (PLAYBACK_BYTES_PER_SEC * PACE_NUMERATOR);
+                                embassy_time::Timer::after_millis(ms.max(1)).await;
+                                let now = embassy_time::Instant::now().as_millis();
+                                let elapsed = now.saturating_sub(credit_ms);
+                                credit_ms = now;
+                                credit = (credit
+                                    + elapsed * PLAYBACK_BYTES_PER_SEC * PACE_NUMERATOR
+                                        / (1000 * PACE_DENOMINATOR))
+                                    .min(BURST_BYTES);
+                            }
+                            credit = credit.saturating_sub(SECTOR as u64);
+
                             READ_TRACK_DATA.store(true, Ordering::Relaxed);
                             if pos.track < 32 {
                                 TRACKS_SEEN.store(
@@ -458,9 +474,13 @@ async fn main(spawner: Spawner) {
                             }
                             let now = embassy_time::Instant::now().as_millis() as u32;
                             LAST_READ_MS.store(now, Ordering::Relaxed);
-                            let p = detect::Position { track: pos.track, offset: pos.offset };
+                            let p = detect::Position {
+                                track: pos.track,
+                                offset: pos.offset,
+                            };
                             note_event(detector.on_read(p, now));
                         }
+
                         fat::read_sector(lba + i, &mut sector);
                         if write_all(&mut ep_in, &sector).await.is_err() {
                             failed = true;

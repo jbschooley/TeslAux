@@ -36,10 +36,15 @@ pub enum Event {
 
 /// How long reads must be quiet before playback counts as paused.
 ///
-/// At 48 kHz stereo the car reads roughly three times a second, so a gap this
-/// long is not jitter. Short enough to feel immediate on a button press, long
-/// enough to ride out a slow read.
-const PAUSE_AFTER_MS: u32 = 400;
+/// Paced to just above real time the car reads about three times a second, so
+/// the gaps to ride out are around 300 ms. This allows three times that,
+/// deliberately: **a false pause is worse than a slow one.** Reporting a pause
+/// that did not happen silences the user's music; taking an extra half second
+/// to notice a real one is barely perceptible.
+///
+/// The margin is needed because a player serves some reads from its own cache —
+/// restarting a track it has just played produces no reads at all for a while.
+const PAUSE_AFTER_MS: u32 = 1_200;
 
 /// Reads from a new track before believing the player moved there.
 ///
@@ -330,9 +335,15 @@ mod tests {
     fn a_pause_is_reported_once_reads_go_quiet() {
         let mut d = det();
         playing(&mut d, 3, 0);
-        assert_eq!(d.tick(100), None, "reported a pause while still reading");
-        assert_eq!(d.tick(1000), Some(Event::Paused));
-        assert_eq!(d.tick(2000), None, "reported the same pause twice");
+        // Expressed against the threshold rather than a fixed number, so
+        // tuning it does not silently invalidate the test.
+        assert_eq!(
+            d.tick(PAUSE_AFTER_MS - 1),
+            None,
+            "reported a pause inside the quiet window"
+        );
+        assert_eq!(d.tick(PAUSE_AFTER_MS + 1), Some(Event::Paused));
+        assert_eq!(d.tick(PAUSE_AFTER_MS * 3), None, "reported the same pause twice");
         assert!(d.is_paused());
     }
 
@@ -340,9 +351,12 @@ mod tests {
     fn resuming_is_reported_and_is_not_a_press() {
         let mut d = det();
         playing(&mut d, 3, 0);
-        assert_eq!(d.tick(1000), Some(Event::Paused));
+        assert_eq!(d.tick(PAUSE_AFTER_MS + 1), Some(Event::Paused));
         assert_eq!(
-            d.on_read(Position { track: 3, offset: TRACK_BYTES / 2 + 4096 }, 1100),
+            d.on_read(
+                Position { track: 3, offset: TRACK_BYTES / 2 + 4096 },
+                PAUSE_AFTER_MS + 100
+            ),
             Some(Event::Resumed)
         );
         assert!(!d.is_paused());
