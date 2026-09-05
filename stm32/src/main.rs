@@ -64,6 +64,8 @@ use embassy_usb::{Builder, UsbDevice};
 
 use embassy_usb::class::hid::State as HidState;
 use teslamic::{If3Handler, KeyboardHandler, SampleRateHandler};
+#[cfg(feature = "feature-unit")]
+use teslamic::FeatureUnitHandler;
 
 /// Frames in one USB packet at 48 kHz. This is the producer's burst size, and
 /// the deadband below has to exceed it.
@@ -247,6 +249,11 @@ async fn main(spawner: Spawner) {
         static mut KBD: KeyboardHandler = KeyboardHandler;
         static mut IF3: If3Handler = If3Handler;
         static mut SRATE: SampleRateHandler = SampleRateHandler { rate: 0 };
+        #[cfg(feature = "feature-unit")]
+        static mut FU: FeatureUnitHandler = FeatureUnitHandler;
+        #[cfg(feature = "feature-unit")]
+        // SAFETY: as below; taken once at startup and outlives `usb`.
+        let fu = unsafe { &mut *core::ptr::addr_of_mut!(FU) };
         // SAFETY: taken once at startup; all outlive `usb` (main never returns).
         let (cd, bd, md, cb, hid, kbd, if3, srate) = unsafe {
             (
@@ -270,9 +277,13 @@ async fn main(spawner: Spawner) {
             kbd,
             if3,
             srate,
+            #[cfg(feature = "feature-unit")]
+            fu,
             teslamic::BYTES_PER_FRAME_ELASTIC as u16,
             teslamic::SAMPLE_RATE,
         );
+        #[cfg(feature = "feature-unit")]
+        spawner.spawn(feature_unit_task().unwrap());
         spawner.spawn(usb_car_task(builder.build()).unwrap());
         ep
     };
@@ -483,5 +494,35 @@ async fn pump(mut iso_in: impl EndpointIn) -> ! {
                 }
             }
         }
+    }
+}
+
+/// Report what the car does with the Feature Unit, over the ST-Link.
+///
+/// This is the whole point of running the experiment here rather than on the
+/// RP2040: the RP2040's only channel is an LED, which can say "something
+/// happened" but not what was asked for or what value was set.
+#[cfg(feature = "feature-unit")]
+#[embassy_executor::task]
+async fn feature_unit_task() -> ! {
+    use core::sync::atomic::Ordering;
+    use teslamic::feature_unit as fu;
+    let mut last = u32::MAX;
+    loop {
+        let n = fu::REQUESTS.load(Ordering::Relaxed);
+        if n != last {
+            last = n;
+            let raw = fu::LAST_RAW.load(Ordering::Relaxed);
+            defmt::info!(
+                "feature unit: {} request(s), {} SET_CUR, last bRequest {=u8:#04x} wValue {=u16:#06x}, volume {} (1/256 dB), muted {}",
+                n,
+                fu::SET_CUR_SEEN.load(Ordering::Relaxed),
+                (raw >> 16) as u8,
+                raw as u16,
+                fu::LAST_VOLUME.load(Ordering::Relaxed),
+                fu::MUTED.load(Ordering::Relaxed),
+            );
+        }
+        embassy_time::Timer::after_millis(250).await;
     }
 }

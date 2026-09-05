@@ -96,6 +96,14 @@ pipe-tone = []
 # red a stall, amber in between, blue a gradual drain. Combine with pipe-tone to
 # take the source board's data out of the picture. See src/bin/car.rs.
 pipe-watch = []
+# DIAGNOSTIC: advertise the real mic's full audio topology — Input 4 -> Feature
+# Unit 5 -> Selector 6 -> Output 7 — instead of the bare Input -> Output pair
+# this has always used. The real mic gets a volume control in the car's UI and
+# this one does not, and the Feature Unit is the only thing that could be
+# driving that. Answers the car's volume queries and counts them, so a run in
+# the car says whether the car drives mic volume over USB at all.
+feature-unit = []
+
 
 # DIAGNOSTIC (car board): generate a 1 kHz tone internally and deliberately swing
 # the iso packet size 47/49 every frame. Answers "does Tesla tolerate variable

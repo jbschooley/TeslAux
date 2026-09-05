@@ -44,3 +44,12 @@ opt-level     = "s"
 lto           = true
 debug         = 2
 codegen-units = 1
+
+[features]
+# DIAGNOSTIC: advertise the real mic's full audio topology — Input 4 -> Feature
+# Unit 5 -> Selector 6 -> Output 7 — instead of the bare Input -> Output pair
+# this has always used. The real mic gets a volume control in the car's UI and
+# this one does not, and the Feature Unit is the only thing that could be
+# driving that. Answers the car's volume queries and counts them, so a run in
+# the car says whether the car drives mic volume over USB at all.
+feature-unit = []

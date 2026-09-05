@@ -313,7 +313,23 @@ async fn main(spawner: Spawner) {
     #[cfg(not(feature = "clock-locked"))]
     let ep_max = ((frames_max + 1) * CHANNELS_X_BYTES) as u16;
     debug_assert!(ep_max <= 1023, "over the full-speed isochronous limit");
-    let iso_in = teslamic::build(&mut builder, hid_state, kbd, if3, srate, ep_max, rate);
+    #[cfg(feature = "feature-unit")]
+    let fu = {
+        static mut FU: teslamic::FeatureUnitHandler = teslamic::FeatureUnitHandler;
+        // SAFETY: taken once at startup, and outlives `usb` (main never returns).
+        unsafe { &mut *core::ptr::addr_of_mut!(FU) }
+    };
+    let iso_in = teslamic::build(
+        &mut builder,
+        hid_state,
+        kbd,
+        if3,
+        srate,
+        #[cfg(feature = "feature-unit")]
+        fu,
+        ep_max,
+        rate,
+    );
     let usb = builder.build();
 
     // ── I2S capture ─────────────────────────────────────────────────────────

@@ -62,6 +62,20 @@ const SUBCLASS_AUDIOCONTROL: u8 = 0x01;
 const SUBCLASS_AUDIOSTREAMING: u8 = 0x02;
 const PROTO_UNDEFINED: u8 = 0x00;
 
+// The audio topology, in two versions.
+//
+// The default is the bare Input -> Output pair that has worked in the car since
+// the beginning. `feature-unit` replaces it with the real mic's full topology —
+// Input 4 -> Feature Unit 5 -> Selector 6 -> Output 7, terminal IDs and all —
+// because the real mic gets a volume control in the car's UI and this one does
+// not, and the Feature Unit is the only thing that could be driving it.
+//
+// The earlier control capture showed the car issuing no audio-class requests at
+// all, which was taken as proof it ignores volume. It proves nothing of the
+// kind: that capture was of THIS device, which advertises no Feature Unit for
+// the car to talk to.
+
+#[cfg(not(feature = "feature-unit"))]
 const AC_HEADER: [u8; 7] = [
     0x01, // HEADER
     0x00, 0x01, // bcdADC = 1.00
@@ -69,7 +83,18 @@ const AC_HEADER: [u8; 7] = [
     0x01, // bInCollection
     0x01, // baInterfaceNr(1) = the AudioStreaming interface
 ];
+/// 9 header + 12 input + 10 feature + 7 selector + 9 output = 47, which is what
+/// the real mic reports.
+#[cfg(feature = "feature-unit")]
+const AC_HEADER: [u8; 7] = [
+    0x01, // HEADER
+    0x00, 0x01, // bcdADC = 1.00
+    0x2F, 0x00, // wTotalLength = 47
+    0x01, // bInCollection
+    0x01, // baInterfaceNr(1) = the AudioStreaming interface
+];
 
+#[cfg(not(feature = "feature-unit"))]
 const AC_INPUT_TERMINAL: [u8; 10] = [
     0x02, // INPUT_TERMINAL
     0x01, // bTerminalID = 1
@@ -80,7 +105,41 @@ const AC_INPUT_TERMINAL: [u8; 10] = [
     0x00, // iChannelNames
     0x00, // iTerminal
 ];
+#[cfg(feature = "feature-unit")]
+const AC_INPUT_TERMINAL: [u8; 10] = [
+    0x02, // INPUT_TERMINAL
+    0x04, // bTerminalID = 4, as the real mic
+    0x01, 0x02, // wTerminalType = 0x0201 (Microphone)
+    0x00, // bAssocTerminal
+    CHANNELS as u8,
+    0x03, 0x00, // wChannelConfig = L+R
+    0x00, // iChannelNames
+    0x00, // iTerminal
+];
 
+/// Master mute plus per-channel volume, exactly the real mic's control bitmap.
+#[cfg(feature = "feature-unit")]
+const AC_FEATURE_UNIT: [u8; 8] = [
+    0x06, // FEATURE_UNIT
+    0x05, // bUnitID = 5
+    0x04, // bSourceID = the input terminal
+    0x01, // bControlSize = 1 byte per channel
+    0x01, // bmaControls(0) master: mute
+    0x02, // bmaControls(1) ch1: volume
+    0x02, // bmaControls(2) ch2: volume
+    0x00, // iFeature
+];
+
+#[cfg(feature = "feature-unit")]
+const AC_SELECTOR_UNIT: [u8; 5] = [
+    0x05, // SELECTOR_UNIT
+    0x06, // bUnitID = 6
+    0x01, // bNrInPins
+    0x05, // baSourceID(1) = the feature unit
+    0x00, // iSelector
+];
+
+#[cfg(not(feature = "feature-unit"))]
 const AC_OUTPUT_TERMINAL: [u8; 7] = [
     0x03, // OUTPUT_TERMINAL
     0x02, // bTerminalID = 2
@@ -89,10 +148,27 @@ const AC_OUTPUT_TERMINAL: [u8; 7] = [
     0x01, // bSourceID = the microphone input terminal
     0x00, // iTerminal
 ];
+#[cfg(feature = "feature-unit")]
+const AC_OUTPUT_TERMINAL: [u8; 7] = [
+    0x03, // OUTPUT_TERMINAL
+    0x07, // bTerminalID = 7, as the real mic
+    0x01, 0x01, // wTerminalType = 0x0101 (USB Streaming)
+    0x00, // bAssocTerminal
+    0x06, // bSourceID = the selector unit
+    0x00, // iTerminal
+];
 
+#[cfg(not(feature = "feature-unit"))]
 const AS_GENERAL: [u8; 5] = [
     0x01, // AS_GENERAL
     0x02, // bTerminalLink = 2
+    0x01, // bDelay
+    0x01, 0x00, // wFormatTag = PCM
+];
+#[cfg(feature = "feature-unit")]
+const AS_GENERAL: [u8; 5] = [
+    0x01, // AS_GENERAL
+    0x07, // bTerminalLink = 7, the real mic's output terminal
     0x01, // bDelay
     0x01, 0x00, // wFormatTag = PCM
 ];
@@ -259,6 +335,121 @@ impl Handler for If3Handler {
     }
 }
 
+/// Answers the car's volume and mute queries, and records what it asked for.
+///
+/// The point of the build is the record, not the answers. If these counters stay
+/// at zero the car never touches the Feature Unit and the ceiling is entirely
+/// its own mixing; if they move, the car drives mic volume over USB and what we
+/// report here is a lever.
+///
+/// Ranges are deliberately generous: 30 dB of gain is offered above unity, so if
+/// the car maps its slider onto what the device advertises there is somewhere
+/// for it to go. Nothing here changes a sample — `CUR` is what we *claim*, and
+/// applying it would be a separate decision.
+#[cfg(feature = "feature-unit")]
+pub mod feature_unit {
+    use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+
+    /// UAC1 volume is a signed 16-bit count of 1/256 dB.
+    const DB: i32 = 256;
+
+    pub static REQUESTS: AtomicU32 = AtomicU32::new(0);
+    pub static SET_CUR_SEEN: AtomicU32 = AtomicU32::new(0);
+    /// The last volume the car asked for, in 1/256 dB.
+    pub static LAST_VOLUME: AtomicI32 = AtomicI32::new(0);
+    /// Packed (bRequest << 16) | wValue of the last request, for anything the
+    /// cases below do not name.
+    pub static LAST_RAW: AtomicU32 = AtomicU32::new(0);
+    pub static MUTED: AtomicU32 = AtomicU32::new(0);
+
+    pub const CUR: i16 = 0; // 0 dB
+    pub const MIN: i16 = (-30 * DB) as i16;
+    pub const MAX: i16 = (30 * DB) as i16;
+    pub const RES: i16 = (DB / 2) as i16; // 0.5 dB
+
+    pub fn note(request: u8, value: u16) {
+        REQUESTS.store(REQUESTS.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
+        LAST_RAW.store(((request as u32) << 16) | value as u32, Ordering::Relaxed);
+    }
+}
+
+/// The Feature Unit's control endpoint. Addressed as wIndex = (unit << 8) |
+/// interface, so unit 5 on IF0 is 0x0500.
+#[cfg(feature = "feature-unit")]
+pub struct FeatureUnitHandler;
+
+#[cfg(feature = "feature-unit")]
+impl FeatureUnitHandler {
+    const UNIT: u8 = 5;
+    const MUTE: u8 = 0x01;
+    const VOLUME: u8 = 0x02;
+}
+
+#[cfg(feature = "feature-unit")]
+impl Handler for FeatureUnitHandler {
+    fn control_in<'a>(&'a mut self, req: Request, buf: &'a mut [u8]) -> Option<InResponse<'a>> {
+        use core::sync::atomic::Ordering;
+        if req.request_type != RequestType::Class
+            || (req.index >> 8) as u8 != Self::UNIT
+            || (req.index & 0xFF) != 0
+        {
+            return None;
+        }
+        feature_unit::note(req.request, req.value);
+        let selector = (req.value >> 8) as u8;
+        // 0x81 GET_CUR, 0x82 GET_MIN, 0x83 GET_MAX, 0x84 GET_RES.
+        let v: i16 = match (req.request, selector) {
+            (0x81, Self::VOLUME) => feature_unit::CUR,
+            (0x82, Self::VOLUME) => feature_unit::MIN,
+            (0x83, Self::VOLUME) => feature_unit::MAX,
+            (0x84, Self::VOLUME) => feature_unit::RES,
+            (0x81, Self::MUTE) => {
+                let m = feature_unit::MUTED.load(Ordering::Relaxed) as u8;
+                if buf.is_empty() {
+                    return Some(InResponse::Rejected);
+                }
+                buf[0] = m;
+                return Some(InResponse::Accepted(&buf[..1]));
+            }
+            _ => return Some(InResponse::Rejected),
+        };
+        if buf.len() < 2 {
+            return Some(InResponse::Rejected);
+        }
+        buf[..2].copy_from_slice(&v.to_le_bytes());
+        Some(InResponse::Accepted(&buf[..2]))
+    }
+
+    fn control_out(&mut self, req: Request, data: &[u8]) -> Option<OutResponse> {
+        use core::sync::atomic::Ordering;
+        if req.request_type != RequestType::Class
+            || (req.index >> 8) as u8 != Self::UNIT
+            || (req.index & 0xFF) != 0
+        {
+            return None;
+        }
+        feature_unit::note(req.request, req.value);
+        // 0x01 = SET_CUR.
+        if req.request == 0x01 {
+            feature_unit::SET_CUR_SEEN.store(
+                feature_unit::SET_CUR_SEEN.load(Ordering::Relaxed).wrapping_add(1),
+                Ordering::Relaxed,
+            );
+            match ((req.value >> 8) as u8, data.len()) {
+                (Self::VOLUME, n) if n >= 2 => {
+                    let v = i16::from_le_bytes([data[0], data[1]]);
+                    feature_unit::LAST_VOLUME.store(v as i32, Ordering::Relaxed);
+                }
+                (Self::MUTE, n) if n >= 1 => {
+                    feature_unit::MUTED.store(data[0] as u32, Ordering::Relaxed);
+                }
+                _ => {}
+            }
+        }
+        Some(OutResponse::Accepted)
+    }
+}
+
 /// Device identity. The 40-byte serial forces a 162-byte string descriptor, so
 /// the control buffer must be >= 256 (128 broke enumeration on nRF).
 pub fn config() -> Config<'static> {
@@ -291,6 +482,7 @@ pub fn build<'d, D: Driver<'d>>(
     kbd: &'d mut KeyboardHandler,
     if3: &'d mut If3Handler,
     srate: &'d mut SampleRateHandler,
+    #[cfg(feature = "feature-unit")] fu: &'d mut FeatureUnitHandler,
     ep_max_bytes: u16,
     rate: u32,
 ) -> D::EndpointIn {
@@ -302,6 +494,11 @@ pub fn build<'d, D: Driver<'d>>(
         let mut alt = ac.alt_setting(AUDIO_CLASS, SUBCLASS_AUDIOCONTROL, PROTO_UNDEFINED, None);
         alt.descriptor(CS_INTERFACE, &AC_HEADER);
         alt.descriptor(CS_INTERFACE, &AC_INPUT_TERMINAL);
+        #[cfg(feature = "feature-unit")]
+        {
+            alt.descriptor(CS_INTERFACE, &AC_FEATURE_UNIT);
+            alt.descriptor(CS_INTERFACE, &AC_SELECTOR_UNIT);
+        }
         alt.descriptor(CS_INTERFACE, &AC_OUTPUT_TERMINAL);
     }
     let iso_in = {
@@ -349,6 +546,9 @@ pub fn build<'d, D: Driver<'d>>(
     }
     builder.handler(if3);
     builder.handler(srate);
+    // Global like the others; it filters on wIndex itself.
+    #[cfg(feature = "feature-unit")]
+    builder.handler(fu);
 
     iso_in
 }
