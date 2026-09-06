@@ -329,9 +329,78 @@ impl Handler for If3Handler {
             return None;
         }
         match req.request_type {
-            RequestType::Class => Some(OutResponse::Accepted),
+            RequestType::Class => {
+                #[cfg(feature = "if3-log")]
+                if3_log::record(req.request, req.value, _data);
+                Some(OutResponse::Accepted)
+            }
             _ => None,
         }
+    }
+}
+
+/// A ring of the car's IF3 writes, so they can be read out somewhere.
+///
+/// Every `A5 5A` frame the car sends has been accepted and discarded since the
+/// beginning — it never reads anything back, so accepting blindly was enough to
+/// get the mic working and there was never a reason to look. There is one now:
+/// the car's mic, reverb and effect controls do nothing to this device and send
+/// nothing over the audio class, which leaves this as the only channel they
+/// could be on.
+///
+/// Sixteen bytes of each frame, which covers the header, the type and enough
+/// payload to see what moved. Written only from the USB task; the reader just
+/// watches `COUNT`, and a frame that gets overwritten before it is read is a
+/// frame missed rather than a frame torn — good enough to tell whether a slider
+/// sends anything at all.
+#[cfg(feature = "if3-log")]
+pub mod if3_log {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    /// Wide enough for the enumeration burst. Sixteen overran it by 53 frames,
+    /// which is fine for "does a slider send anything" and useless for reading
+    /// what the car says on connect.
+    pub const SLOTS: usize = 128;
+    pub const WORDS: usize = 4; // 16 bytes of payload
+
+    pub static COUNT: AtomicU32 = AtomicU32::new(0);
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ZERO: AtomicU32 = AtomicU32::new(0);
+    pub static META: [AtomicU32; SLOTS] = [ZERO; SLOTS];
+    pub static DATA: [AtomicU32; SLOTS * WORDS] = [ZERO; SLOTS * WORDS];
+
+    pub fn record(request: u8, value: u16, data: &[u8]) {
+        let n = COUNT.load(Ordering::Relaxed);
+        let slot = (n as usize) % SLOTS;
+        for w in 0..WORDS {
+            let mut v = 0u32;
+            for b in 0..4 {
+                let i = w * 4 + b;
+                if i < data.len() {
+                    v |= (data[i] as u32) << (8 * b);
+                }
+            }
+            DATA[slot * WORDS + w].store(v, Ordering::Relaxed);
+        }
+        META[slot].store(
+            ((request as u32) << 24) | ((value as u32) << 8) | (data.len().min(255) as u32),
+            Ordering::Relaxed,
+        );
+        COUNT.store(n.wrapping_add(1), Ordering::Relaxed);
+    }
+
+    /// (bRequest, wValue, length, first 16 bytes) of frame `n`.
+    pub fn get(n: u32) -> (u8, u16, usize, [u8; WORDS * 4]) {
+        let slot = (n as usize) % SLOTS;
+        let meta = META[slot].load(Ordering::Relaxed);
+        let mut bytes = [0u8; WORDS * 4];
+        for w in 0..WORDS {
+            let v = DATA[slot * WORDS + w].load(Ordering::Relaxed);
+            for b in 0..4 {
+                bytes[w * 4 + b] = (v >> (8 * b)) as u8;
+            }
+        }
+        ((meta >> 24) as u8, (meta >> 8) as u16, (meta & 0xFF) as usize, bytes)
     }
 }
 

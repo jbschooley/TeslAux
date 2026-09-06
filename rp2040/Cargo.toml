@@ -103,6 +103,13 @@ pipe-watch = []
 # driving that. Answers the car's volume queries and counts them, so a run in
 # the car says whether the car drives mic volume over USB at all.
 feature-unit = []
+# DIAGNOSTIC: keep a ring of the car's IF3 `A5 5A` writes so they can be read
+# out. They have always been accepted and discarded — the car never reads back,
+# so there was no reason to look. There is now: the car's mic, reverb and effect
+# controls do nothing to this device and send nothing over the audio class,
+# which leaves IF3 as the only channel they could be on.
+if3-log = []
+
 # DIAGNOSTIC (with feature-unit): advertise a maximum volume of 0 dB instead of
 # +30. The car sets the device to its advertised maximum at connect and never
 # revisits it, so if the car scales its own mixer by what the mic claims it can

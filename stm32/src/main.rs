@@ -284,6 +284,8 @@ async fn main(spawner: Spawner) {
         );
         #[cfg(feature = "feature-unit")]
         spawner.spawn(feature_unit_task().unwrap());
+        #[cfg(feature = "if3-log")]
+        spawner.spawn(if3_log_task().unwrap());
         spawner.spawn(usb_car_task(builder.build()).unwrap());
         ep
     };
@@ -524,5 +526,36 @@ async fn feature_unit_task() -> ! {
             );
         }
         embassy_time::Timer::after_millis(250).await;
+    }
+}
+
+/// Print the car's IF3 writes as they arrive.
+#[cfg(feature = "if3-log")]
+#[embassy_executor::task]
+async fn if3_log_task() -> ! {
+    use core::sync::atomic::Ordering;
+    use teslamic::if3_log;
+    let mut next = 0u32;
+    loop {
+        let count = if3_log::COUNT.load(Ordering::Relaxed);
+        // Anything more than a ring behind is gone; say so rather than print it.
+        if count.wrapping_sub(next) > if3_log::SLOTS as u32 {
+            let lost = count.wrapping_sub(next) - if3_log::SLOTS as u32;
+            defmt::warn!("IF3: {} frame(s) missed", lost);
+            next = count.wrapping_sub(if3_log::SLOTS as u32);
+        }
+        while next != count {
+            let (req, val, len, bytes) = if3_log::get(next);
+            defmt::info!(
+                "IF3 #{}: bRequest {=u8:#04x} wValue {=u16:#06x} len {} | {=[u8]:#04x}",
+                next,
+                req,
+                val,
+                len,
+                bytes[..len.min(16)]
+            );
+            next = next.wrapping_add(1);
+        }
+        embassy_time::Timer::after_millis(100).await;
     }
 }
