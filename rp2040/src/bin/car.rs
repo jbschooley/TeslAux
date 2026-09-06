@@ -665,6 +665,14 @@ async fn pump(
                     }
                 }
             }
+            #[cfg(feature = "boot-detach")]
+            if HOLD_OFF.load(Ordering::Relaxed) {
+                // Hand the endpoint nothing and keep frame time; the car sees a
+                // source that has stopped producing rather than one that
+                // vanished mid-packet.
+                embassy_time::Timer::after_millis(1).await;
+                continue;
+            }
             match iso_in.write(&buf[..n]).await {
                 Ok(()) => {
                     // `wait_enabled()` only returns on an alt-setting change. A
@@ -909,6 +917,18 @@ static GAIN_TARGET: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU3
 #[cfg(feature = "boot-detach")]
 const GAIN_STEP: u32 = 16;
 
+/// Stop handing packets to the endpoint, without leaving the bus.
+///
+/// The scratch survives 600 ms of silence and lands after it, so the car's
+/// buffer is already full of silence when it happens — the noise is the car
+/// tearing the stream down, not our audio being cut mid-cycle. The one part of
+/// that we still control is whether the stream is live at the moment the bus
+/// drops. This lets it go quiet on the endpoint first: still enumerated, still
+/// configured, simply not producing. The hardware returns zero-length packets,
+/// which is an ordinary thing for an isochronous source to do.
+#[cfg(feature = "boot-detach")]
+static HOLD_OFF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 #[cfg(feature = "boot-detach")]
 mod boot {
     use embassy_rp::pac;
@@ -1001,6 +1021,13 @@ async fn boot_detach_task() -> ! {
     /// The delay is not felt in use. The button is pressed on the way to the
     /// volume control, not while listening.
     const FLUSH_MS: u64 = 600;
+    /// How long to produce nothing before leaving the bus.
+    ///
+    /// Zero. The real mic streams right up to the instant it is unplugged and
+    /// makes no noise doing it, so a stretch of empty frames first is us doing
+    /// something it never does — and the scratch changed character when this was
+    /// added rather than going away, which is not the direction of a fix.
+    const QUIET_MS: u64 = 0;
     use core::sync::atomic::Ordering;
     let mut detached = false;
     loop {
@@ -1014,11 +1041,18 @@ async fn boot_detach_task() -> ! {
                 // least that much.
                 GAIN_TARGET.store(0, Ordering::Relaxed);
                 Timer::after_millis(FLUSH_MS).await;
+                // Then stop producing at all, and only leave once the car has
+                // had a stretch of frames with nothing in them.
+                if QUIET_MS > 0 {
+                    HOLD_OFF.store(true, Ordering::Relaxed);
+                    Timer::after_millis(QUIET_MS).await;
+                }
                 pac::USB.sie_ctrl().modify(|w| w.set_pullup_en(false));
             } else {
                 // Come back silent and ramp up, so re-enumeration does not
                 // arrive mid-waveform either.
                 pac::USB.sie_ctrl().modify(|w| w.set_pullup_en(true));
+                HOLD_OFF.store(false, Ordering::Relaxed);
                 GAIN.store(0, Ordering::Relaxed);
                 GAIN_TARGET.store(256, Ordering::Relaxed);
             }

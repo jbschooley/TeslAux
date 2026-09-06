@@ -256,7 +256,20 @@ pub fn build<'d, D: Driver<'d>>(
             None,
             ep_max_bytes,
             1,
+            // Asynchronous, and honestly so: the packet size varies, which is
+            // exactly what this describes.
+            //
+            // `adaptive-ep` says 0x09 instead, matching the real mic, on the
+            // theory that calling ourselves asynchronous makes the car run
+            // rate-matching machinery it does not run for the real mic — and
+            // that tearing that down is what makes the noise. Tried; the scratch
+            // survived it, changing character rather than going away. Kept
+            // because it is one byte and the theory is not disproven, only
+            // unhelped.
+            #[cfg(not(feature = "adaptive-ep"))]
             SynchronizationType::Asynchronous,
+            #[cfg(feature = "adaptive-ep")]
+            SynchronizationType::Adaptive,
             UsageType::DataEndpoint,
             &[0x00, 0x00], // bRefresh, bSynchAddress -> the 9-byte UAC form
         );

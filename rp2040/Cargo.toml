@@ -103,6 +103,11 @@ pipe-watch = []
 # volume is set — so hold, adjust the volume, release, and the car stays loud.
 # Only the car side is affected; the phone is on the other board.
 boot-detach = []
+# Declare the iso endpoint adaptive (attr 0x09) like the real mic, rather than
+# asynchronous (0x05), which is what it honestly is. Tried against the teardown
+# scratch: the scratch survived, changing character rather than going away.
+adaptive-ep = []
+
 
 # DIAGNOSTIC (car board): generate a 1 kHz tone internally and deliberately swing
 # the iso packet size 47/49 every frame. Answers "does Tesla tolerate variable
