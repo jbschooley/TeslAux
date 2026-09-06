@@ -117,6 +117,27 @@ line-in = []
 # controls do nothing to this device and send nothing over the audio class,
 # which leaves IF3 as the only channel they could be on.
 if3-log = []
+# DIAGNOSTIC: keep every descriptor, string and interface as the real mic's and
+# change only the VID/PID. By elimination the last field that can carry
+# recognition — terminal type, Feature Unit and IF3 have all been ruled out.
+generic-id = []
+
+# DIAGNOSTIC: omit IF3 entirely. It is what defeats the "unsupported USB
+# microphone" popup and the descriptor the car validates, so this is the test
+# that separates being accepted from being clamped: if audio still arrives, the
+# identity alone is enough; if it stops, the two are the same event.
+no-if3 = []
+
+# DIAGNOSTIC: refuse the car's IF3 karaoke session frames (`FC 03 C0 AA 01/00`)
+# while accepting the rest. Anti-howling clamps the car's entire output whenever
+# a CaraokeMic is present; whether that engages on enumeration or on the karaoke
+# session starting has never been separated. This declines the session while
+# staying the device the car accepts audio from.
+if3-nak-session = []
+# The blunter version: refuse every IF3 write. Finds out whether the car needs
+# any of that block or merely sends it.
+if3-nak-all = []
+
 
 # DIAGNOSTIC (with feature-unit): advertise a maximum volume of 0 dB instead of
 # +30. The car sets the device to its advertised maximum at connect and never

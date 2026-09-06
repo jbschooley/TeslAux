@@ -351,6 +351,24 @@ impl Handler for If3Handler {
             RequestType::Class => {
                 #[cfg(feature = "if3-log")]
                 if3_log::record(req.request, req.value, _data);
+                // Anti-howling clamps the car's whole output whenever a
+                // CaraokeMic is present. Whether it engages on enumeration or on
+                // the karaoke session starting has never been separated, and the
+                // car brackets its config block with `FC 03 C0 AA 01` to open
+                // and `... 00` to commit. Refusing those is the narrowest way to
+                // decline the session while staying the device the car accepts
+                // audio from.
+                #[cfg(feature = "if3-nak-session")]
+                if _data.len() >= 7
+                    && _data[..6] == [0xa5, 0x5a, 0xfc, 0x03, 0xc0, 0xaa]
+                {
+                    return Some(OutResponse::Rejected);
+                }
+                // The blunter version: decline the lot, and find out whether the
+                // car needs any of it or merely sends it.
+                #[cfg(feature = "if3-nak-all")]
+                return Some(OutResponse::Rejected);
+                #[allow(unreachable_code)]
                 Some(OutResponse::Accepted)
             }
             _ => None,
@@ -563,7 +581,18 @@ impl Handler for FeatureUnitHandler {
 /// Device identity. The 40-byte serial forces a 162-byte string descriptor, so
 /// the control buffer must be >= 256 (128 broke enumeration on nRF).
 pub fn config() -> Config<'static> {
+    // `generic-id` keeps every descriptor, string and interface exactly as the
+    // real mic's and changes only the VID/PID. By elimination this is the last
+    // field that can be carrying recognition: the terminal type does not matter,
+    // the Feature Unit does not matter, and IF3 turned out not to be needed
+    // either — the car recognises the mic and clamps without it, and with no
+    // popup, which is not what RESEARCH.md predicted.
+    //
+    // 0x1209/0x0001 is pid.codes' test range, deliberately not anyone's product.
+    #[cfg(not(feature = "generic-id"))]
     let mut c = Config::new(0x1235, 0x0002);
+    #[cfg(feature = "generic-id")]
+    let mut c = Config::new(0x1209, 0x0001);
     c.manufacturer = Some("TeslaMic_V004_FW_20220217Tes");
     c.product = Some("TeslaMic");
     c.serial_number =
@@ -648,6 +677,15 @@ pub fn build<'d, D: Driver<'d>>(
     );
 
     // IF3: HID class interface with a HID descriptor and no endpoint.
+    //
+    // `no-if3` leaves it out, which is the one test that separates the two
+    // things anti-howling has tangled together. This interface is what defeats
+    // the "unsupported USB microphone" popup and is described as the descriptor
+    // the car validates — so if audio still arrives without it, the VID/PID
+    // alone is enough and the karaoke handshake was never required for the audio
+    // path. If audio stops, then being accepted and being clamped are the same
+    // event and there is nothing further to separate.
+    #[cfg(not(feature = "no-if3"))]
     {
         let mut f3 = builder.function(0x03, 0x00, 0x00);
         let mut i3 = f3.interface();

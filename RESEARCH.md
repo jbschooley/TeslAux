@@ -207,10 +207,34 @@ The last one closes it from the other side: the real mic reports maxed samples
 at its top step, and this device sends full scale regardless, so both arrive at
 the mixer at the same level and meet the same ceiling.
 
-**And the identity cannot be dropped.** The car ignores generic USB audio devices
-completely — nothing appears at all. The TeslaMic identity is not merely how the
-popup is avoided; it is the only reason audio is accepted. So recognition and
-anti-howling arrive together and no descriptor edit separates them.
+**And it is not about being a CaraokeMic at all.** Taking the identity apart one
+field at a time:
+
+| build | recognised? | audio? | IF3 config block | clamp |
+|---|---|---|---|---|
+| Line Connector terminal type | yes | yes | sent | yes |
+| IF3 refused (`c0 aa` stalled) | yes | yes | sent anyway | yes |
+| IF3 omitted entirely | yes | yes | none to send | yes |
+| VID/PID `1209:0001` | yes | **yes** | **none sent** | yes |
+
+The last row is the finding. A generic test VID/PID, with the car sending no
+karaoke configuration whatsoever — so not treated as a CaraokeMic — still gets
+its audio played, and still clamps.
+
+So recognition is keyed on the **descriptor shape**: a UAC1 input with the right
+format, rates and endpoint. Not the identity, not IF3, not the terminal type. A
+random USB audio device that the car ignores is being rejected for its format,
+not for who it claims to be.
+
+Two things in this table also correct earlier sections. IF3 is **not** what
+defeats the "unsupported USB microphone" popup — audio works without it and no
+popup appears — and it is not "the descriptor the car validates". Either that was
+never the operative factor or the car's firmware has moved since it was written.
+
+Which closes the search rather than narrowing it: **anti-howling applies to any
+USB audio input the car accepts**, and there is no identity or descriptor that is
+accepted without it. Looking for a different device to imitate is looking for
+something that does not exist.
 
 What remains is a workaround rather than a fix: **set the volume before the
 bridge is connected**, and do not touch it afterwards. The clamp latches on
