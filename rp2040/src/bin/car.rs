@@ -901,6 +901,11 @@ mod watch {
 // Holding BOOTSEL drops the car-facing D+ pullup. The car sees the mic leave,
 // the volume can be set clean, and releasing brings it back into a system that
 // is now loud. The phone side is a different board and never notices.
+//
+// The car makes a scratching noise for about half a second whenever an audio
+// stream disappears, including when the real CaraokeMic is unplugged, so it is
+// the car's own teardown rather than anything to fix here. Fading to silence and
+// flushing its buffer first is what keeps that from being audible.
 /// Output gain, Q8: 256 is unity and bit-exact, 0 is silence.
 ///
 /// Only ever leaves unity while detaching. Dropping off the bus mid-waveform
@@ -1012,6 +1017,11 @@ async fn boot_detach_task() -> ! {
     ///
     /// The scratch on an unplug runs about half a second, which is the car's own
     /// buffer emptying, and this has to cover it.
+    ///
+    /// The car does this to any stream that disappears — the real CaraokeMic
+    /// buzzes on an unplug too. So it is not something wrong here to be found
+    /// and fixed, and the fade is not a workaround for our own bug: it is why
+    /// this device leaves more quietly than the accessory does.
     ///
     /// Measured by ear, not guessed: 600 ms was clean, 100 ms brought the
     /// scratch back intermittently, and 300 ms was still intermittent. So it is
