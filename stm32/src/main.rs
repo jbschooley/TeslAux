@@ -286,6 +286,8 @@ async fn main(spawner: Spawner) {
         spawner.spawn(feature_unit_task().unwrap());
         #[cfg(feature = "if3-log")]
         spawner.spawn(if3_log_task().unwrap());
+        #[cfg(feature = "usb-timing")]
+        spawner.spawn(usb_timing_task().unwrap());
         #[cfg(feature = "kbd-volume")]
         spawner.spawn(kbd_volume_task(kbd_writer).unwrap());
         #[cfg(not(feature = "kbd-volume"))]
@@ -414,8 +416,17 @@ fn flush_car_tx_fifo() {
 async fn pump(mut iso_in: impl EndpointIn) -> ! {
     let mut buf = [0u8; teslamic::BYTES_PER_FRAME + 8];
     let mut last_write = embassy_time::Instant::now();
+    // Separate from `last_write` so the trim logic above is untouched, and reset
+    // on every (re-)enable so the idle stretch before a stream starts is not
+    // counted as the car being late.
+    #[cfg(feature = "usb-timing")]
+    let mut last_poll = embassy_time::Instant::now();
     loop {
         iso_in.wait_enabled().await;
+        #[cfg(feature = "usb-timing")]
+        {
+            last_poll = embassy_time::Instant::now();
+        }
 
         // Flush the endpoint's TX FIFO now that it has been (re-)enabled.
         //
@@ -466,6 +477,11 @@ async fn pump(mut iso_in: impl EndpointIn) -> ! {
             let attempt = match attempt {
                 Ok(r) => r,
                 Err(_) => {
+                    #[cfg(feature = "usb-timing")]
+                    usb_timing::TIMEOUTS.store(
+                        usb_timing::TIMEOUTS.load(Ordering::Relaxed).wrapping_add(1),
+                        Ordering::Relaxed,
+                    );
                     // Belt and braces: the same flush on the recovery path, so
                     // a stall from any other cause cannot become permanent.
                     flush_car_tx_fifo();
@@ -486,6 +502,13 @@ async fn pump(mut iso_in: impl EndpointIn) -> ! {
                     // Catch it where it actually shows: a gap between delivered
                     // packets far longer than the one-frame polling interval.
                     let now = embassy_time::Instant::now();
+                    #[cfg(feature = "usb-timing")]
+                    {
+                        usb_timing::record(
+                            now.duration_since(last_poll).as_micros() as u32,
+                        );
+                        last_poll = now;
+                    }
                     if now.duration_since(last_write) > embassy_time::Duration::from_millis(20) {
                         PIPE.lock(|p| p.borrow_mut().trim_to_target());
                     }
@@ -596,5 +619,81 @@ async fn kbd_volume_task(
     defmt::info!("keyboard: done — did the car's volume move?");
     loop {
         embassy_time::Timer::after_secs(60).await;
+    }
+}
+
+/// How punctually the car collects our isochronous packets.
+///
+/// The question is whether the car's USB scheduling is costing us anything, and
+/// in particular whether writing to the Sentry drive makes it late. A full-speed
+/// device behind a high-speed hub has its isochronous traffic carried as split
+/// transactions through the hub's transaction translator, sharing a budget with
+/// every other full-speed device — a known source of isochronous jitter, and the
+/// argument for moving to a high-speed part.
+///
+/// Every bit-exact recording this project has made was captured on a Mac, so
+/// none of them say anything about the car's side. This does.
+///
+/// A packet should leave every 1 ms. Buckets are gaps between successful writes.
+#[cfg(feature = "usb-timing")]
+mod usb_timing {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    pub static TIMEOUTS: AtomicU32 = AtomicU32::new(0);
+    #[allow(clippy::declare_interior_mutable_const)]
+    const Z: AtomicU32 = AtomicU32::new(0);
+    /// <=1.5 ms, <=2.5, <=5.5, <=10.5, beyond.
+    pub static BUCKETS: [AtomicU32; 5] = [Z; 5];
+    pub static MAX_US: AtomicU32 = AtomicU32::new(0);
+
+    pub fn record(us: u32) {
+        let i = match us {
+            0..=1_500 => 0,
+            1_501..=2_500 => 1,
+            2_501..=5_500 => 2,
+            5_501..=10_500 => 3,
+            _ => 4,
+        };
+        BUCKETS[i].store(BUCKETS[i].load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
+        if us > MAX_US.load(Ordering::Relaxed) {
+            MAX_US.store(us, Ordering::Relaxed);
+        }
+    }
+
+    /// Read and clear, so each line is a window rather than a running total.
+    pub fn take() -> ([u32; 5], u32, u32) {
+        let mut b = [0u32; 5];
+        for (i, slot) in BUCKETS.iter().enumerate() {
+            b[i] = slot.load(Ordering::Relaxed);
+            slot.store(0, Ordering::Relaxed);
+        }
+        let m = MAX_US.load(Ordering::Relaxed);
+        MAX_US.store(0, Ordering::Relaxed);
+        (b, m, TIMEOUTS.load(Ordering::Relaxed))
+    }
+}
+
+/// Report the car's polling punctuality every five seconds.
+#[cfg(feature = "usb-timing")]
+#[embassy_executor::task]
+async fn usb_timing_task() -> ! {
+    loop {
+        embassy_time::Timer::after_secs(5).await;
+        let (b, max_us, timeouts) = usb_timing::take();
+        let total: u32 = b.iter().sum();
+        if total == 0 {
+            continue;
+        }
+        defmt::info!(
+            "usb: {} packets | on time {} | 1-2ms {} | 2-5ms {} | 5-10ms {} | >10ms {} | worst {} us | timeouts {}",
+            total,
+            b[0],
+            b[1],
+            b[2],
+            b[3],
+            b[4],
+            max_us,
+            timeouts,
+        );
     }
 }

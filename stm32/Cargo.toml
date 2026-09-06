@@ -74,6 +74,15 @@ line-in = []
 # controls do nothing to this device and send nothing over the audio class,
 # which leaves IF3 as the only channel they could be on.
 if3-log = []
+# DIAGNOSTIC: measure how punctually the car collects our isochronous packets,
+# and whether the Sentry drive writing makes it late. A full-speed device behind
+# a high-speed hub has its isochronous traffic carried as split transactions
+# through the hub's transaction translator, sharing a budget with every other
+# full-speed device — the argument for moving to a high-speed part. Every
+# bit-exact recording so far was captured on a Mac and says nothing about the
+# car's side; this does.
+usb-timing = []
+
 # DIAGNOSTIC (with kbd-volume): present IF2 as a Consumer Control device and send
 # Consumer-page usages instead of Keyboard-page ones. The car ignored Keyboard
 # 0x80/0x81, which is where volume keys nominally live but almost nobody
