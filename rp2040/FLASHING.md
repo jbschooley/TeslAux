@@ -84,6 +84,7 @@ which is expected.
 | `teslamic-rp-I2STEST.uf2` | source | drives the link with embassy-rp's upstream I²S master, to test `slave_rx` against known-good code |
 | `teslamic-rp-source-PANTEST.uf2` | source | which side does I²S slot 0 come out of? Tone in slot 0, silence in slot 1 |
 | `teslamic-rp-source-MEASURE.uf2` | source | how far does the buffer actually wander? LED: green <64 frames, amber <128, red >=128. Run a full song; the peak is the real lower bound on the cushion |
+| `teslamic-rp-car-BOOTDETACH.uf2` | car | as `car-elastic-lowlat`, plus: **hold BOOTSEL to drop off the car's USB bus**. The car clamps all media to ~60% whenever an audio input is present and decides that when the volume is set — so hold the button, set the volume, release, and it stays loud |
 | `teslamic-rp-car-STRESS-TEST.uf2` | car | does the car accept variable packet sizes? Self-contained, needs no wiring |
 | `teslamic-rp-car-PIPEWATCH.uf2` | car | **how** does the pipe empty? Same tone as PIPETONE plus the measurement. LED latches on the first underrun: green none yet, **red** the producer stalled (level fell below the pacer's floor and hit zero within 10 ms), **amber** in between, **blue** a gradual drain the pacer failed to answer (50 ms+) |
 | `teslamic-rp-car-PIPETONE.uf2` | car | is a hold coming from THIS board's pipe, or arriving over I²S? Substitutes a known tone for the captured samples while keeping the capture timing. Needs the source board connected and streaming; check with `tools/tonecompare.py` |

@@ -342,6 +342,9 @@ async fn main(spawner: Spawner) {
     #[cfg(not(feature = "packet-stress"))]
     sm0.set_enable(true);
 
+    #[cfg(feature = "boot-detach")]
+    spawner.spawn(boot_detach_task().unwrap());
+
     // The RP2040-Zero has no plain LED; its only indicator is a WS2812 on
     // GPIO16, driven from PIO1 (PIO0 is I2S).
     #[cfg(not(feature = "rp2040-zero"))]
@@ -851,6 +854,52 @@ mod watch {
     }
 }
 
+// ── boot-detach: hold BOOTSEL to take the mic off the bus ───────────────────
+//
+// The car clamps ALL media output — Spotify included — to about 60% whenever a
+// USB audio input is present, and it computes that clamp when the volume is
+// set. Unplugging does not lift it; adjusting the volume with nothing attached
+// does, and the loud setting then survives reconnecting.
+//
+// Measured in the car, none of these move it: the Feature Unit advertising
+// +30 dB, 0 dB or -20 dB; a Line Connector terminal type instead of Microphone;
+// IF3 refused, or omitted entirely; a generic VID/PID, which the car still plays
+// and still clamps while sending no karaoke configuration at all; and volume
+// keys on both the Keyboard and Consumer HID pages. So the clamp is not
+// something to argue with. It is something to time.
+//
+// Holding BOOTSEL drops the car-facing D+ pullup. The car sees the mic leave,
+// the volume can be set clean, and releasing brings it back into a system that
+// is now loud. The phone side is a different board and never notices.
+#[cfg(feature = "boot-detach")]
+mod boot {
+    use embassy_rp::pac;
+
+    /// Read BOOTSEL, which is wired to the flash's chip-select line.
+    ///
+    /// Must run from RAM with interrupts off: sampling the pad means taking the
+    /// QSPI output driver away, and while it is away the flash cannot be read,
+    /// so an interrupt vectoring into flash here would fault. `.data` is copied
+    /// to RAM at boot, `inline(never)` keeps this there, and the body calls
+    /// nothing that isn't inlined.
+    #[inline(never)]
+    #[link_section = ".data"]
+    pub fn pressed() -> bool {
+        const CS: usize = 1;
+        cortex_m::interrupt::free(|_| {
+            let ctrl = pac::IO_QSPI.gpio(CS).ctrl();
+            let status = pac::IO_QSPI.gpio(CS).status();
+            let saved = ctrl.read();
+            ctrl.modify(|w| w.set_oeover(pac::io::vals::Oeover::DISABLE));
+            // The pad needs a moment to settle once it stops being driven.
+            cortex_m::asm::delay(2000);
+            let low = !status.read().infrompad();
+            ctrl.write_value(saved);
+            low
+        })
+    }
+}
+
 /// Map the firmware's atomics onto a board-independent status. How it is shown
 /// depends on the board: a blink code on a plain LED, or colour on the
 /// RP2040-Zero's WS2812 (it has no plain LED — see `status.rs`).
@@ -888,4 +937,27 @@ async fn status_task(mut led: Output<'static>) -> ! {
 #[embassy_executor::task]
 async fn status_task(mut led: ws2812::Ws2812<'static, embassy_rp::peripherals::PIO1, 0>) -> ! {
     status::run(&mut led, current_state).await
+}
+
+/// Take the device off the bus while BOOTSEL is held.
+///
+/// embassy-rp's `UsbDevice::disable()` cannot be used for this — it is
+/// `async fn disable(&mut self) {}`, a no-op, so it never touches the bus. The
+/// pullup is what the host actually sees, so drive it directly, and `modify`
+/// rather than `write` so the rest of SIE_CTRL survives.
+#[cfg(feature = "boot-detach")]
+#[embassy_executor::task]
+async fn boot_detach_task() -> ! {
+    use embassy_rp::pac;
+    let mut detached = false;
+    loop {
+        let held = boot::pressed();
+        if held != detached {
+            detached = held;
+            pac::USB.sie_ctrl().modify(|w| w.set_pullup_en(!held));
+        }
+        // Slow enough that the interrupts-off window is nothing against the
+        // audio path, quick enough to feel like a button.
+        embassy_time::Timer::after_millis(50).await;
+    }
 }

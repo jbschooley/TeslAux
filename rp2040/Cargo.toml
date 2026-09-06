@@ -97,6 +97,13 @@ pipe-tone = []
 # take the source board's data out of the picture. See src/bin/car.rs.
 pipe-watch = []
 
+# Hold the BOOTSEL button on the car board to drop the car-facing USB pullup, so
+# the car sees the mic leave the bus. The car clamps all media output to about
+# 60% whenever a USB audio input is present, and computes that clamp when the
+# volume is set — so hold, adjust the volume, release, and the car stays loud.
+# Only the car side is affected; the phone is on the other board.
+boot-detach = []
+
 # DIAGNOSTIC (car board): generate a 1 kHz tone internally and deliberately swing
 # the iso packet size 47/49 every frame. Answers "does Tesla tolerate variable
 # packet sizes?" with no PCM2706, no source board, no wiring — flash, plug into

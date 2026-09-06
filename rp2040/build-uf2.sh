@@ -28,6 +28,7 @@ build source ultra-low       teslamic-rp-source-ultralow
 # --- PCM2706 variant: same car binary as elastic, kept under its old name ---
 build car    ""              teslamic-rp-car-pcm2706
 build car    clock-locked    teslamic-rp-car-locked
+build car    low-latency,boot-detach teslamic-rp-car-BOOTDETACH
 build car    packet-stress   teslamic-rp-car-STRESS-TEST
 # Same cushion and block size as the shipping car image, so it is the shipping
 # pipe under test — only the sample VALUES are substituted.
