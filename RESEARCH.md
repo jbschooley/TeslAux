@@ -103,13 +103,63 @@ Request decoding: `bmRequestType` `0x21` = host→device/class/interface,
 `bReq` `0x0a`=SET_IDLE, `0x06`=GET_DESCRIPTOR, `0x09`=SET_REPORT, `0x01`=GET_REPORT.
 `wValue` `0x2200` = HID Report descriptor; `0x0200` = Output report, ID 0.
 
-### 3.3 The IF3 config protocol (`A5 5A` framed)
-- Magic header **`A5 5A`**, then a command/type byte (`fc`, `00`, `01`, …).
-- The `fc 04 b0 b0 00 NN` frames look like **offset-addressed chunked writes**
-  (offset `0x0000` → `0x0010` → `0x0020`, +0x10 each). Likely writing a config or
-  parameter blob in 16-byte chunks.
-- Variable report lengths (9, 8, 12, 18 bytes) → multiple message/command types.
-- We `Accept` every write; the car never reads back over the control channel.
+### 3.3 The IF3 config protocol (`A5 5A` framed) — DECODED
+
+Captured in the car with `--features if3-log`, by moving each control in turn.
+534 frames. The frame is:
+
+```
+A5 5A | type | len | payload[len] | 16
+```
+
+`len` counts the payload only. Two earlier readings here were wrong and are
+corrected below: the `fc 04 b0 b0 00 NN` frames are not chunked writes to an
+offset, and the incrementing third byte is not a sequence number.
+
+**The UI controls.** `A5 5A FC 04 B0 B0 <cc> <v> 16`, where `<v>` is 0x00-0x0F —
+sixteen steps — and `<cc>` selects the control:
+
+| `<cc>` | control |
+|---|---|
+| `0x00` | **mic volume**, default 0x0A |
+| `0x01` + `0x02` | **reverb**, sent as a pair, one frame each per step |
+
+So the car's mic volume slider is a 0-15 step sent here, not the audio class
+Feature Unit, and the reverb slider drives two channels together. What was read
+as an offset walking `00 → 10 → 20` was the slider being dragged.
+
+**The effect presets.** Tapping an effect re-sends the entire DSP configuration:
+types `0x00`, `0x01`, `0x03`, `0x04`, `0x06`-`0x0D`, then `A5 5A FC 05 FF` +
+ASCII **`YASB`**, then a parameter sweep from `0x81` to `0xB7`, then
+`FC 03 C0 AA 01` to commit. The incrementing byte is a **parameter ID**, not a
+sequence number — the car walks the register map in order.
+
+The block is identical every time except for the frames that carry the preset
+itself. Those are the ones worth knowing:
+
+| type | len | distinct values seen |
+|---|---|---|
+| `0x89` | 18 | 4 |
+| `0x8B` | 22 | 4 |
+| `0xA9`, `0xAA`, `0xAB` | 12 | 3-4 |
+
+Four distinct values across four effects tapped. Everything else in the block is
+constant, including eight 112-byte blobs at `0xA0`-`0xA7`.
+
+`FC 03 C0 AA 01` / `... 00` bracket the block — start and commit.
+
+**What this means.** Two things this project wanted are sitting in here:
+
+* The **mic volume slider** can be honoured. Treating `<v>` as attenuation with
+  0x0F as unity gives a working volume control that is bit-exact at maximum and
+  never clips, unlike gain.
+* The **effect buttons are a control channel**. Each tap is a distinct,
+  recognisable frame from the car's own UI, which is what the media-control work
+  went looking for and could not find over the mic channel.
+
+It does **not** offer more volume. The real mic already reports maxed samples at
+its top step, and this device sends full scale regardless, so both arrive at the
+car's mixer at the same level and hit the same ceiling.
 
 ### 3.4 Why we're blocked (the wall)
 Because there's **no `GET_REPORT` after the writes**, the accept/reject decision
