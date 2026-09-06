@@ -988,8 +988,18 @@ async fn status_task(mut led: ws2812::Ws2812<'static, embassy_rp::peripherals::P
 async fn boot_detach_task() -> ! {
     use embassy_rp::pac;
     use embassy_time::Timer;
-    /// How long to stream silence before dropping off. The scratch on an unplug
-    /// runs about half a second, which is the car's own buffer emptying.
+    /// How long to stream silence before dropping off.
+    ///
+    /// The scratch on an unplug runs about half a second, which is the car's own
+    /// buffer emptying, and this has to cover it.
+    ///
+    /// Measured by ear, not guessed: 600 ms was clean, 100 ms brought the
+    /// scratch back intermittently, and 300 ms was still intermittent. So it is
+    /// not enough for the last thing written to be silence — the buffer has to
+    /// be filled with it, and only 600 reliably reaches the far end.
+    ///
+    /// The delay is not felt in use. The button is pressed on the way to the
+    /// volume control, not while listening.
     const FLUSH_MS: u64 = 600;
     use core::sync::atomic::Ordering;
     let mut detached = false;
