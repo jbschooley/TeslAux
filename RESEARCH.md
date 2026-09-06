@@ -121,8 +121,13 @@ sixteen steps — and `<cc>` selects the control:
 
 | `<cc>` | control |
 |---|---|
-| `0x00` | **mic volume**, default 0x0A |
+| `0x00` | **volume**, default 0x0A |
 | `0x01` + `0x02` | **reverb**, sent as a pair, one frame each per step |
+
+`0x00` is the volume, not specifically the mic slider: the car's master volume
+roller sends the same control, sweeping the same 0x00-0x0F. Whether the two UI
+elements are one value or the car maps both onto it cannot be told from this
+side — either way the device sees a single volume number.
 
 So the car's mic volume slider is a 0-15 step sent here, not the audio class
 Feature Unit, and the reverb slider drives two channels together. What was read
@@ -156,6 +161,12 @@ constant, including eight 112-byte blobs at `0xA0`-`0xA7`.
 * The **effect buttons are a control channel**. Each tap is a distinct,
   recognisable frame from the car's own UI, which is what the media-control work
   went looking for and could not find over the mic channel.
+
+**Media transport sends nothing.** Play, pause, next and previous, from the
+steering wheel and from the screen, produce not one frame. The mic is never told
+the track changed, which is reasonable — it has no reason to know — but it does
+mean IF3 offers no transport events, and the effect buttons are the only UI
+control that reaches the device.
 
 It does **not** offer more volume. The real mic already reports maxed samples at
 its top step, and this device sends full scale regardless, so both arrive at the
