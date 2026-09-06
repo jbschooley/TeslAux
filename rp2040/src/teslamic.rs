@@ -364,8 +364,30 @@ pub mod feature_unit {
 
     pub const CUR: i16 = 0; // 0 dB
     pub const MIN: i16 = (-30 * DB) as i16;
-    pub const MAX: i16 = (30 * DB) as i16;
     pub const RES: i16 = (DB / 2) as i16; // 0.5 dB
+
+    /// The advertised ceiling, and the experiment.
+    ///
+    /// The car reads this once at connect and immediately sets CUR to it on
+    /// both channels — then never touches the unit again, however far its own
+    /// slider moves. So the slider is the car's internal mixer, and this is the
+    /// only number about us it takes any notice of.
+    ///
+    /// Which raises the inverted question. If the car *normalises* for what a
+    /// mic claims it can do — "this one has 30 dB in hand, so I will pull back
+    /// downstream" — then advertising LESS should make it attenuate less.
+    /// `fu-max-unity` claims no gain at all and is how that gets tested. It is
+    /// the opposite of the intuitive move, which is why it is worth measuring
+    /// rather than reasoning about.
+    ///
+    /// On the real mic this control is a preamp gain for an analog capsule, and
+    /// running it at maximum is exactly right. For a source already at full
+    /// scale there is nothing underneath for it to amplify, so nothing here
+    /// applies gain to a sample either way.
+    #[cfg(not(feature = "fu-max-unity"))]
+    pub const MAX: i16 = (30 * DB) as i16;
+    #[cfg(feature = "fu-max-unity")]
+    pub const MAX: i16 = 0; // 0 dB: we claim no gain available at all
 
     pub fn note(request: u8, value: u16) {
         REQUESTS.store(REQUESTS.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);

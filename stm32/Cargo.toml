@@ -53,3 +53,9 @@ codegen-units = 1
 # driving that. Answers the car's volume queries and counts them, so a run in
 # the car says whether the car drives mic volume over USB at all.
 feature-unit = []
+# DIAGNOSTIC (with feature-unit): advertise a maximum volume of 0 dB instead of
+# +30. The car sets the device to its advertised maximum at connect and never
+# revisits it, so if the car scales its own mixer by what the mic claims it can
+# do, claiming nothing should make it attenuate less. Inverted on purpose.
+fu-max-unity = ["feature-unit"]
+
