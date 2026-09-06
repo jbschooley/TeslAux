@@ -643,6 +643,28 @@ async fn pump(
             if MUTED.load(Ordering::Relaxed) {
                 buf[..n].fill(0);
             }
+            #[cfg(feature = "boot-detach")]
+            {
+                // Step toward the target once per packet, then scale. At unity
+                // this is a compare and a branch, and the samples are untouched.
+                let target = GAIN_TARGET.load(Ordering::Relaxed);
+                let mut g = GAIN.load(Ordering::Relaxed);
+                if g != target {
+                    g = if g < target {
+                        (g + GAIN_STEP).min(target)
+                    } else {
+                        g.saturating_sub(GAIN_STEP).max(target)
+                    };
+                    GAIN.store(g, Ordering::Relaxed);
+                }
+                if g != 256 {
+                    for f in buf[..n].chunks_exact_mut(2) {
+                        let v = i16::from_le_bytes([f[0], f[1]]) as i32;
+                        let v = ((v * g as i32) >> 8) as i16;
+                        f.copy_from_slice(&v.to_le_bytes());
+                    }
+                }
+            }
             match iso_in.write(&buf[..n]).await {
                 Ok(()) => {
                     // `wait_enabled()` only returns on an alt-setting change. A
@@ -871,6 +893,22 @@ mod watch {
 // Holding BOOTSEL drops the car-facing D+ pullup. The car sees the mic leave,
 // the volume can be set clean, and releasing brings it back into a system that
 // is now loud. The phone side is a different board and never notices.
+/// Output gain, Q8: 256 is unity and bit-exact, 0 is silence.
+///
+/// Only ever leaves unity while detaching. Dropping off the bus mid-waveform
+/// leaves the car playing out whatever was in its buffer — half a second of
+/// scratchy sawtooth, audible on an ordinary unplug too. We cannot help the
+/// unplug, but when the button causes it we can make sure what the car has
+/// buffered is silence.
+#[cfg(feature = "boot-detach")]
+static GAIN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(256);
+#[cfg(feature = "boot-detach")]
+static GAIN_TARGET: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(256);
+/// Step per USB frame. 16 gets from unity to silence in 16 ms — long enough not
+/// to click, short enough not to be a fade you notice.
+#[cfg(feature = "boot-detach")]
+const GAIN_STEP: u32 = 16;
+
 #[cfg(feature = "boot-detach")]
 mod boot {
     use embassy_rp::pac;
@@ -949,15 +987,34 @@ async fn status_task(mut led: ws2812::Ws2812<'static, embassy_rp::peripherals::P
 #[embassy_executor::task]
 async fn boot_detach_task() -> ! {
     use embassy_rp::pac;
+    use embassy_time::Timer;
+    /// How long to stream silence before dropping off. The scratch on an unplug
+    /// runs about half a second, which is the car's own buffer emptying.
+    const FLUSH_MS: u64 = 600;
+    use core::sync::atomic::Ordering;
     let mut detached = false;
     loop {
         let held = boot::pressed();
         if held != detached {
             detached = held;
-            pac::USB.sie_ctrl().modify(|w| w.set_pullup_en(!held));
+            if held {
+                // Fade out, then keep streaming silence for long enough that
+                // what the car has buffered is silence before we vanish. The
+                // noise on an unplug lasts about half a second, so flush at
+                // least that much.
+                GAIN_TARGET.store(0, Ordering::Relaxed);
+                Timer::after_millis(FLUSH_MS).await;
+                pac::USB.sie_ctrl().modify(|w| w.set_pullup_en(false));
+            } else {
+                // Come back silent and ramp up, so re-enumeration does not
+                // arrive mid-waveform either.
+                pac::USB.sie_ctrl().modify(|w| w.set_pullup_en(true));
+                GAIN.store(0, Ordering::Relaxed);
+                GAIN_TARGET.store(256, Ordering::Relaxed);
+            }
         }
         // Slow enough that the interrupts-off window is nothing against the
         // audio path, quick enough to feel like a button.
-        embassy_time::Timer::after_millis(50).await;
+        Timer::after_millis(50).await;
     }
 }
