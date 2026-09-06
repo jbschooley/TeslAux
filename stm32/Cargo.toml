@@ -53,6 +53,14 @@ codegen-units = 1
 # driving that. Answers the car's volume queries and counts them, so a run in
 # the car says whether the car drives mic volume over USB at all.
 feature-unit = []
+# DIAGNOSTIC: report the Input Terminal as a Line Connector (0x0603) instead of
+# a Microphone (0x0201). The car clamps ALL media output to about 60% whenever a
+# CaraokeMic is enumerated — with both handhelds switched off, so it reacts to a
+# microphone-class device being present, not to a live mic. Tesla calls it
+# anti-howling. A line input has no acoustic path and no feedback risk, so if the
+# clamp keys on terminal type, saying so should lift it.
+line-in = []
+
 # DIAGNOSTIC: keep a ring of the car's IF3 `A5 5A` writes so they can be read
 # out. They have always been accepted and discarded — the car never reads back,
 # so there was no reason to look. There is now: the car's mic, reverb and effect

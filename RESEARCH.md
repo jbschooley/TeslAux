@@ -172,6 +172,55 @@ It does **not** offer more volume. The real mic already reports maxed samples at
 its top step, and this device sends full scale regardless, so both arrive at the
 car's mixer at the same level and hit the same ceiling.
 
+### 3.35 The volume ceiling is anti-howling, and it is not reachable
+
+Playing through the mic tops out around 60% of the car's volume scale. Chased it
+from both ends; it is not the mic path being mixed quietly.
+
+**It clamps everything, not the mic.** With the mic connected, Spotify stops
+getting louder past the same point. Unplug the mic and the car goes much louder.
+
+**It is device presence, not a live mic.** The real receiver with both handhelds
+switched off clamps just the same.
+
+**It latches when the volume is set, not continuously.** Raise the volume first,
+then connect: it stays loud, and keeps playing loud, until the volume is touched
+again — at which point everything drops to the ceiling while the display carries
+on reading higher.
+
+Tesla calls the feature "anti-howling" on the CaraokeMic's product page.
+Limiting the speakers whenever a microphone-class device is in the cabin is
+exactly what that is for, and the car applies it bluntly: any CaraokeMic
+present, live or not.
+
+Things tried, all measured, none of which move it:
+
+| tried | result |
+|---|---|
+| Feature Unit advertising +30 dB, then 0 dB | No audible difference either way |
+| The real mic's own range | 0 to +16 dB, already pinned at maximum |
+| Input Terminal as Line Connector (0x0603) rather than Microphone | Still recognised as a CaraokeMic, still clamped |
+| Both handhelds powered off | Still clamped |
+| Mic volume slider (IF3 `cc=0x00`) at maximum | Already there |
+
+The last one closes it from the other side: the real mic reports maxed samples
+at its top step, and this device sends full scale regardless, so both arrive at
+the mixer at the same level and meet the same ceiling.
+
+**And the identity cannot be dropped.** The car ignores generic USB audio devices
+completely — nothing appears at all. The TeslaMic identity is not merely how the
+popup is avoided; it is the only reason audio is accepted. So recognition and
+anti-howling arrive together and no descriptor edit separates them.
+
+What remains is a workaround rather than a fix: **set the volume before the
+bridge is connected**, and do not touch it afterwards. The clamp latches on
+change, so a level set while nothing is plugged in survives.
+
+Full volume means leaving the mic path for the media path, which is not clamped
+because a mass-storage device is not an audio input. That trades away the
+overlay — the reason the mic path was chosen — and inherits the car's read-ahead
+as latency.
+
 ### 3.4 Why we're blocked (the wall)
 Because there's **no `GET_REPORT` after the writes**, the accept/reject decision
 happens on channels our device-side control spy **cannot observe**:

@@ -94,11 +94,30 @@ const AC_HEADER: [u8; 7] = [
     0x01, // baInterfaceNr(1) = the AudioStreaming interface
 ];
 
+/// What kind of source the car is told this is.
+///
+/// `0x0201` is Microphone, which is what the real mic reports and what has been
+/// cloned from the start. The car clamps all media output — Spotify included —
+/// to about 60% whenever a CaraokeMic is enumerated, and does so with both
+/// handheld mics switched off, so it is reacting to a microphone-class device
+/// being present rather than to a live mic. Tesla calls the feature
+/// "anti-howling"; limiting the speakers when there is an acoustic source in the
+/// cabin is exactly what that would do.
+///
+/// A line input has no acoustic path and no feedback risk. If the clamp keys on
+/// terminal type, saying so should lift it. `line-in` says `0x0603` (Line
+/// Connector); `0x0602` (Digital Audio Interface) is the other candidate if that
+/// is not distinct enough for it.
+#[cfg(not(feature = "line-in"))]
+const TERMINAL_TYPE: [u8; 2] = [0x01, 0x02]; // 0x0201 Microphone
+#[cfg(feature = "line-in")]
+const TERMINAL_TYPE: [u8; 2] = [0x03, 0x06]; // 0x0603 Line Connector
+
 #[cfg(not(feature = "feature-unit"))]
 const AC_INPUT_TERMINAL: [u8; 10] = [
     0x02, // INPUT_TERMINAL
     0x01, // bTerminalID = 1
-    0x01, 0x02, // wTerminalType = 0x0201 (Microphone)
+    TERMINAL_TYPE[0], TERMINAL_TYPE[1],
     0x00, // bAssocTerminal
     CHANNELS as u8,
     0x03, 0x00, // wChannelConfig = L+R
@@ -109,7 +128,7 @@ const AC_INPUT_TERMINAL: [u8; 10] = [
 const AC_INPUT_TERMINAL: [u8; 10] = [
     0x02, // INPUT_TERMINAL
     0x04, // bTerminalID = 4, as the real mic
-    0x01, 0x02, // wTerminalType = 0x0201 (Microphone)
+    TERMINAL_TYPE[0], TERMINAL_TYPE[1],
     0x00, // bAssocTerminal
     CHANNELS as u8,
     0x03, 0x00, // wChannelConfig = L+R
