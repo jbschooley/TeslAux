@@ -53,6 +53,13 @@ codegen-units = 1
 # driving that. Answers the car's volume queries and counts them, so a run in
 # the car says whether the car drives mic volume over USB at all.
 feature-unit = []
+# DIAGNOSTIC (with feature-unit): claim a range entirely below unity, -60 dB to
+# -20 dB, so the device says it cannot reach full level at all. Advertising
+# headroom above unity changed nothing and claiming none changed nothing; this is
+# the remaining direction on that axis. If the car compensates for a source that
+# says it is weak, this is what would show it.
+fu-negative = ["feature-unit"]
+
 # DIAGNOSTIC: report the Input Terminal as a Line Connector (0x0603) instead of
 # a Microphone (0x0201). The car clamps ALL media output to about 60% whenever a
 # CaraokeMic is enumerated — with both handhelds switched off, so it reacts to a
@@ -67,6 +74,12 @@ line-in = []
 # controls do nothing to this device and send nothing over the audio class,
 # which leaves IF3 as the only channel they could be on.
 if3-log = []
+# DIAGNOSTIC (with kbd-volume): present IF2 as a Consumer Control device and send
+# Consumer-page usages instead of Keyboard-page ones. The car ignored Keyboard
+# 0x80/0x81, which is where volume keys nominally live but almost nobody
+# implements; a keyboard's volume buttons really send Consumer 0xE9/0xEA.
+kbd-consumer = []
+
 # DIAGNOSTIC: press Volume Up on the HID keyboard interface, ten times, and see
 # whether the car acts on it. IF2 is the only channel running device to host —
 # IF3 is endpoint-less and the car never reads it — and the clamp is computed

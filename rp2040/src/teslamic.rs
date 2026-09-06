@@ -468,8 +468,25 @@ pub mod feature_unit {
     pub static LAST_RAW: AtomicU32 = AtomicU32::new(0);
     pub static MUTED: AtomicU32 = AtomicU32::new(0);
 
+    /// What we claim to be set to. The car overwrites this with MAX at connect
+    /// anyway, but it has to be inside the range we advertise or the claim is
+    /// incoherent.
+    #[cfg(not(feature = "fu-negative"))]
     pub const CUR: i16 = 0; // 0 dB
+    #[cfg(feature = "fu-negative")]
+    pub const CUR: i16 = (-20 * DB) as i16;
+
+    #[cfg(not(feature = "fu-negative"))]
     pub const MIN: i16 = (-30 * DB) as i16;
+    /// Claim to be a quiet source that cannot reach unity: -60 dB up to -20 dB.
+    ///
+    /// The inverse of the earlier test. Advertising headroom above unity changed
+    /// nothing, and neither did claiming none. If the car compensates for what a
+    /// source says it can manage — boosting a weak one rather than trusting it —
+    /// then claiming to be 20 dB short is the way to find out, and it is the one
+    /// direction on this axis that has not been tried.
+    #[cfg(feature = "fu-negative")]
+    pub const MIN: i16 = (-60 * DB) as i16;
     pub const RES: i16 = (DB / 2) as i16; // 0.5 dB
 
     /// The advertised ceiling, and the experiment.
@@ -490,10 +507,12 @@ pub mod feature_unit {
     /// running it at maximum is exactly right. For a source already at full
     /// scale there is nothing underneath for it to amplify, so nothing here
     /// applies gain to a sample either way.
-    #[cfg(not(feature = "fu-max-unity"))]
+    #[cfg(all(not(feature = "fu-max-unity"), not(feature = "fu-negative")))]
     pub const MAX: i16 = (30 * DB) as i16;
-    #[cfg(feature = "fu-max-unity")]
+    #[cfg(all(feature = "fu-max-unity", not(feature = "fu-negative")))]
     pub const MAX: i16 = 0; // 0 dB: we claim no gain available at all
+    #[cfg(feature = "fu-negative")]
+    pub const MAX: i16 = (-20 * DB) as i16; // cannot even reach unity
 
     pub fn note(request: u8, value: u16) {
         REQUESTS.store(REQUESTS.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
@@ -674,7 +693,10 @@ pub fn build<'d, D: Driver<'d>>(
         builder,
         hid_state,
         HidConfig {
+            #[cfg(not(feature = "kbd-consumer"))]
             report_descriptor: &HID_REPORT_KEYBOARD,
+            #[cfg(feature = "kbd-consumer")]
+            report_descriptor: &HID_REPORT_CONSUMER,
             request_handler: Some(kbd),
             poll_ms: 1,
             max_packet_size: 8,
@@ -711,6 +733,38 @@ pub fn build<'d, D: Driver<'d>>(
 /// Keyboard/Keypad usage IDs the car may act on. Not the Consumer page — the
 /// real mic is a boot keyboard, and these live in the standard page.
 pub const KEY_MUTE: u8 = 0x7F;
+/// Consumer page (0x0C) usages. The car ignored the Keyboard page's volume
+/// keys, which is not surprising — a keyboard's volume buttons really send
+/// these, and Keyboard-page 0x80/0x81 are rarely implemented by anyone.
+pub const CONSUMER_VOLUME_UP: u16 = 0x00E9;
+pub const CONSUMER_VOLUME_DOWN: u16 = 0x00EA;
+pub const CONSUMER_MUTE: u16 = 0x00E2;
+pub const CONSUMER_PLAY_PAUSE: u16 = 0x00CD;
+
+/// A Consumer Control report descriptor: one 16-bit usage per report.
+#[cfg(feature = "kbd-consumer")]
+#[rustfmt::skip]
+pub const HID_REPORT_CONSUMER: [u8; 23] = [
+    0x05, 0x0c,       // Usage Page (Consumer)
+    0x09, 0x01,       // Usage (Consumer Control)
+    0xa1, 0x01,       // Collection (Application)
+    0x15, 0x00,       //   Logical Minimum (0)
+    0x26, 0xff, 0x03, //   Logical Maximum (0x3FF)
+    0x19, 0x00,       //   Usage Minimum (0)
+    0x2a, 0xff, 0x03, //   Usage Maximum (0x3FF)
+    0x75, 0x10,       //   Report Size (16)
+    0x95, 0x01,       //   Report Count (1)
+    0x81, 0x00,       //   Input (Data, Array)
+    0xc0,             // End Collection
+];
+
+/// Press and release a Consumer Control usage.
+#[cfg(feature = "kbd-consumer")]
+pub async fn tap_consumer<'d, D: Driver<'d>>(w: &mut HidWriter<'d, D, 8>, usage: u16) {
+    let _ = w.write(&usage.to_le_bytes()).await;
+    let _ = w.write(&[0u8, 0]).await;
+}
+
 pub const KEY_VOLUME_UP: u8 = 0x80;
 pub const KEY_VOLUME_DOWN: u8 = 0x81;
 

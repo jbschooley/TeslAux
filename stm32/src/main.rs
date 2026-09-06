@@ -587,7 +587,10 @@ async fn kbd_volume_task(
     embassy_time::Timer::after_secs(10).await;
     for i in 0..10u32 {
         defmt::info!("keyboard: Volume Up #{}", i + 1);
+        #[cfg(not(feature = "kbd-consumer"))]
         teslamic::tap_key(&mut w, teslamic::KEY_VOLUME_UP).await;
+        #[cfg(feature = "kbd-consumer")]
+        teslamic::tap_consumer(&mut w, teslamic::CONSUMER_VOLUME_UP).await;
         embassy_time::Timer::after_secs(2).await;
     }
     defmt::info!("keyboard: done — did the car's volume move?");

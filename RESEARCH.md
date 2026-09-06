@@ -197,11 +197,21 @@ Things tried, all measured, none of which move it:
 
 | tried | result |
 |---|---|
-| Feature Unit advertising +30 dB, then 0 dB | No audible difference either way |
+| Feature Unit advertising +30 dB, 0 dB, then -60..-20 dB | No audible difference in any of the three |
 | The real mic's own range | 0 to +16 dB, already pinned at maximum |
 | Input Terminal as Line Connector (0x0603) rather than Microphone | Still recognised as a CaraokeMic, still clamped |
 | Both handhelds powered off | Still clamped |
 | Mic volume slider (IF3 `cc=0x00`) at maximum | Already there |
+
+The Feature Unit is decorative here. The car queries the range, writes the
+maximum to both channels and reads one back — faithfully, every time, whether
+that maximum is +30 dB, 0 dB or -20 dB — and then does nothing with it. Claiming
+headroom does not release any, claiming none does not make the car compensate,
+and claiming to be 20 dB short of unity does not make it boost.
+
+Two HID paths are dead as well: the car acts on neither Keyboard-page volume
+usages (0x80/0x81) nor Consumer-page ones (0xE9), sent from the interrupt IN
+endpoint that is the mic's own button.
 
 The last one closes it from the other side: the real mic reports maxed samples
 at its top step, and this device sends full scale regardless, so both arrive at
