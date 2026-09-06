@@ -624,7 +624,7 @@ pub fn build<'d, D: Driver<'d>>(
     #[cfg(feature = "feature-unit")] fu: &'d mut FeatureUnitHandler,
     ep_max_bytes: u16,
     rate: u32,
-) -> D::EndpointIn {
+) -> (D::EndpointIn, HidWriter<'d, D, 8>) {
     srate.rate = rate;
     // IF0 AudioControl + IF1 AudioStreaming.
     let mut func = builder.function(AUDIO_CLASS, SUBCLASS_AUDIOCONTROL, PROTO_UNDEFINED);
@@ -661,9 +661,16 @@ pub fn build<'d, D: Driver<'d>>(
     };
     drop(func);
 
-    // IF2: the real keyboard descriptor. Kept alive so the endpoint stays
-    // allocated; no key is ever pressed.
-    let _kbd: HidWriter<'_, D, 8> = HidWriter::new(
+    // IF2: the real keyboard descriptor — the mic's physical button.
+    //
+    // Returned rather than dropped now. It is the only channel that runs
+    // device to host: IF3 is endpoint-less and the car has never issued a single
+    // GET_REPORT on it, so everything else here is the car talking to us. The
+    // standard Keyboard usage page carries 0x7F Mute, 0x80 Volume Up and 0x81
+    // Volume Down, and the car computes its volume clamp at the moment the
+    // volume is set — so a device that can ask for a volume change is a device
+    // that can choose when that computation happens.
+    let kbd_writer: HidWriter<'_, D, 8> = HidWriter::new(
         builder,
         hid_state,
         HidConfig {
@@ -698,5 +705,17 @@ pub fn build<'d, D: Driver<'d>>(
     #[cfg(feature = "feature-unit")]
     builder.handler(fu);
 
-    iso_in
+    (iso_in, kbd_writer)
+}
+
+/// Keyboard/Keypad usage IDs the car may act on. Not the Consumer page — the
+/// real mic is a boot keyboard, and these live in the standard page.
+pub const KEY_MUTE: u8 = 0x7F;
+pub const KEY_VOLUME_UP: u8 = 0x80;
+pub const KEY_VOLUME_DOWN: u8 = 0x81;
+
+/// One keypress and release, as a boot keyboard reports it.
+pub async fn tap_key<'d, D: Driver<'d>>(w: &mut HidWriter<'d, D, 8>, key: u8) {
+    let _ = w.write(&[0, 0, key, 0, 0, 0, 0, 0]).await;
+    let _ = w.write(&[0; 8]).await;
 }

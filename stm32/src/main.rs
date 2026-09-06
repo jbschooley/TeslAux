@@ -271,7 +271,7 @@ async fn main(spawner: Spawner) {
         // Elastic pacing sends `nominal + 1` frames when shedding drift, so the
         // endpoint must be declared at 196, not the real mic's 192. An endpoint
         // declared at 192 silently drops every corrected packet.
-        let ep = teslamic::build(
+        let (ep, kbd_writer) = teslamic::build(
             &mut builder,
             hid,
             kbd,
@@ -286,6 +286,10 @@ async fn main(spawner: Spawner) {
         spawner.spawn(feature_unit_task().unwrap());
         #[cfg(feature = "if3-log")]
         spawner.spawn(if3_log_task().unwrap());
+        #[cfg(feature = "kbd-volume")]
+        spawner.spawn(kbd_volume_task(kbd_writer).unwrap());
+        #[cfg(not(feature = "kbd-volume"))]
+        let _ = kbd_writer;
         spawner.spawn(usb_car_task(builder.build()).unwrap());
         ep
     };
@@ -557,5 +561,37 @@ async fn if3_log_task() -> ! {
             next = next.wrapping_add(1);
         }
         embassy_time::Timer::after_millis(100).await;
+    }
+}
+
+/// Ask the car to turn itself up, and see whether it listens.
+///
+/// The clamp is computed when the volume is set, from what is connected at that
+/// moment — unplugging does not lift it, but the next volume change does. So the
+/// question is whether this device can cause a volume change at a moment of its
+/// choosing. IF3 cannot: it is endpoint-less and the car has never read from it.
+/// The keyboard can, if the car acts on Keyboard-page volume usages at all.
+///
+/// Ten presses, two seconds apart, starting well after enumeration so the car is
+/// settled. Watch the car's volume display: if it climbs, this channel works and
+/// the clamp becomes something we can time rather than something we suffer.
+#[cfg(feature = "kbd-volume")]
+#[embassy_executor::task]
+async fn kbd_volume_task(
+    mut w: embassy_usb::class::hid::HidWriter<
+        'static,
+        embassy_stm32::usb::Driver<'static, embassy_stm32::peripherals::USB_OTG_FS>,
+        8,
+    >,
+) -> ! {
+    embassy_time::Timer::after_secs(10).await;
+    for i in 0..10u32 {
+        defmt::info!("keyboard: Volume Up #{}", i + 1);
+        teslamic::tap_key(&mut w, teslamic::KEY_VOLUME_UP).await;
+        embassy_time::Timer::after_secs(2).await;
+    }
+    defmt::info!("keyboard: done — did the car's volume move?");
+    loop {
+        embassy_time::Timer::after_secs(60).await;
     }
 }

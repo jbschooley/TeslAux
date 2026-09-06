@@ -117,6 +117,13 @@ line-in = []
 # controls do nothing to this device and send nothing over the audio class,
 # which leaves IF3 as the only channel they could be on.
 if3-log = []
+# DIAGNOSTIC: press Volume Up on the HID keyboard interface, ten times, and see
+# whether the car acts on it. IF2 is the only channel running device to host —
+# IF3 is endpoint-less and the car never reads it — and the clamp is computed
+# when the volume is set. A device that can ask for a volume change is a device
+# that can choose when that computation happens.
+kbd-volume = []
+
 # DIAGNOSTIC: keep every descriptor, string and interface as the real mic's and
 # change only the VID/PID. By elimination the last field that can carry
 # recognition — terminal type, Feature Unit and IF3 have all been ruled out.

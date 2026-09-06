@@ -319,7 +319,7 @@ async fn main(spawner: Spawner) {
         // SAFETY: taken once at startup, and outlives `usb` (main never returns).
         unsafe { &mut *core::ptr::addr_of_mut!(FU) }
     };
-    let iso_in = teslamic::build(
+    let (iso_in, _kbd_writer) = teslamic::build(
         &mut builder,
         hid_state,
         kbd,
