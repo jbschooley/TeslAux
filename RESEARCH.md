@@ -255,6 +255,38 @@ because a mass-storage device is not an audio input. That trades away the
 overlay — the reason the mic path was chosen — and inherits the car's read-ahead
 as latency.
 
+### 3.36 The car's USB scheduling is not costing us anything
+
+Measured in the car with `--features usb-timing`, which buckets the gap between
+successful isochronous writes. A packet should leave every 1 ms.
+
+| | no Sentry drive | Sentry drive recording |
+|---|---|---|
+| packets per 5 s window | 5000 | 5000 |
+| on time (<=1.5 ms) | **5000 / 5000** | **5000 / 5000** |
+| worst gap | 1008-1009 us | 1007-1040 us |
+| write timeouts | 8, from enumeration | 8, unchanged |
+
+Not one late packet in either condition, over many windows. The worst case moved
+by 31 microseconds against a 1000 microsecond budget.
+
+This was worth measuring because there was a real mechanism to suspect: a
+full-speed device behind a high-speed hub has its isochronous traffic carried as
+split transactions through the hub's transaction translator, sharing a budget
+with every other full-speed device — a known source of isochronous jitter, and
+the argument for moving to a high-speed part such as an STM32F723 or a Teensy
+4.1. It is not happening here. The car polls this device like a metronome
+whether or not it is writing video to a drive on the same bus.
+
+So high speed would buy nothing for jitter, and nothing meaningful for latency
+either: the car's own pipeline adds about 100 ms and the phone another 10-50,
+against a few milliseconds of ours.
+
+What this does not cover is what the car does with the packets after collecting
+them. Every bit-exact recording here was captured on a Mac, so the car's
+downstream processing remains unmeasured — but that is also beyond anything a
+faster bridge could change.
+
 ### 3.4 Why we're blocked (the wall)
 Because there's **no `GET_REPORT` after the writes**, the accept/reject decision
 happens on channels our device-side control spy **cannot observe**:
