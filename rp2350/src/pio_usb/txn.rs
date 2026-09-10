@@ -60,11 +60,15 @@ pub enum Outcome {
     /// A data packet went out. `acked` says whether the host acknowledged it,
     /// and is always false for isochronous, which has no handshake to wait
     /// for. Only an acknowledged packet may advance the data toggle.
-    Sent { acked: bool },
+    ///
+    /// Carries the endpoint number because the caller has to record the result
+    /// against the right slot, and by the time it sees this the token is gone.
+    Sent { ep: u8, acked: bool },
     /// A handshake went out and nothing else.
     Handshake(Pid),
-    /// A data packet arrived and was accepted, with this many payload bytes.
-    Received(usize),
+    /// A data packet arrived and was accepted, with this many payload bytes
+    /// now in the caller's buffer.
+    Received { ep: u8, len: usize },
     /// A data packet arrived and its CRC16 failed, so nothing was
     /// acknowledged. The host will retry; an isochronous host will not, and
     /// that is the trade.
@@ -221,7 +225,10 @@ impl Engine {
                     // Isochronous. The transaction is over when the packet is;
                     // there is nothing to wait for, and waiting would burn the
                     // budget for the next frame.
-                    return Outcome::Sent { acked: false };
+                    return Outcome::Sent {
+                        ep: token.endpoint,
+                        acked: false,
+                    };
                 }
 
                 // Everything else: the host answers. The receiver has to be
@@ -236,7 +243,10 @@ impl Engine {
                     // been confirmed.
                     _ => false,
                 };
-                Outcome::Sent { acked }
+                Outcome::Sent {
+                    ep: token.endpoint,
+                    acked,
+                }
             }
 
             Response::Receive { reply } => {
@@ -254,7 +264,10 @@ impl Engine {
                 if let Some(pid) = reply {
                     port.transmit(handshakes.get(pid));
                 }
-                Outcome::Received(len)
+                Outcome::Received {
+                    ep: token.endpoint,
+                    len,
+                }
             }
         }
     }
@@ -451,7 +464,7 @@ mod tests {
                 |_| Some(buf.symbols()),
                 &mut [0u8; 8]
             ),
-            Outcome::Sent { acked: false }
+            Outcome::Sent { ep: 1, acked: false }
         );
         assert_eq!(port.sent.len(), 1, "exactly one packet on the wire");
         assert_eq!(port.sent[0], expected, "and it is the prepared one");
@@ -481,7 +494,7 @@ mod tests {
                 |_| Some(buf.symbols()),
                 &mut [0u8; 8]
             ),
-            Outcome::Sent { acked: true }
+            Outcome::Sent { ep: 1, acked: true }
         );
         // One to listen for the ACK, one to re-arm for the next packet.
         assert_eq!(port.resets, 2, "the receiver must be put back before waiting");
@@ -503,7 +516,7 @@ mod tests {
                 |_| Some(buf.symbols()),
                 &mut [0u8; 8]
             ),
-            Outcome::Sent { acked: false },
+            Outcome::Sent { ep: 1, acked: false },
             "silence is not an error, just an unconfirmed packet"
         );
     }
@@ -530,7 +543,7 @@ mod tests {
                 |_| Some(buf.symbols()),
                 &mut [0u8; 8]
             ),
-            Outcome::Sent { acked: false }
+            Outcome::Sent { ep: 1, acked: false }
         );
         // Only the re-arm at the end: isochronous never stops to listen.
         assert_eq!(port.resets, 1, "no wait means no extra reset");
@@ -575,7 +588,7 @@ mod tests {
         let mut buf = [0u8; 64];
         assert_eq!(
             engine().handle(&mut port, &h, one(EpType::Bulk, true), no_packet, &mut buf),
-            Outcome::Received(payload.len())
+            Outcome::Received { ep: 2, len: payload.len() }
         );
         assert_eq!(&buf[..payload.len()], &payload);
         assert_eq!(port.sent[0], h.get(Pid::Ack));
@@ -594,7 +607,7 @@ mod tests {
         let mut buf = [0u8; 64];
         assert_eq!(
             engine().handle(&mut port, &h, one(EpType::Isochronous, true), no_packet, &mut buf),
-            Outcome::Received(payload.len())
+            Outcome::Received { ep: 2, len: payload.len() }
         );
         assert!(port.sent.is_empty(), "isochronous acknowledges nothing");
     }
@@ -639,7 +652,7 @@ mod tests {
         };
         assert_eq!(
             engine().handle(&mut port, &h, halted, no_packet, &mut [0u8; 64]),
-            Outcome::Received(8)
+            Outcome::Received { ep: 0, len: 8 }
         );
         assert_eq!(port.sent[0], h.get(Pid::Ack), "that is how a halt is cleared");
     }

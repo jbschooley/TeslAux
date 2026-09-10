@@ -374,3 +374,260 @@ mod tests {
         );
     }
 }
+
+/// Run one transaction and record what it did.
+///
+/// The bridge between [`super::txn::Engine`], which knows the protocol, and
+/// [`Table`], which owns the buffers. Everything here is bookkeeping the
+/// interrupt does after the deadline has passed — the reply is already on the
+/// wire by the time this updates anything.
+///
+/// The caller holds whatever lock keeps the application out; see the module
+/// docs for why there is none inside.
+pub fn service<P: super::txn::Port, const N: usize>(
+    engine: &mut super::txn::Engine,
+    port: &mut P,
+    handshakes: &super::endpoint::Handshakes,
+    table: &mut Table<N>,
+    rx_buf: &mut [u8],
+) -> super::txn::Outcome {
+    use super::txn::Outcome;
+
+    let outcome = {
+        // Split the borrow so the engine can hold the table immutably through
+        // both closures while it runs, and this can take it mutably after.
+        let t = &*table;
+        engine.handle(
+            port,
+            handshakes,
+            |ep, is_in| t.state(ep, is_in),
+            |ep| t.slot(ep, true).and_then(|s| s.packet()),
+            rx_buf,
+        )
+    };
+
+    match outcome {
+        Outcome::Sent { ep, acked } => {
+            if let Some(slot) = table.slot_mut(ep, true) {
+                slot.sent(acked);
+            }
+        }
+        Outcome::Received { ep, len } => {
+            if let Some(slot) = table.slot_mut(ep, false) {
+                // A packet the application has not collected yet is dropped.
+                // For isochronous that is the correct outcome — a late frame is
+                // a lost frame — and for anything else the endpoint should have
+                // been NAKing, so it is a bug upstream rather than here.
+                slot.deliver(&rx_buf[..len]);
+                // The endpoint has nowhere to put the next one until the
+                // application reads this, so stop accepting.
+                slot.state.ready = false;
+            }
+        }
+        // Nothing to record. A corrupt packet in particular must leave the
+        // endpoint exactly as it was: the host will send it again, and a slot
+        // that had advanced would put the retransmission in the wrong place.
+        Outcome::Sof(_)
+        | Outcome::Handshake(_)
+        | Outcome::Corrupt
+        | Outcome::Ignored
+        | Outcome::BadToken
+        | Outcome::Timeout => {}
+    }
+    outcome
+}
+
+#[cfg(test)]
+mod service_tests {
+    use super::*;
+    use crate::pio_usb::endpoint::Handshakes;
+    use crate::pio_usb::packet::{build_data, encode_token, Pid, SYNC};
+    use crate::pio_usb::txn::{Engine, Outcome, Port};
+
+    const ADDR: u8 = 7;
+
+    struct Fake {
+        rx: std::collections::VecDeque<u8>,
+        sent: Vec<Vec<u32>>,
+    }
+    impl Port for Fake {
+        fn rx(&mut self) -> Option<u8> {
+            self.rx.pop_front()
+        }
+        fn eop(&self) -> bool {
+            self.rx.is_empty()
+        }
+        fn transmit(&mut self, symbols: &[u32]) {
+            self.sent.push(symbols.to_vec());
+        }
+        fn tx_busy(&self) -> bool {
+            false
+        }
+        fn reset_receiver(&mut self) {}
+    }
+
+    fn fake(bytes: &[u8]) -> Fake {
+        Fake {
+            rx: bytes.iter().copied().collect(),
+            sent: Vec::new(),
+        }
+    }
+
+    fn token(pid: Pid, ep: u8) -> Vec<u8> {
+        let [b0, b1] = encode_token(ADDR, ep);
+        vec![SYNC, pid.to_byte(), b0, b1]
+    }
+
+    fn engine() -> Engine {
+        Engine {
+            address: ADDR,
+            frame: 0,
+        }
+    }
+
+    #[test]
+    fn a_sent_packet_frees_the_endpoint_for_the_application() {
+        let mut t: Table<4> = Table::new();
+        t.allocate(1, true, EpType::Bulk);
+        t.slot_mut(1, true).unwrap().queue(&[1, 2, 3]);
+
+        let mut bytes = token(Pid::In, 1);
+        bytes.extend_from_slice(&[SYNC, Pid::Ack.to_byte()]);
+        let mut port = fake(&bytes);
+
+        let out = service(
+            &mut engine(),
+            &mut port,
+            &Handshakes::new(),
+            &mut t,
+            &mut [0u8; 64],
+        );
+        assert_eq!(out, Outcome::Sent { ep: 1, acked: true });
+
+        let s = t.slot_mut(1, true).unwrap();
+        assert!(!s.state.ready, "the buffer is the application's again");
+        assert!(s.complete, "and it can see the transfer finished");
+        assert_eq!(next_pid(s), Pid::Data1, "acknowledged, so the toggle moved");
+    }
+
+    #[test]
+    fn an_unacknowledged_packet_stays_on_data0() {
+        let mut t: Table<4> = Table::new();
+        t.allocate(1, true, EpType::Bulk);
+        t.slot_mut(1, true).unwrap().queue(&[1]);
+
+        // No ACK behind the token.
+        let mut port = fake(&token(Pid::In, 1));
+        service(
+            &mut engine(),
+            &mut port,
+            &Handshakes::new(),
+            &mut t,
+            &mut [0u8; 64],
+        );
+        assert_eq!(next_pid(t.slot(1, true).unwrap()), Pid::Data0);
+    }
+
+    #[test]
+    fn a_received_packet_lands_in_the_right_slot() {
+        let mut t: Table<4> = Table::new();
+        t.allocate(2, false, EpType::Bulk);
+
+        let payload = [0xAAu8, 0xBB, 0xCC];
+        let mut data = [0u8; 16];
+        let n = build_data(Pid::Data0, &payload, &mut data).unwrap();
+        let mut bytes = token(Pid::Out, 2);
+        bytes.extend_from_slice(&data[..n]);
+        let mut port = fake(&bytes);
+
+        let out = service(
+            &mut engine(),
+            &mut port,
+            &Handshakes::new(),
+            &mut t,
+            &mut [0u8; 64],
+        );
+        assert_eq!(out, Outcome::Received { ep: 2, len: 3 });
+
+        let s = t.slot_mut(2, false).unwrap();
+        assert!(!s.state.ready, "nowhere to put another until this is read");
+        let mut buf = [0u8; 8];
+        assert_eq!(s.take(&mut buf), Some(3));
+        assert_eq!(&buf[..3], &payload);
+        assert!(s.state.ready, "and now there is");
+    }
+
+    /// The IN slot and the OUT slot with the same number are different
+    /// endpoints, so a transfer must not be recorded against the wrong one.
+    #[test]
+    fn a_transfer_is_recorded_against_the_matching_direction() {
+        let mut t: Table<4> = Table::new();
+        t.allocate(1, true, EpType::Bulk);
+        t.allocate(1, false, EpType::Bulk);
+        t.slot_mut(1, true).unwrap().queue(&[1]);
+
+        let mut bytes = token(Pid::In, 1);
+        bytes.extend_from_slice(&[SYNC, Pid::Ack.to_byte()]);
+        let mut port = fake(&bytes);
+        service(
+            &mut engine(),
+            &mut port,
+            &Handshakes::new(),
+            &mut t,
+            &mut [0u8; 64],
+        );
+
+        assert!(t.slot(1, true).unwrap().complete, "the IN endpoint sent");
+        assert!(
+            !t.slot(1, false).unwrap().complete,
+            "the OUT endpoint did nothing"
+        );
+    }
+
+    /// A corrupt packet must leave the endpoint untouched: the host will send
+    /// it again, and a slot that had advanced would misplace the retry.
+    #[test]
+    fn a_corrupt_packet_changes_nothing() {
+        let mut t: Table<4> = Table::new();
+        t.allocate(2, false, EpType::Bulk);
+
+        let mut data = [0u8; 16];
+        let n = build_data(Pid::Data0, &[1, 2, 3], &mut data).unwrap();
+        data[3] ^= 0x01;
+        let mut bytes = token(Pid::Out, 2);
+        bytes.extend_from_slice(&data[..n]);
+        let mut port = fake(&bytes);
+
+        let out = service(
+            &mut engine(),
+            &mut port,
+            &Handshakes::new(),
+            &mut t,
+            &mut [0u8; 64],
+        );
+        assert_eq!(out, Outcome::Corrupt);
+        let s = t.slot(2, false).unwrap();
+        assert!(!s.complete, "nothing was delivered");
+        assert!(s.state.ready, "and the endpoint still has room");
+    }
+
+    #[test]
+    fn a_sof_touches_no_endpoint() {
+        let mut t: Table<4> = Table::new();
+        t.allocate(1, true, EpType::Bulk);
+        t.slot_mut(1, true).unwrap().queue(&[1]);
+
+        let frame = 0x123u16;
+        let raw = frame | ((crate::pio_usb::codec::crc5(frame) as u16) << 11);
+        let mut port = fake(&[SYNC, Pid::Sof.to_byte(), raw as u8, (raw >> 8) as u8]);
+        let mut e = engine();
+        let out = service(&mut e, &mut port, &Handshakes::new(), &mut t, &mut [0u8; 64]);
+
+        assert_eq!(out, Outcome::Sof(frame));
+        assert_eq!(e.frame, frame);
+        assert!(
+            t.slot(1, true).unwrap().state.ready,
+            "the queued packet is still queued"
+        );
+    }
+}
