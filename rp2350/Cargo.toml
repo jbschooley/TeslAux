@@ -25,6 +25,12 @@ path = "src/bin/ledtest.rs"
 name = "pioloop"
 path = "src/bin/pioloop.rs"
 
+# Logic analyser: samples D+/D- with a spare PIO block and dumps the waveform
+# over the native USB port. For when the decoded bytes stop being informative.
+[[bin]]
+name = "piocap"
+path = "src/bin/piocap.rs"
+
 [dependencies]
 pio      = "0.3"
 pio-proc = "0.3"

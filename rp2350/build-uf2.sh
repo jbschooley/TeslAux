@@ -17,5 +17,8 @@ build ledtest "" teslamic-rp2350-LEDTEST
 # back byte for byte; red = decoded but wrong; blue = nothing came back at all;
 # amber = the system clock is not 96 MHz. See src/bin/pioloop.rs.
 build pioloop "" teslamic-rp2350-PIOLOOP
+# Logic analyser: samples D+/D- at 96 MHz with a spare PIO block and dumps the
+# raw waveform over serial. See src/bin/piocap.rs.
+build piocap "" teslamic-rp2350-PIOCAP
 
 ls -l ./*.uf2
