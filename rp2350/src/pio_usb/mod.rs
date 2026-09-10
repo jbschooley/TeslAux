@@ -50,6 +50,7 @@
 #[cfg(target_os = "none")]
 pub mod bus;
 pub mod codec;
+pub mod device;
 pub mod packet;
 pub mod rx;
 pub mod tx;
