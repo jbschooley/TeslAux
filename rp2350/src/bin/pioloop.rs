@@ -296,6 +296,16 @@ async fn main(_spawner: Spawner) {
             let bus_static =
                 got > 8 && back[..got.min(back.len())].iter().all(|b| STATIC_BUS.contains(b));
 
+            // Did the edge detector ever reach the EOP? Its instruction 0 is
+            // `irq wait`, which sets the flag and blocks until acknowledged, so
+            // a set flag here means it saw the end of the packet and stopped.
+            // Clear means it never recognised the EOP and is still free-running
+            // over the idle bus — which is the difference between a coding
+            // fault and a framing one, and the wire capture says the EOP is
+            // definitely being transmitted.
+            let saw_eop = irq_flags.check(teslamic_rp2350::pio_usb::rx::IRQ_RX_EOP as u8);
+            let saw_sop = irq_flags.check(teslamic_rp2350::pio_usb::rx::IRQ_RX_START as u8);
+
             let first_bad = (0..n.min(got)).find(|&i| back[i] != raw[i]);
             line.clear();
             let _ = write!(
@@ -324,6 +334,7 @@ async fn main(_spawner: Spawner) {
                     let _ = write!(line, "SHORT\r\n");
                 }
             }
+            let _ = write!(line, "  sop {} eop {}\r\n", saw_sop as u8, saw_eop as u8);
             emit(&mut class, &line).await;
 
             // Dump both in full (to a limit), not truncated to the expected
