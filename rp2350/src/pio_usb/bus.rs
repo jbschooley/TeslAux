@@ -414,3 +414,42 @@ pub fn try_push_symbol<'d, P: Instance, const SM: usize>(
 ) -> bool {
     sm.tx().try_push((byte as u32) << 24)
 }
+
+/// Expand a symbol stream into words ready for [`dma_symbols`].
+///
+/// Each symbol byte becomes one word in the top octet, because the transmitter
+/// autopulls at a threshold of 8 with a left-shifting OSR — see
+/// [`try_push_symbol`] for why both of those matter. Returns the number of
+/// words written, or `None` if `out` is too small.
+pub fn expand_symbols(syms: &[u8], out: &mut [u32]) -> Option<usize> {
+    if out.len() < syms.len() {
+        return None;
+    }
+    for (w, &b) in out.iter_mut().zip(syms) {
+        *w = (b as u32) << 24;
+    }
+    Some(syms.len())
+}
+
+/// Hand a whole packet to the transmitter by DMA.
+///
+/// **A packet must be fed by DMA, not by the CPU.** The transmitter consumes
+/// four symbols every 333 ns and cannot be made to wait: if the FIFO runs dry
+/// mid-packet the state machine stalls at whichever `out pc, 2` it reached and
+/// holds that instruction's side-set, so the bus sits in J or K until the CPU
+/// catches up. The receiver sees the fragment before the stall as a complete
+/// start of packet, triggers on it, and never resynchronises.
+///
+/// That is not hypothetical. Feeding byte-at-a-time from a loop that shares a
+/// core with `usb.run()` put a three-bit burst on the wire, then 1.5 µs of
+/// idle, then the real packet — one USB interrupt landing between two pushes.
+/// The reference uses DMA for this reason (`DMA_SIZE_8` in
+/// `configure_tx_channel`), and the reason is worth stating rather than
+/// inheriting.
+pub fn dma_symbols<'a, 'd, P: Instance, const SM: usize, C: embassy_rp::dma::Channel>(
+    sm: &'a mut StateMachine<'d, P, SM>,
+    ch: embassy_rp::Peri<'a, C>,
+    words: &'a [u32],
+) -> embassy_rp::dma::Transfer<'a, C> {
+    sm.tx().dma_push(ch, words, false)
+}

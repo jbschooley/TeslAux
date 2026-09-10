@@ -246,11 +246,14 @@ async fn main(_spawner: Spawner) {
         let mut raw = [0u8; 64];
         let n = packet::build_data(packet::Pid::Data0, PAYLOAD, &mut raw).unwrap();
         let mut syms = [0u8; 256];
+        let mut sym_words = [0u32; 256];
         let sym_bytes = {
             let mut buf = codec::SymbolBuf::new(&mut syms);
             codec::encode(&raw[..n], &mut buf).unwrap();
             buf.bytes()
         };
+
+        bus::expand_symbols(&syms[..sym_bytes], &mut sym_words).unwrap();
 
         line.clear();
         let _ = write!(
@@ -291,16 +294,9 @@ async fn main(_spawner: Spawner) {
         // a full FIFO is fine here — the DMA is running independently.
         let mut decoded = [0u8; 64];
         let mut got = 0usize;
-        for &byte in &syms[..sym_bytes] {
-            while !bus::try_push_symbol(&mut tx_sm, byte) {
-                while let Some(w) = dec_sm.rx().try_pull() {
-                    if got < decoded.len() {
-                        decoded[got] = (w >> 24) as u8;
-                    }
-                    got += 1;
-                }
-            }
-        }
+        // DMA, so no interrupt can starve the transmitter mid-packet.
+        let feed = bus::dma_symbols(&mut tx_sm, p.DMA_CH1, &sym_words[..sym_bytes]);
+        feed.await;
         // Let the tail of the packet and the EOP land.
         let drain_until = embassy_time::Instant::now() + embassy_time::Duration::from_micros(500);
         while embassy_time::Instant::now() < drain_until {

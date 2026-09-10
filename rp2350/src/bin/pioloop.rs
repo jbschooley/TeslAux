@@ -243,8 +243,13 @@ async fn main(_spawner: Spawner) {
         sm2.set_enable(true);
         sm0.set_enable(true);
 
+        // One channel, reborrowed per case: the transfer borrows it for its
+        // lifetime and each case needs it again.
+        let mut dma = p.DMA_CH0;
+
         let mut raw = [0u8; RAW_BYTES];
         let mut syms = [0u8; SYM_BYTES];
+        let mut sym_words = [0u32; SYM_BYTES];
         let mut back = [0u8; RAW_BYTES];
 
         for (idx, payload) in CASES.iter().enumerate() {
@@ -266,13 +271,19 @@ async fn main(_spawner: Spawner) {
             // pins that are still inputs and the bus never moves.
             bus::tx_start(&mut sm0, &programs.tx, programs.order);
 
+            bus::expand_symbols(&syms[..sym_bytes], &mut sym_words).unwrap();
+
             let mut got = 0usize;
-            let mut fed = 0usize;
-            let deadline = embassy_time::Instant::now() + embassy_time::Duration::from_millis(50);
+            // The whole packet goes out by DMA. Feeding it from this loop
+            // starves the transmitter the moment a USB interrupt lands between
+            // two pushes, which puts a fragment on the wire, then a gap, then
+            // the rest — and the receiver treats the fragment as a packet.
+            let feed = bus::dma_symbols(&mut sm0, dma.reborrow(), &sym_words[..sym_bytes]);
+            feed.await;
+
+            // Now drain what the receiver made of it.
+            let deadline = embassy_time::Instant::now() + embassy_time::Duration::from_millis(5);
             while embassy_time::Instant::now() < deadline {
-                if fed < sym_bytes && bus::try_push_symbol(&mut sm0, syms[fed]) {
-                    fed += 1;
-                }
                 while let Some(w) = sm2.rx().try_pull() {
                     if got < back.len() {
                         // A right-shifting ISR with an 8-bit threshold leaves
@@ -281,7 +292,7 @@ async fn main(_spawner: Spawner) {
                     }
                     got += 1;
                 }
-                if fed >= sym_bytes && got >= n {
+                if got >= n {
                     break;
                 }
             }
