@@ -171,6 +171,9 @@ async fn main(_spawner: Spawner) {
         let Pio {
             common: mut tx_common,
             sm0: mut tx_sm,
+            sm1: mut edge_sm,
+            sm2: mut dec_sm,
+            irq_flags,
             ..
         } = Pio::new(p.PIO0, Irqs);
 
@@ -178,8 +181,19 @@ async fn main(_spawner: Spawner) {
         let mut dm = tx_common.make_pio_pin(p.PIN_12);
         bus::configure_pins(&mut dp, &mut dm);
         let order = tx::PinOrder::DmBelowDp;
-        let tx_prg = tx_common.load_program(&tx::program(order));
-        bus::init_tx(&mut tx_sm, &tx_prg, &dp, &dm);
+        let programs = bus::load(&mut tx_common, order);
+        let tx_prg = &programs.tx;
+        bus::init_tx(&mut tx_sm, tx_prg, &dp, &dm);
+        // The receiver runs too, so one packet yields both the wire and what
+        // the decoder made of it. Aligning those is the only way left to find
+        // where decoding diverges: the wire is known good, the framing flags
+        // say the packet is delimited correctly, and the decoder still emits
+        // more bits than there are bit times to carry them.
+        bus::init_edge_detector(&mut edge_sm, &programs.edge, &dp, &dm);
+        bus::init_decoder(&mut dec_sm, &programs.decoder, &dp);
+        bus::prepare_decoder(&mut dec_sm, &programs.decoder);
+        bus::restart_edge_detector(&mut edge_sm, &programs.edge);
+        bus::clear_rx_irqs(&irq_flags);
         tx_sm.set_enable(true);
 
         // --- sampler on PIO2 ---
@@ -271,12 +285,31 @@ async fn main(_spawner: Spawner) {
         cap_sm.set_enable(true);
         let transfer = cap_sm.rx().dma_pull(p.DMA_CH0, &mut capture, false);
 
-        bus::tx_start(&mut tx_sm, &tx_prg, order);
+        bus::tx_start(&mut tx_sm, tx_prg, order);
 
         // Feed the whole packet without stopping to check anything. Blocking on
         // a full FIFO is fine here — the DMA is running independently.
+        let mut decoded = [0u8; 64];
+        let mut got = 0usize;
         for &byte in &syms[..sym_bytes] {
-            while !bus::try_push_symbol(&mut tx_sm, byte) {}
+            while !bus::try_push_symbol(&mut tx_sm, byte) {
+                while let Some(w) = dec_sm.rx().try_pull() {
+                    if got < decoded.len() {
+                        decoded[got] = (w >> 24) as u8;
+                    }
+                    got += 1;
+                }
+            }
+        }
+        // Let the tail of the packet and the EOP land.
+        let drain_until = embassy_time::Instant::now() + embassy_time::Duration::from_micros(500);
+        while embassy_time::Instant::now() < drain_until {
+            while let Some(w) = dec_sm.rx().try_pull() {
+                if got < decoded.len() {
+                    decoded[got] = (w >> 24) as u8;
+                }
+                got += 1;
+            }
         }
 
         // 256 words at 6 MHz is ~42 us; a timeout only matters if the sampler
@@ -287,16 +320,29 @@ async fn main(_spawner: Spawner) {
                 .is_ok();
         cap_sm.set_enable(false);
 
-        let got = CAPTURE_WORDS;
         line.clear();
         let _ = write!(
             line,
-            "captured {got} words{} (oldest sample in low bits)\r\nidle J is whichever value dominates\r\n",
+            "captured {CAPTURE_WORDS} words{} (oldest sample in low bits)\r\nidle J is whichever value dominates\r\n",
             if filled { "" } else { " (TIMED OUT - sampler never ran)" }
         );
         emit(&mut class, &line).await;
 
-        for chunk in capture[..got].chunks(8) {
+        line.clear();
+        let _ = write!(
+            line,
+            "decoded {}B  sop {} eop {}\r\n  ",
+            got,
+            irq_flags.check(teslamic_rp2350::pio_usb::rx::IRQ_RX_START as u8) as u8,
+            irq_flags.check(teslamic_rp2350::pio_usb::rx::IRQ_RX_EOP as u8) as u8
+        );
+        for b in decoded.iter().take(got.min(24)) {
+            let _ = write!(line, "{b:02x} ");
+        }
+        let _ = write!(line, "\r\n");
+        emit(&mut class, &line).await;
+
+        for chunk in capture[..CAPTURE_WORDS].chunks(8) {
             line.clear();
             for w in chunk {
                 let _ = write!(line, "{w:08x} ");
