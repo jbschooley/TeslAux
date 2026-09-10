@@ -232,6 +232,9 @@ async fn main(_spawner: Spawner) {
 
             bus::clear_eop_irq(&irq_flags);
             back.fill(0);
+            // Enable the line drivers. Without this the symbols clock out onto
+            // pins that are still inputs and the bus never moves.
+            bus::tx_start(&mut sm0, &programs.tx);
 
             let mut got = 0usize;
             let mut fed = 0usize;
@@ -265,6 +268,16 @@ async fn main(_spawner: Spawner) {
                 }
             }
 
+            // A static bus has a signature. With no transitions the decoder
+            // reads six bits as "unchanged" (a 1), then the stuff counter trips
+            // and flips its state reference, so the seventh reads as a 0 — a
+            // repeating seven-bit pattern, identical whatever was "sent". It is
+            // worth naming, because it looks like data and it is what a
+            // transmitter that never enabled its line drivers produces.
+            const STATIC_BUS: [u8; 7] = [0x7e, 0xbf, 0xdf, 0xef, 0xf7, 0xfb, 0xfd];
+            let bus_static =
+                got > 8 && back[..got.min(back.len())].iter().all(|b| STATIC_BUS.contains(b));
+
             let first_bad = (0..n.min(got)).find(|&i| back[i] != raw[i]);
             line.clear();
             let _ = write!(
@@ -279,6 +292,9 @@ async fn main(_spawner: Spawner) {
             match (got, first_bad) {
                 (0, _) => {
                     let _ = write!(line, "SILENT\r\n");
+                }
+                _ if bus_static => {
+                    let _ = write!(line, "BUS STATIC (transmitter never drove)\r\n");
                 }
                 (_, Some(i)) => {
                     let _ = write!(line, "MISMATCH at {i}\r\n");

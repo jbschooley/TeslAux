@@ -114,7 +114,11 @@ pub fn init_tx<'d, P: Instance, const SM: usize>(
     cfg.fifo_join = FifoJoin::TxOnly;
     cfg.clock_divider = TX_DIV.to_fixed();
     sm.set_config(&cfg);
-    sm.set_pin_dirs(Direction::Out, &[dp, dm]);
+    // Deliberately no `set_pin_dirs` here. The program owns the direction of
+    // these pins — [`tx_start`] drives them and [`tx_release`] hands them back —
+    // because D+/D- are a shared bus, and the edge detector configures the same
+    // two pins as inputs a moment later. Setting a direction here would either
+    // be immediately overridden or fight the receiver.
 }
 
 /// Configure the edge detector's state machine.
@@ -229,4 +233,52 @@ pub fn preload_decoder_osr<'d, P: Instance, const SM: usize>(sm: &mut StateMachi
 /// to clear it by hand or the detector receives exactly one packet and stops.
 pub fn clear_eop_irq<P: Instance>(flags: &embassy_rp::pio::IrqFlags<'_, P>) {
     flags.clear(super::rx::IRQ_RX_EOP as usize);
+}
+
+/// Side-set field for an idle-J bus, positioned for a two-bit side-set.
+///
+/// The RP2040/RP2350 side-set field occupies the top bits of the delay/side-set
+/// field, so a 2-bit value is shifted by `13 - 2`. This mirrors the SDK's
+/// `pio_encode_sideset(2, FJ_LK)` with `FJ_LK = 0b01` for a D+/D- pin order.
+const SIDESET_J: u16 = 0b01 << 11;
+
+/// Offset of `start:` in the TX program — the `set pindirs, 0b11` that turns
+/// the line drivers on. Not reachable through the symbol stream, whose values
+/// only address 0..=3, so it can only be entered by injecting a jump.
+const TX_START_OFFSET: u16 = 4;
+
+/// Offset of the `set pindirs, 0b00` that releases the drivers.
+const TX_RELEASE_OFFSET: u16 = 2;
+
+/// Take control of the bus, ready to transmit.
+///
+/// **Must be called before every packet.** The transmitter's symbol values
+/// address instructions 0..=3 only, so the `set pindirs, 0b11` at offset 4 is
+/// unreachable from the symbol stream — the only way in is to inject a jump,
+/// which is what the reference driver does before each transfer
+/// (`pio_usb.c:287`, called from `pio_usb_device.c:144`).
+///
+/// Skipping it does not fail loudly. The state machine happily clocks the whole
+/// packet out onto pins that are still inputs, the bus stays static, and the
+/// receiver decodes that silence into a repeating seven-bit pattern that looks
+/// like data. That is precisely how this was found.
+///
+/// The injected jump carries a side-set of J so the bus is left idle-J before
+/// the first symbol rather than wherever it happened to be.
+pub fn tx_start<'d, P: Instance, const SM: usize>(
+    sm: &mut StateMachine<'d, P, SM>,
+    prg: &LoadedProgram<'d, P>,
+) {
+    let instr = SIDESET_J | (prg.origin as u16 + TX_START_OFFSET);
+    // Injecting into a running state machine is exactly what this is for.
+    unsafe { sm.exec_instr(instr) };
+}
+
+/// Release the bus, letting the pull-ups and the host take it back.
+pub fn tx_release<'d, P: Instance, const SM: usize>(
+    sm: &mut StateMachine<'d, P, SM>,
+    prg: &LoadedProgram<'d, P>,
+) {
+    let instr = SIDESET_J | (prg.origin as u16 + TX_RELEASE_OFFSET);
+    unsafe { sm.exec_instr(instr) };
 }
