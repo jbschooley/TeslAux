@@ -27,6 +27,10 @@
 //! **Nothing here has run on hardware.** The PIO programs assemble; that is
 //! all that is currently true of them.
 
+// Hardware bring-up needs the chip HAL, so it is target-only. The codec and
+// packet layers below stay host-buildable so their tests can run.
+#[cfg(target_os = "none")]
+pub mod bus;
 pub mod codec;
 pub mod packet;
 pub mod rx;
