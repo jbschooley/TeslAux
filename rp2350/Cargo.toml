@@ -53,6 +53,11 @@ board-usb-c = ["embassy-rp/rp235xa"]
 # identical between the two.
 board-pizero = ["embassy-rp/rp235xb"]
 
+# Diagnostic: the start-of-packet handler only counts and clears the flag,
+# running no transaction. Bisects "interrupt rarely raised" against "interrupt
+# raised often but serviced slowly". See on_packet_start.
+stub-irq = []
+
 # Measures which GPIO carries the 1.5k device pull-up, so a new board's D+/D-
 # come from the hardware rather than from a schematic. See src/bin/pinscan.rs.
 [[bin]]

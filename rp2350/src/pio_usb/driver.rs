@@ -192,6 +192,23 @@ const fn waker_index(ep: u8, is_in: bool) -> usize {
 /// asked for went out during [`service`], before any of this.
 pub fn on_packet_start() {
     stats::bump(&stats::IRQ_ENTRIES);
+
+    // Bisection probe. When enabled the handler does nothing but acknowledge
+    // the start-of-packet flag and return, running no transaction and no reset.
+    // If the entry count then climbs toward a thousand a second, the interrupt
+    // was being raised all along and the transaction path was the bottleneck.
+    // If it stays where it is, the flag is genuinely being raised that rarely,
+    // and the fault is upstream of the handler entirely. One flash answers
+    // which half to work on.
+    #[cfg(feature = "stub-irq")]
+    {
+        embassy_rp::pac::PIO0
+            .irq()
+            .write(|w| w.set_irq(1 << super::rx::IRQ_RX_START));
+        return;
+    }
+
+    #[allow(unreachable_code)]
     let woken = critical_section::with(|cs| {
         let mut guard = STATE.borrow_ref_mut(cs);
         let Some(inner) = guard.as_mut() else {
