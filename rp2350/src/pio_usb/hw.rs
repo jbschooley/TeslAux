@@ -141,6 +141,8 @@ impl Port for HwPort {
         self.pio.irq().read().irq() & (1 << IRQ_RX_EOP) != 0
     }
 
+
+
     fn transmit(&mut self, symbols: &[u32]) {
         self.take_bus();
         self.fire(symbols);
@@ -151,6 +153,24 @@ impl Port for HwPort {
     }
 
     fn reset_receiver(&mut self) {
+        HwPort::do_reset(self)
+    }
+
+    fn clear_eop(&mut self) {
+        self.pio.irq().write(|w| w.set_irq(1 << IRQ_RX_EOP));
+    }
+
+}
+
+impl HwPort {
+    /// Revive the receiver after a packet: realign the decoder and put the edge
+    /// detector back to waiting for a start of packet.
+    ///
+    /// Callable from the EOP interrupt as well as the transaction path, because
+    /// the edge detector blocks on `irq wait` at every EOP and something must
+    /// clear it promptly — the bottleneck the stub handler exposed was this
+    /// running only at transaction or report-loop rate.
+    pub fn do_reset(&mut self) {
         // Mirrors `bus::prepare_decoder` and `bus::restart_edge_detector`, in
         // registers rather than embassy's typed handles: stop, clear the FIFO,
         // restart the shift counters, jump to the start, zero X, reload the

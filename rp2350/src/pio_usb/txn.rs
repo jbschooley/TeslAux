@@ -49,6 +49,14 @@ pub trait Port {
     /// transmitter drives, so without this it decodes the device's own packet
     /// and is out of step by the time the host answers.
     fn reset_receiver(&mut self);
+    /// Clear the end-of-packet marker.
+    ///
+    /// A SETUP is a token immediately followed by its DATA0. With a
+    /// non-blocking EOP the token's end-of-packet flag is still set when the
+    /// data stage begins, and the data reader would stop on it before a single
+    /// byte arrived. Clearing it between the two stages is what lets a
+    /// two-packet transaction be read as one.
+    fn clear_eop(&mut self);
 }
 
 /// How a transaction ended.
@@ -290,6 +298,9 @@ impl Engine {
             }
 
             Response::Receive { reply } => {
+                // The token has ended; its EOP flag must not be mistaken for
+                // the data stage's. See `Port::clear_eop`.
+                port.clear_eop();
                 let n = match Self::receive(port, rx_buf) {
                     Some(n) => n,
                     None => return Outcome::Timeout,
@@ -390,6 +401,7 @@ mod tests {
         fn reset_receiver(&mut self) {
             self.resets += 1;
         }
+        fn clear_eop(&mut self) {}
     }
 
     const ADDR: u8 = 7;

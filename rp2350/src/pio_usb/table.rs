@@ -480,6 +480,7 @@ mod service_tests {
             false
         }
         fn reset_receiver(&mut self) {}
+        fn clear_eop(&mut self) {}
     }
 
     fn fake(bytes: &[u8]) -> Fake {

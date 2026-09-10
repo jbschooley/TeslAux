@@ -60,7 +60,15 @@ pub const BIT_REPEAT_COUNT: u8 = 6;
 pub fn edge_detector() -> Program<32> {
     pio::pio_asm!(
         "eop:",
-        "    irq wait 2",              // IRQ_RX_EOP
+        // Non-blocking. The reference uses `irq wait` here because its host
+        // loop acknowledges each EOP in a tight poll; our device is
+        // interrupt-driven and a blocking wait stalls the detector at the end
+        // of every packet. That is invisible for a single-packet transfer like
+        // a start-of-frame, but a SETUP is a token immediately followed by its
+        // DATA0, and a detector frozen on the token's EOP never sees the data —
+        // so enumeration could never begin. Signalling without waiting lets the
+        // detector fall straight through to `start` and catch the next packet.
+        "    irq 2",                   // IRQ_RX_EOP, non-blocking
         "start:",
         "    jmp pin start",           // wait for the falling edge
         "    irq 3 [1]",               // IRQ_RX_START
