@@ -40,8 +40,12 @@ use embassy_executor::Spawner;
 use embassy_futures::join::join4;
 use embassy_rp::bind_interrupts;
 use embassy_rp::interrupt::typelevel::{Handler, Interrupt};
-use embassy_rp::peripherals::{PIO0, PIO1, USB};
-use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
+use embassy_rp::peripherals::{PIO0, PIO1, PIO2, USB};
+use embassy_rp::pio::{
+    Config as PioConfig, FifoJoin, InterruptHandler as PioInterruptHandler, Pio, ShiftConfig,
+    ShiftDirection,
+};
+use fixed::traits::ToFixed;
 use embassy_rp::usb::{Driver as UsbDriver, InterruptHandler as UsbInterruptHandler};
 use embassy_time::Timer;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
@@ -94,6 +98,7 @@ bind_interrupts!(struct Irqs {
     // deaf while looking perfectly healthy.
     PIO0_IRQ_1 => StartOfPacket;
     PIO1_IRQ_0 => PioInterruptHandler<PIO1>;
+    PIO2_IRQ_0 => PioInterruptHandler<PIO2>;
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
 });
 
@@ -215,6 +220,34 @@ async fn main(_spawner: Spawner) {
         order,
     );
 
+    // --- a logic analyser on the spare block ---
+    //
+    // The counters can say a packet was missed but not why, and guessing has
+    // cost two rounds already. This samples both lines at 96 MHz so the host's
+    // own signalling can be read directly.
+    let Pio {
+        common: mut cap_common,
+        sm0: mut cap_sm,
+        ..
+    } = Pio::new(p.PIO2, Irqs);
+    let cap_prg = cap_common
+        .load_program(&pio::pio_asm!(".wrap_target", "    in pins, 2", ".wrap").program);
+    let mut cap_cfg = PioConfig::default();
+    cap_cfg.use_program(&cap_prg, &[]);
+    cap_cfg.shift_in = ShiftConfig {
+        auto_fill: true,
+        threshold: 32,
+        direction: ShiftDirection::Right,
+    };
+    cap_cfg.fifo_join = FifoJoin::RxOnly;
+    cap_cfg.clock_divider = 1u8.to_fixed();
+    cap_sm.set_config(&cap_cfg);
+    embassy_rp::pac::PIO2
+        .sm(0)
+        .pinctrl()
+        .modify(|w| w.set_in_base(dm.pin()));
+    let mut cap_dma = p.DMA_CH0;
+
     // --- the device the host will see ---
     let pio_driver = PioUsb::new(port);
     let mut dev_config = embassy_usb::Config::new(0x1209, 0x0001);
@@ -290,6 +323,53 @@ async fn main(_spawner: Spawner) {
         line.clear();
         let _ = write!(line, "start-of-packet interrupt armed\r\n");
         emit(&mut log_class, &line).await;
+
+        // Capture the first thing the host does, before settling into the
+        // counter loop. Retried until it lands on activity: the host resets in
+        // bursts, and a fixed window mostly catches idle.
+        const CAP: usize = 4096; // ~680 us at 96 MHz
+        let mut capture = [0u32; CAP];
+        let mut caught = false;
+        for _ in 0..600 {
+            cap_sm.set_enable(true);
+            let t = cap_sm
+                .rx()
+                .dma_pull(cap_dma.reborrow(), &mut capture, false);
+            let _ =
+                embassy_time::with_timeout(embassy_time::Duration::from_millis(50), t).await;
+            cap_sm.set_enable(false);
+            let idle = capture[0];
+            if capture.iter().any(|w| *w != idle) {
+                caught = true;
+                break;
+            }
+            Timer::after_millis(5).await;
+        }
+
+        line.clear();
+        if caught {
+            let idle = capture[0];
+            let first = capture.iter().position(|w| *w != idle).unwrap_or(0);
+            let from = first.saturating_sub(2);
+            let to = (from + 96).min(CAP);
+            let _ = write!(
+                line,
+                "\r\nwire w{from}..w{to} of {CAP} (idle {idle:08x})\r\n"
+            );
+            emit(&mut log_class, &line).await;
+            for chunk in capture[from..to].chunks(8) {
+                line.clear();
+                let _ = write!(line, "  ");
+                for w in chunk {
+                    let _ = write!(line, "{w:08x} ");
+                }
+                let _ = write!(line, "\r\n");
+                emit(&mut log_class, &line).await;
+            }
+        } else {
+            let _ = write!(line, "\r\nwire: nothing but idle in 600 windows\r\n");
+            emit(&mut log_class, &line).await;
+        }
 
         let mut last = (u32::MAX, 0, 0, 0, 0, 0);
         let mut last_quiet = false;
