@@ -444,7 +444,7 @@ async fn main(_spawner: Spawner) {
                 line.clear();
                 let _ = write!(
                     line,
-                    "{:6} {:6} {:6} {:6} {:5} {:5} {:5}  {:4}/s {:4}s  bus {seen:04b} {}\r\n",
+                    "{:6} {:6} {:6} {:6} {:5} {:5} {:6} {:5} {:5}  bus {seen:04b} {}\r\n",
                     now.0,
                     now.1,
                     now.2,
@@ -484,32 +484,12 @@ async fn main(_spawner: Spawner) {
         }
     };
 
-    // Keep the receiver armed, continuously.
-    //
-    // The edge detector ends every packet on an `irq wait` and stops until the
-    // flag is acknowledged. `Engine::handle` does that at the end of each
-    // transaction — but only for a packet it actually handled, and if the
-    // detector is stopped there is no interrupt, so no transaction, so nothing
-    // to release it. The only other caller was the reporter, once per pass,
-    // which is why the counters showed about one packet per housekeeping cycle
-    // instead of the thousand a second a host actually sends.
-    //
-    // Doing it in its own task is a probe, not the answer: if the rate jumps,
-    // the per-packet reset is losing the race and belongs in Bus::poll or the
-    // interrupt itself rather than being papered over by polling.
-    let keep_armed = async {
-        loop {
-            driver::service_bus();
-            embassy_futures::yield_now().await;
-        }
-    };
-
-    embassy_futures::join::join5(
-        log_usb.run(),
-        device.run(),
-        report,
-        heartbeat,
-        keep_armed,
-    )
-    .await;
+    // The receiver is released by `Engine::handle` after each transaction and
+    // by the reporter between passes. An earlier version spun on
+    // `service_bus()` in its own task to test whether a stuck EOP explained the
+    // missing packets. It did not — the rate did not move — and spinning made
+    // it worse, because each call takes a critical section and so suppresses
+    // the interrupt it was meant to unblock. Measuring a thing must not consume
+    // it, which is the second time that has caught me here.
+    embassy_futures::join::join4(log_usb.run(), device.run(), report, heartbeat).await;
 }
