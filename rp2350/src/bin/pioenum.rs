@@ -207,9 +207,11 @@ async fn main(_spawner: Spawner) {
         0,
         0,
         2,
+        1,
         1, // DMA channel 1
         programs.tx.origin as u16,
         programs.decoder.origin as u16,
+        programs.edge.origin as u16,
         order,
     );
 
@@ -314,13 +316,23 @@ async fn main(_spawner: Spawner) {
             // sampling every 200 µs almost never lands on one — the previous
             // version could see a ten-millisecond reset and nothing else, and
             // reported a bus that was in fact busy as STATIC.
+            // Short bursts with a yield between. A start of frame is about a
+            // microsecond arriving once a millisecond, so the burst has to be
+            // long enough to land on one — but a single 24,000-iteration loop
+            // held the executor for tens of milliseconds at a time and stopped
+            // the heartbeat, which is the one signal that says the executor is
+            // alive at all. Do not starve the liveness indicator to measure
+            // liveness.
             let mut seen = 0u8;
-            for _ in 0..24_000 {
-                let (_, dp_status) = bus::pin_registers(13);
-                let (_, dm_status) = bus::pin_registers(12);
-                let dp = ((dp_status >> 17) & 1) as u8;
-                let dm = ((dm_status >> 17) & 1) as u8;
-                seen |= 1 << (dp * 2 + dm);
+            for _ in 0..8 {
+                for _ in 0..2_000 {
+                    let (_, dp_status) = bus::pin_registers(13);
+                    let (_, dm_status) = bus::pin_registers(12);
+                    let dp = ((dp_status >> 17) & 1) as u8;
+                    let dm = ((dm_status >> 17) & 1) as u8;
+                    seen |= 1 << (dp * 2 + dm);
+                }
+                embassy_futures::yield_now().await;
             }
             // Which bus states appeared: bit 1 = SE0, bit 2 = K, bit 4 = J.
             let quiet = seen.count_ones() == 1;

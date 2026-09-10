@@ -22,6 +22,10 @@
 use embassy_rp::pac;
 
 use super::rx::{IRQ_RX_EOP, MOV_OSR_NOT_NULL, SET_X_ZERO};
+
+/// Offset of `start:` in the edge detector: instruction 0 is the `irq wait`
+/// that ends a packet, so waiting for the next one begins at 1.
+const EDGE_START_OFFSET: u16 = 1;
 use super::tx::PinOrder;
 use super::txn::Port;
 
@@ -34,6 +38,9 @@ pub struct HwPort {
     pio_no: u8,
     tx_sm: usize,
     rx_sm: usize,
+    /// The edge detector's state machine. Restarting the decoder alone is not
+    /// enough — see [`HwPort::reset_receiver`].
+    edge_sm: usize,
     /// DMA channel used to send packets.
     dma: usize,
     /// Instruction offset the transmitter was loaded at. Zero in practice —
@@ -41,6 +48,9 @@ pub struct HwPort {
     tx_origin: u16,
     /// Instruction offset the NRZI decoder was loaded at, for resetting it.
     dec_origin: u16,
+    /// Instruction offset the edge detector was loaded at. Its `start:` is one
+    /// past this — instruction 0 is the `irq wait` that ends a packet.
+    edge_origin: u16,
     order: PinOrder,
 }
 
@@ -53,9 +63,11 @@ impl HwPort {
         pio_no: u8,
         tx_sm: usize,
         rx_sm: usize,
+        edge_sm: usize,
         dma: usize,
         tx_origin: u16,
         dec_origin: u16,
+        edge_origin: u16,
         order: PinOrder,
     ) -> Self {
         Self {
@@ -63,9 +75,11 @@ impl HwPort {
             pio_no,
             tx_sm,
             rx_sm,
+            edge_sm,
             dma,
             tx_origin,
             dec_origin,
+            edge_origin,
             order,
         }
     }
@@ -160,8 +174,28 @@ impl Port for HwPort {
         self.pio
             .ctrl()
             .modify(|w| w.set_sm_enable(w.sm_enable() | ctrl_bit));
-        // The edge detector blocks at its `irq wait` after an EOP; clearing the
-        // flags is what releases it to look for the next start of packet.
+
+        // And the edge detector, which clearing the flag alone does not put
+        // right. Releasing it from `irq wait` resumes it wherever it happened
+        // to be; what is wanted is `start:`, waiting for the next start of
+        // packet. Without this the port answers one packet and then goes quiet
+        // until something outside re-arms it — which reads on a counter as a
+        // host that has stopped talking.
+        let edge_bit = 1u8 << self.edge_sm;
+        self.pio
+            .ctrl()
+            .modify(|w| w.set_sm_enable(w.sm_enable() & !edge_bit));
+        self.pio.ctrl().modify(|w| w.set_sm_restart(edge_bit));
+        self.pio
+            .sm(self.edge_sm)
+            .instr()
+            .write(|w| w.set_instr(self.edge_origin + EDGE_START_OFFSET));
+        self.pio
+            .ctrl()
+            .modify(|w| w.set_sm_enable(w.sm_enable() | edge_bit));
+
+        // Clear every receive flag last, so nothing left over from the packet
+        // just ended triggers the freshly restarted machines.
         self.pio.irq().write(|w| w.set_irq(0xf << 1));
     }
 }
