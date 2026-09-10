@@ -55,6 +55,7 @@ pub mod endpoint;
 pub mod packet;
 pub mod rx;
 pub mod tx;
+pub mod txn;
 
 /// System clock this port requires, in Hz.
 ///
