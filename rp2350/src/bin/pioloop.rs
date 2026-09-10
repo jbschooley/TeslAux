@@ -278,11 +278,16 @@ async fn main(_spawner: Spawner) {
             // starves the transmitter the moment a USB interrupt lands between
             // two pushes, which puts a fragment on the wire, then a gap, then
             // the rest — and the receiver treats the fragment as a packet.
+            //
+            // The transfer is armed when it is constructed, so it proceeds in
+            // hardware while this loop runs. That matters: the decoder's RX
+            // FIFO is eight words deep, so with nothing draining it during
+            // transmission everything after the ninth byte is dropped — eight
+            // in the FIFO plus one in the ISR. Awaiting the DMA before reading
+            // truncates every packet longer than that, whatever the wire said.
             let feed = bus::dma_symbols(&mut sm0, dma.reborrow(), &sym_words[..sym_bytes]);
-            feed.await;
 
-            // Now drain what the receiver made of it.
-            let deadline = embassy_time::Instant::now() + embassy_time::Duration::from_millis(5);
+            let deadline = embassy_time::Instant::now() + embassy_time::Duration::from_millis(20);
             while embassy_time::Instant::now() < deadline {
                 while let Some(w) = sm2.rx().try_pull() {
                     if got < back.len() {
@@ -296,6 +301,7 @@ async fn main(_spawner: Spawner) {
                     break;
                 }
             }
+            feed.await;
 
             // A static bus has a signature. With no transitions the decoder
             // reads six bits as "unchanged" (a 1), then the stuff counter trips
