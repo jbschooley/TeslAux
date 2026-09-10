@@ -246,7 +246,12 @@ async fn main(_spawner: Spawner) {
     embassy_rp::pac::PIO2
         .sm(0)
         .pinctrl()
-        .modify(|w| w.set_in_base(dm.pin()));
+        // The base is the *lower* pin: `in pins, 2` reads upward from it, so
+        // bit 0 is always the lower-numbered line and bit 1 the higher. Using
+        // D- unconditionally worked only because it happened to be lower on the
+        // RP2350-USB-C; on the PiZero D+ is gp28 and D- gp29, so that sampled
+        // gp29 and gp30 — one real line and one unrelated pin.
+        .modify(|w| w.set_in_base(board::DP_PIN.min(board::DM_PIN)));
     let mut cap_dma = p.DMA_CH0;
 
     // --- the device the host will see ---
@@ -376,7 +381,9 @@ async fn main(_spawner: Spawner) {
                     line.clear();
                     let _ = write!(
                         line,
-                        "\r\nwire w{from}..w{to} of {CAP} (idle {idle:08x})\r\n"
+                        "\r\nwire w{from}..w{to} of {CAP} (idle {idle:08x})\r\n  sample bit0=gp{} bit1=gp{}, inverted (both bits set = SE0)\r\n",
+                        board::DP_PIN.min(board::DM_PIN),
+                        board::DP_PIN.max(board::DM_PIN),
                     );
                     emit(&mut log_class, &line).await;
                     for chunk in capture[from..to].chunks(8) {

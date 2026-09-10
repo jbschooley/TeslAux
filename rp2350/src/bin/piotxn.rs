@@ -277,7 +277,12 @@ async fn main(_spawner: Spawner) {
         embassy_rp::pac::PIO2
             .sm(0)
             .pinctrl()
-            .modify(|w| w.set_in_base(dm.pin()));
+            // The base is the *lower* pin: `in pins, 2` reads upward from it, so
+        // bit 0 is always the lower-numbered line and bit 1 the higher. Using
+        // D- unconditionally worked only because it happened to be lower on the
+        // RP2350-USB-C; on the PiZero D+ is gp28 and D- gp29, so that sampled
+        // gp29 and gp30 — one real line and one unrelated pin.
+        .modify(|w| w.set_in_base(board::DP_PIN.min(board::DM_PIN)));
 
         // The engine talks to the hardware through this, not through embassy's
         // typed handles — it is the module a host test cannot reach, which is
