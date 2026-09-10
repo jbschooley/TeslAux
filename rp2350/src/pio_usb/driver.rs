@@ -118,6 +118,16 @@ pub mod stats {
     /// retrying the same request.
     pub static IGNORED_PIDS: AtomicU32 = AtomicU32::new(0);
 
+    /// The four bytes of the last packet that failed its checks, packed big
+    /// end first, with the top bit of a separate flag word set once valid.
+    ///
+    /// What they are is the whole question. `80 2d ..` is a SETUP token we
+    /// mangled — a decode fault. `80 c3 ..` is a DATA packet, which means the
+    /// receiver joined a transaction late and read the data stage as though it
+    /// were the start of a packet, and the token before it was missed entirely.
+    pub static LAST_BAD: AtomicU32 = AtomicU32::new(0);
+    pub static LAST_BAD_SEEN: AtomicU32 = AtomicU32::new(0);
+
     pub(super) fn bump(c: &AtomicU32) {
         c.fetch_add(1, Ordering::Relaxed);
     }
@@ -215,7 +225,16 @@ pub fn on_packet_start() {
                 stats::bump(&stats::SOF);
                 None
             }
-            Outcome::BadToken | Outcome::Corrupt => {
+            Outcome::BadToken { bytes } => {
+                stats::bump(&stats::BAD);
+                stats::LAST_BAD.store(
+                    u32::from_be_bytes(bytes),
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+                stats::LAST_BAD_SEEN.store(1, core::sync::atomic::Ordering::Relaxed);
+                None
+            }
+            Outcome::Corrupt => {
                 stats::bump(&stats::BAD);
                 None
             }

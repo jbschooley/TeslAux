@@ -88,7 +88,13 @@ pub enum Outcome {
     /// The token did not survive its own checks — bad SYNC, bad PID check
     /// nibble, or a failed CRC5. Answering it would mean replying on another
     /// device's behalf.
-    BadToken,
+    ///
+    /// Carries the four bytes read, because what they are matters. A mangled
+    /// token and a *data* packet mistaken for one look identical in a counter
+    /// and mean completely different things: the first is a decode fault, the
+    /// second means the receiver joined a transaction late and is reading the
+    /// data stage as if it were the start of a packet.
+    BadToken { bytes: [u8; 4] },
     /// The bus went quiet mid-packet.
     Timeout,
 }
@@ -191,16 +197,17 @@ impl Engine {
         let Some(sync) = Self::byte(port) else {
             return Outcome::Timeout;
         };
-        if sync != SYNC {
-            return Outcome::BadToken;
-        }
         let (Some(pid_byte), Some(b0), Some(b1)) =
             (Self::byte(port), Self::byte(port), Self::byte(port))
         else {
             return Outcome::Timeout;
         };
+        let seen = [sync, pid_byte, b0, b1];
+        if sync != SYNC {
+            return Outcome::BadToken { bytes: seen };
+        }
         let Some(pid) = Pid::from_byte(pid_byte) else {
-            return Outcome::BadToken;
+            return Outcome::BadToken { bytes: seen };
         };
 
         if pid == Pid::Sof {
@@ -209,12 +216,12 @@ impl Engine {
                     self.frame = frame;
                     Outcome::Sof(frame)
                 }
-                None => Outcome::BadToken,
+                None => Outcome::BadToken { bytes: seen },
             };
         }
 
         let Some(token) = decode_token(pid, b0, b1) else {
-            return Outcome::BadToken;
+            return Outcome::BadToken { bytes: seen };
         };
 
         // --- decide ---
@@ -440,10 +447,10 @@ mod tests {
         bytes[0] = 0x81;
         let mut port = Fake::new(&bytes);
         let h = Handshakes::new();
-        assert_eq!(
+        assert!(matches!(
             engine().handle(&mut port, &h, one(EpType::Bulk, true), no_packet, &mut [0u8; 8]),
-            Outcome::BadToken
-        );
+            Outcome::BadToken { .. }
+        ));
         assert!(port.sent.is_empty());
     }
 
@@ -455,10 +462,10 @@ mod tests {
         bytes[2] ^= 0x01;
         let mut port = Fake::new(&bytes);
         let h = Handshakes::new();
-        assert_eq!(
+        assert!(matches!(
             engine().handle(&mut port, &h, one(EpType::Bulk, true), no_packet, &mut [0u8; 8]),
-            Outcome::BadToken
-        );
+            Outcome::BadToken { .. }
+        ));
         assert!(port.sent.is_empty(), "silence, not a NAK");
     }
 
@@ -772,7 +779,7 @@ mod tests {
         let mut port = Fake::new(&[SYNC, Pid::Sof.to_byte(), 0, 0]);
         let h = Handshakes::new();
         let out = engine().handle(&mut port, &h, one(EpType::Bulk, true), no_packet, &mut [0u8; 8]);
-        assert!(matches!(out, Outcome::Sof(_) | Outcome::BadToken));
+        assert!(matches!(out, Outcome::Sof(_) | Outcome::BadToken { .. }));
         assert!(port.sent.is_empty());
     }
 }
