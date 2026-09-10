@@ -289,7 +289,7 @@ async fn main(_spawner: Spawner) {
         let _ = write!(line, "start-of-packet interrupt armed\r\n");
         emit(&mut log_class, &line).await;
 
-        let mut last = (u32::MAX, 0, 0, 0, 0);
+        let mut last = (u32::MAX, 0, 0, 0, 0, 0);
         let mut last_quiet = false;
         loop {
             let now = driver::stats::read();
@@ -302,14 +302,25 @@ async fn main(_spawner: Spawner) {
             // Idle J is D+ high, D- low, unchanging. A host that has noticed us
             // drives a reset (both low) and then start-of-frame traffic every
             // millisecond, so *any* movement here means it is talking.
+            // Release the receiver if a bus reset has stopped it. Nothing in
+            // the packet path can do this: the detector is blocked precisely
+            // because no packet is being handled. In a finished driver this
+            // belongs in `Bus::poll`; here it runs in the reporter, which is
+            // the only thing guaranteed to keep ticking.
+            driver::service_bus();
+
+            // Sample in a tight loop rather than with awaits. A start of frame
+            // is about a microsecond and arrives once a millisecond, so
+            // sampling every 200 µs almost never lands on one — the previous
+            // version could see a ten-millisecond reset and nothing else, and
+            // reported a bus that was in fact busy as STATIC.
             let mut seen = 0u8;
-            for _ in 0..64 {
+            for _ in 0..24_000 {
                 let (_, dp_status) = bus::pin_registers(13);
                 let (_, dm_status) = bus::pin_registers(12);
                 let dp = ((dp_status >> 17) & 1) as u8;
                 let dm = ((dm_status >> 17) & 1) as u8;
                 seen |= 1 << (dp * 2 + dm);
-                Timer::after_micros(200).await;
             }
             // Which bus states appeared: bit 1 = SE0, bit 2 = K, bit 4 = J.
             let quiet = seen.count_ones() == 1;
@@ -320,12 +331,13 @@ async fn main(_spawner: Spawner) {
                 line.clear();
                 let _ = write!(
                     line,
-                    "{:6} {:6} {:6} {:6} {:5} {:5}   bus {seen:04b} {}\r\n",
+                    "{:6} {:6} {:6} {:6} {:5} {:5} {:5}   bus {seen:04b} {}\r\n",
                     now.0,
                     now.1,
                     now.2,
                     now.3,
                     now.4,
+                    now.5,
                     driver::address(),
                     if quiet { "STATIC" } else { "moving" }
                 );

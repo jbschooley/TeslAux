@@ -99,21 +99,52 @@ pub mod stats {
     pub static BAD: AtomicU32 = AtomicU32::new(0);
     /// SETUP packets received. The first one is the host asking what we are.
     pub static SETUPS: AtomicU32 = AtomicU32::new(0);
+    /// Times the receiver had to be released from a stuck EOP. A bus reset
+    /// causes one; a steady stream of them means something else is stopping it.
+    pub static REARMS: AtomicU32 = AtomicU32::new(0);
 
     pub(super) fn bump(c: &AtomicU32) {
         c.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A snapshot for printing: transactions, SOFs, answered, bad, setups.
-    pub fn read() -> (u32, u32, u32, u32, u32) {
+    /// A snapshot: transactions, SOFs, answered, bad, setups, re-arms.
+    pub fn read() -> (u32, u32, u32, u32, u32, u32) {
         (
             TRANSACTIONS.load(Ordering::Relaxed),
             SOF.load(Ordering::Relaxed),
             ANSWERED.load(Ordering::Relaxed),
             BAD.load(Ordering::Relaxed),
             SETUPS.load(Ordering::Relaxed),
+            REARMS.load(Ordering::Relaxed),
         )
     }
+}
+
+/// Re-arm the receiver if it has stopped, returning whether it had.
+///
+/// The edge detector ends a packet with `irq wait`, which sets the EOP flag and
+/// blocks until something acknowledges it. Normally that something is the end
+/// of a transaction. A **bus reset** is not a transaction: it is ten
+/// milliseconds of SE0, which the detector reads as an EOP and stops on, and
+/// nothing downstream ever runs to release it. The device goes deaf at exactly
+/// the moment the host is trying to talk to it, and stays that way.
+///
+/// So this has to be called periodically by something that is not the packet
+/// path. It is cheap — one register read when there is nothing to do.
+pub fn service_bus() -> bool {
+    critical_section::with(|cs| {
+        let mut guard = STATE.borrow_ref_mut(cs);
+        let Some(inner) = guard.as_mut() else {
+            return false;
+        };
+        use super::txn::Port as _;
+        if !inner.port.eop() {
+            return false;
+        }
+        inner.port.reset_receiver();
+        stats::bump(&stats::REARMS);
+        true
+    })
 }
 
 /// The address the device currently answers to. Zero until SET_ADDRESS lands,
