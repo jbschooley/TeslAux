@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: MIT
+[package]
+name    = "teslamic-rp2350"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Single-board TeslAux bridge on RP2350. Car on the native USB controller, phone on a PIO full-speed device port."
+
+# Bring-up only: WS2812 on GPIO16, no USB, no PIO USB. Proves the chip port
+# (thumbv8m, IMAGE_DEF, memory map) before anything is built on top of it.
+[[bin]]
+name = "ledtest"
+path = "src/bin/ledtest.rs"
+
+[dependencies]
+# `rp235xa` is the 60-pin part on the Waveshare RP2350-USB-C. embassy-rp emits
+# the secure-exe IMAGE_DEF for us; memory.x only has to place `.start_block`.
+embassy-rp       = { version = "0.9", features = ["rp235xa", "time-driver", "critical-section-impl", "unstable-pac"] }
+embassy-usb      = { version = "0.6", default-features = false }
+embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread"] }
+embassy-time     = { version = "0.5" }
+embassy-futures  = { version = "0.1" }
+embassy-sync     = { version = "0.7" }
+
+cortex-m    = { version = "0.7", features = ["inline-asm"] }
+cortex-m-rt = "0.7"
+pio         = "0.3"
+pio-proc    = "0.3"
+fixed       = "1"
+# RGB8, for the board's onboard WS2812 (GPIO16, same pin as the RP2040-Zero).
+smart-leds  = "0.4"
+
+[profile.release]
+opt-level     = "s"
+lto           = "fat"
+codegen-units = 1
+debug         = 2

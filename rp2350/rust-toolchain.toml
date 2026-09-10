@@ -1,0 +1,5 @@
+# Pinned separately from rp2040/ and t114/: sibling crates, different cores.
+# The RP2350A is a Cortex-M33 (thumbv8m.main, hard float).
+[toolchain]
+channel = "1.95.0"
+targets = ["thumbv8m.main-none-eabihf"]
