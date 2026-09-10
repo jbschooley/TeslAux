@@ -313,9 +313,9 @@ async fn main(_spawner: Spawner) {
         let mut cap_dma = p.DMA_CH0;
 
         for case in &CASES {
-            // Fresh receiver for every transaction, exactly as the loopback
-            // needs. Moving this into the IRQ_RX_START path is what makes the
-            // driver work unattended, and is deliberately still to come.
+            // The engine re-arms the receiver itself at the end of every
+            // transaction now, so this is only needed to get the *first* one
+            // started — before anything has run, nothing has armed it.
             bus::prepare_decoder(&mut sm2, &programs.decoder);
             bus::restart_edge_detector(&mut sm1, &programs.edge);
             bus::clear_rx_irqs(&irq_flags);

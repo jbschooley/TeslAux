@@ -125,7 +125,32 @@ impl Engine {
     /// `endpoint` looks up an endpoint's state by its number and direction;
     /// returning `None` means we do not have it. `rx_buf` receives the payload
     /// of an OUT or SETUP packet.
+    ///
+    /// **Leaves the receiver armed for the next packet**, whatever happened to
+    /// this one — including the paths that give up early on a bad token or a
+    /// silent bus. That is what makes this usable from an interrupt: a host
+    /// sends when it likes, and there is no other moment at which the reset
+    /// could be done. Until this, the receiver was reset by whichever code
+    /// scheduled the packet, which only worked because the tests knew when one
+    /// was coming.
     pub fn handle<'p, P: Port>(
+        &mut self,
+        port: &mut P,
+        handshakes: &Handshakes,
+        endpoint: impl Fn(u8, bool) -> Option<EpState>,
+        packet: impl Fn(u8) -> Option<&'p [u32]>,
+        rx_buf: &mut [u8],
+    ) -> Outcome {
+        let outcome = self.handle_inner(port, handshakes, endpoint, packet, rx_buf);
+        // Unconditional: a transaction that ended badly is exactly when the
+        // receiver is most likely to be mid-packet and least likely to recover
+        // on its own.
+        port.reset_receiver();
+        outcome
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_inner<'p, P: Port>(
         &mut self,
         port: &mut P,
         handshakes: &Handshakes,
@@ -458,7 +483,8 @@ mod tests {
             ),
             Outcome::Sent { acked: true }
         );
-        assert_eq!(port.resets, 1, "the receiver must be put back before waiting");
+        // One to listen for the ACK, one to re-arm for the next packet.
+        assert_eq!(port.resets, 2, "the receiver must be put back before waiting");
     }
 
     #[test]
@@ -506,7 +532,8 @@ mod tests {
             ),
             Outcome::Sent { acked: false }
         );
-        assert_eq!(port.resets, 0, "no wait means no reset");
+        // Only the re-arm at the end: isochronous never stops to listen.
+        assert_eq!(port.resets, 1, "no wait means no extra reset");
     }
 
     /// If `respond` says ready but no buffer turns up, nothing goes out. A
@@ -645,6 +672,44 @@ mod tests {
             e.handle(&mut port, &h, one(EpType::Control, false), no_packet, &mut [0u8; 8]),
             Outcome::Ignored
         );
+    }
+
+    /// The receiver has to be armed again however the transaction ended. A
+    /// transaction that failed is exactly when the receiver is most likely to
+    /// be mid-packet, and there is no later moment to do it — a host sends when
+    /// it likes.
+    #[test]
+    fn every_ending_leaves_the_receiver_armed() {
+        let h = Handshakes::new();
+
+        // Bad sync.
+        let mut bytes = token_bytes(Pid::In, ADDR, 1);
+        bytes[0] = 0x81;
+        let mut port = Fake::new(&bytes);
+        engine().handle(&mut port, &h, one(EpType::Bulk, true), no_packet, &mut [0u8; 8]);
+        assert_eq!(port.resets, 1, "bad sync");
+
+        // Failed CRC5.
+        let mut bytes = token_bytes(Pid::In, ADDR, 1);
+        bytes[2] ^= 0x01;
+        let mut port = Fake::new(&bytes);
+        engine().handle(&mut port, &h, one(EpType::Bulk, true), no_packet, &mut [0u8; 8]);
+        assert_eq!(port.resets, 1, "bad crc5");
+
+        // A bus that went quiet mid-token.
+        let mut port = Fake::new(&[SYNC, Pid::In.to_byte()]);
+        engine().handle(&mut port, &h, one(EpType::Bulk, true), no_packet, &mut [0u8; 8]);
+        assert_eq!(port.resets, 1, "timeout");
+
+        // Someone else's token.
+        let mut port = Fake::new(&token_bytes(Pid::In, ADDR + 1, 1));
+        engine().handle(&mut port, &h, one(EpType::Bulk, true), no_packet, &mut [0u8; 8]);
+        assert_eq!(port.resets, 1, "another device");
+
+        // A SOF.
+        let mut port = Fake::new(&[SYNC, Pid::Sof.to_byte(), 0, 0]);
+        engine().handle(&mut port, &h, one(EpType::Bulk, true), no_packet, &mut [0u8; 8]);
+        assert_eq!(port.resets, 1, "sof");
     }
 
     #[test]
