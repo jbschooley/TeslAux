@@ -67,9 +67,13 @@ bind_interrupts!(struct Irqs {
 /// The address the device answers to during the test. Not zero, so the
 /// address filter is actually doing something.
 const ADDR: u8 = 7;
-/// 16 samples per word at 96 MHz: 384 words is about 64 µs, enough for a token
-/// and a 12-byte reply with idle either side.
-const CAPTURE_WORDS: usize = 384;
+/// 16 samples per word at 96 MHz: 1024 words is about 170 µs.
+///
+/// The first version used 384 words — 64 µs — and closed before the reply.
+/// Everything between the token and the reply has to fit inside the window,
+/// and the gap is set by how long the CPU takes to notice the token, which is
+/// not a quantity to be optimistic about.
+const CAPTURE_WORDS: usize = 1024;
 
 const PAYLOAD: [u8; 8] = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
 
@@ -313,8 +317,13 @@ async fn main(_spawner: Spawner) {
             // Let the token finish and be decoded before the engine looks for
             // it. A real host does not wait, but a real host is also not the
             // same CPU.
+            //
+            // Blocking, not `Timer::after`. Awaiting yields to the executor,
+            // which runs the USB task, which can take far longer than the delay
+            // asked for — long enough that the capture window closed before the
+            // reply and every exchange looked like a token with no answer.
             while port.tx_busy() {}
-            Timer::after_micros(20).await;
+            embassy_time::block_for(embassy_time::Duration::from_micros(10));
 
             let mut engine = Engine {
                 address: ADDR,
@@ -336,9 +345,10 @@ async fn main(_spawner: Spawner) {
                 &mut rx_buf,
             );
 
-            // Let the reply drain, then stop sampling.
+            // Let the reply drain, then stop sampling. Blocking for the same
+            // reason as above: this is inside the capture window.
             while port.tx_busy() {}
-            Timer::after_micros(40).await;
+            embassy_time::block_for(embassy_time::Duration::from_micros(20));
             let _ = embassy_time::with_timeout(embassy_time::Duration::from_millis(5), cap).await;
             cap_sm.set_enable(false);
 
@@ -357,7 +367,15 @@ async fn main(_spawner: Spawner) {
             let from = first.saturating_sub(1);
             let to = (last + 2).min(CAPTURE_WORDS);
             line.clear();
-            let _ = write!(line, "  wire w{from}..w{to} (idle {idle:08x})\r\n  ");
+            let _ = write!(
+                line,
+                "  wire w{from}..w{to} of {CAPTURE_WORDS} (idle {idle:08x}){}\r\n",
+                if to >= CAPTURE_WORDS - 2 {
+                    "  TRUNCATED - window too short"
+                } else {
+                    ""
+                }
+            );
             emit(&mut class, &line).await;
             for chunk in capture[from..to].chunks(8) {
                 line.clear();
