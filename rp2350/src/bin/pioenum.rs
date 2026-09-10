@@ -373,11 +373,19 @@ async fn main(_spawner: Spawner) {
                 )
                 .await;
                 cap_sm.set_enable(false);
+                // Trigger on a *packet*, not on any non-idle sample.
+                //
+                // A bus reset is ten milliseconds of SE0 and the window is
+                // under one, so "first thing that is not idle" caught the reset
+                // every time and never a token. K only appears inside a packet:
+                // with these pins inverted, J is 0b10, SE0 is 0b11, and K is
+                // 0b01. Finding one of those means real data.
+                let has_k = |w: &u32| (0..16).any(|i| (w >> (i * 2)) & 0b11 == 0b01);
                 let idle = capture[0];
-                if let Some(first) = capture.iter().position(|w| *w != idle) {
+                if let Some(first) = capture.iter().position(has_k) {
                     dumped = true;
-                    let from = first.saturating_sub(2);
-                    let to = (from + 96).min(CAP);
+                    let from = first.saturating_sub(4);
+                    let to = (from + 160).min(CAP);
                     line.clear();
                     let _ = write!(
                         line,
