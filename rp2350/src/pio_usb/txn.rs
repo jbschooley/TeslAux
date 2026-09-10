@@ -38,8 +38,17 @@ pub trait Port {
     fn rx(&mut self) -> Option<u8>;
     /// Whether the receiver has seen the end of the current packet.
     fn eop(&self) -> bool;
-    /// Take the bus and transmit an already-encoded packet.
+    /// Take the bus and transmit an already-encoded packet. Returns as soon
+    /// as the transfer is armed, not when it has finished.
     fn transmit(&mut self, symbols: &[u32]);
+    /// Whether a transmission is still going out.
+    fn tx_busy(&self) -> bool;
+    /// Put the receiver back to waiting for a start of packet.
+    ///
+    /// Needed after transmitting: the receiver watches the same two wires the
+    /// transmitter drives, so without this it decodes the device's own packet
+    /// and is out of step by the time the host answers.
+    fn reset_receiver(&mut self);
 }
 
 /// How a transaction ended.
@@ -48,8 +57,10 @@ pub enum Outcome {
     /// A start of frame, carrying its frame number. What the bridge paces
     /// against, and the only "transaction" with no endpoint.
     Sof(u16),
-    /// A data packet went out.
-    Sent,
+    /// A data packet went out. `acked` says whether the host acknowledged it,
+    /// and is always false for isochronous, which has no handshake to wait
+    /// for. Only an acknowledged packet may advance the data toggle.
+    Sent { acked: bool },
     /// A handshake went out and nothing else.
     Handshake(Pid),
     /// A data packet arrived and was accepted, with this many payload bytes.
@@ -166,21 +177,41 @@ impl Engine {
                 Outcome::Handshake(pid)
             }
 
-            Response::SendData { .. } => {
+            Response::SendData {
+                expect_handshake, ..
+            } => {
                 // The packet was encoded when the application wrote it; this
                 // only has to point the DMA at it. Returning "sent" without
                 // sending would be a lie, so the lookup is a parameter rather
                 // than the caller's job afterwards.
-                match packet(token.endpoint) {
-                    Some(symbols) => {
-                        port.transmit(symbols);
-                        Outcome::Sent
-                    }
+                let Some(symbols) = packet(token.endpoint) else {
                     // `respond` said the endpoint was ready and the buffer
                     // disagrees. Nothing safe can go on the wire, and a
                     // half-truth is worse than silence.
-                    None => Outcome::Ignored,
+                    return Outcome::Ignored;
+                };
+                port.transmit(symbols);
+
+                if !expect_handshake {
+                    // Isochronous. The transaction is over when the packet is;
+                    // there is nothing to wait for, and waiting would burn the
+                    // budget for the next frame.
+                    return Outcome::Sent { acked: false };
                 }
+
+                // Everything else: the host answers. The receiver has to be
+                // put back first, because it has just decoded our own packet —
+                // it watches the same wires the transmitter drives.
+                while port.tx_busy() {}
+                port.reset_receiver();
+                let acked = match (Self::byte(port), Self::byte(port)) {
+                    (Some(SYNC), Some(pid)) => Pid::from_byte(pid) == Some(Pid::Ack),
+                    // No answer, or a malformed one. Not an error: the host is
+                    // entitled to stay silent, and the packet simply has not
+                    // been confirmed.
+                    _ => false,
+                };
+                Outcome::Sent { acked }
             }
 
             Response::Receive { reply } => {
@@ -244,6 +275,7 @@ mod tests {
     struct Fake {
         rx: std::collections::VecDeque<u8>,
         sent: Vec<Vec<u32>>,
+        resets: usize,
     }
 
     impl Fake {
@@ -251,6 +283,7 @@ mod tests {
             Self {
                 rx: bytes.iter().copied().collect(),
                 sent: Vec::new(),
+                resets: 0,
             }
         }
     }
@@ -264,6 +297,13 @@ mod tests {
         }
         fn transmit(&mut self, symbols: &[u32]) {
             self.sent.push(symbols.to_vec());
+        }
+        fn tx_busy(&self) -> bool {
+            // The fake transmits instantly; nothing here is about timing.
+            false
+        }
+        fn reset_receiver(&mut self) {
+            self.resets += 1;
         }
     }
 
@@ -386,10 +426,87 @@ mod tests {
                 |_| Some(buf.symbols()),
                 &mut [0u8; 8]
             ),
-            Outcome::Sent
+            Outcome::Sent { acked: false }
         );
         assert_eq!(port.sent.len(), 1, "exactly one packet on the wire");
         assert_eq!(port.sent[0], expected, "and it is the prepared one");
+    }
+
+    /// A non-isochronous data packet is only confirmed when the host answers,
+    /// and only a confirmed packet may advance the data toggle. This was the
+    /// gap that made bulk behave exactly like isochronous — the wire captures
+    /// for the two cases were identical, which is how it was noticed.
+    #[test]
+    fn a_bulk_in_waits_for_the_hosts_ack() {
+        use crate::pio_usb::endpoint::{words_for_payload, PacketBuf};
+        let mut buf: PacketBuf<12, { words_for_payload(8) }> = PacketBuf::new();
+        buf.prepare(Pid::Data0, &[0u8; 8]).unwrap();
+
+        // Token, then the host's ACK waiting behind it.
+        let mut bytes = token_bytes(Pid::In, ADDR, 1);
+        bytes.extend_from_slice(&[SYNC, Pid::Ack.to_byte()]);
+
+        let mut port = Fake::new(&bytes);
+        let h = Handshakes::new();
+        assert_eq!(
+            engine().handle(
+                &mut port,
+                &h,
+                one(EpType::Bulk, true),
+                |_| Some(buf.symbols()),
+                &mut [0u8; 8]
+            ),
+            Outcome::Sent { acked: true }
+        );
+        assert_eq!(port.resets, 1, "the receiver must be put back before waiting");
+    }
+
+    #[test]
+    fn a_bulk_in_the_host_never_answers_is_not_acked() {
+        use crate::pio_usb::endpoint::{words_for_payload, PacketBuf};
+        let mut buf: PacketBuf<12, { words_for_payload(8) }> = PacketBuf::new();
+        buf.prepare(Pid::Data0, &[0u8; 8]).unwrap();
+
+        let mut port = Fake::new(&token_bytes(Pid::In, ADDR, 1));
+        let h = Handshakes::new();
+        assert_eq!(
+            engine().handle(
+                &mut port,
+                &h,
+                one(EpType::Bulk, true),
+                |_| Some(buf.symbols()),
+                &mut [0u8; 8]
+            ),
+            Outcome::Sent { acked: false },
+            "silence is not an error, just an unconfirmed packet"
+        );
+    }
+
+    /// Isochronous must not wait, and must not reset the receiver to do so:
+    /// the next frame's budget is the thing being protected.
+    #[test]
+    fn an_isochronous_in_does_not_wait_for_anything() {
+        use crate::pio_usb::endpoint::{words_for_payload, PacketBuf};
+        let mut buf: PacketBuf<12, { words_for_payload(8) }> = PacketBuf::new();
+        buf.prepare(Pid::Data0, &[0u8; 8]).unwrap();
+
+        // An ACK is sitting there; isochronous must ignore it entirely.
+        let mut bytes = token_bytes(Pid::In, ADDR, 1);
+        bytes.extend_from_slice(&[SYNC, Pid::Ack.to_byte()]);
+
+        let mut port = Fake::new(&bytes);
+        let h = Handshakes::new();
+        assert_eq!(
+            engine().handle(
+                &mut port,
+                &h,
+                one(EpType::Isochronous, true),
+                |_| Some(buf.symbols()),
+                &mut [0u8; 8]
+            ),
+            Outcome::Sent { acked: false }
+        );
+        assert_eq!(port.resets, 0, "no wait means no reset");
     }
 
     /// If `respond` says ready but no buffer turns up, nothing goes out. A

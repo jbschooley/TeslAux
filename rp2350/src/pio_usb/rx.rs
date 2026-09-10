@@ -136,3 +136,34 @@ pub fn nrzi_decoder() -> Program<32> {
     )
     .program
 }
+
+/// `set x, 0` — clears the decoder's previous-line-state reference, which is
+/// meaningless across a gap in the stream.
+///
+/// Hardcoded rather than assembled, because the reset runs in the interrupt
+/// path and `pio_asm!` builds a `Program` at every call. The test below checks
+/// it against the assembler, which is the point of having it here rather than
+/// next to the code that uses it: `hw` is target-only and its tests never run.
+pub const SET_X_ZERO: u16 = 0xe020;
+
+/// `mov osr, ~null` — the all-ones OSR the decoder shifts a 1 bit out of.
+pub const MOV_OSR_NOT_NULL: u16 = 0xa0eb;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_hardcoded_reset_instructions_match_the_assembler() {
+        assert_eq!(
+            SET_X_ZERO,
+            pio::pio_asm!("set x, 0").program.code[0],
+            "set x, 0"
+        );
+        assert_eq!(
+            MOV_OSR_NOT_NULL,
+            pio::pio_asm!("mov osr, ~null").program.code[0],
+            "mov osr, ~null"
+        );
+    }
+}

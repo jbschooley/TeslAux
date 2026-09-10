@@ -21,7 +21,7 @@
 
 use embassy_rp::pac;
 
-use super::rx::IRQ_RX_EOP;
+use super::rx::{IRQ_RX_EOP, MOV_OSR_NOT_NULL, SET_X_ZERO};
 use super::tx::PinOrder;
 use super::txn::Port;
 
@@ -39,8 +39,11 @@ pub struct HwPort {
     /// Instruction offset the transmitter was loaded at. Zero in practice —
     /// its symbols are absolute addresses — but carried rather than assumed.
     tx_origin: u16,
+    /// Instruction offset the NRZI decoder was loaded at, for resetting it.
+    dec_origin: u16,
     order: PinOrder,
 }
+
 
 impl HwPort {
     /// `pio_no` is 0, 1 or 2 and must match `pio`; they are separate because
@@ -52,6 +55,7 @@ impl HwPort {
         rx_sm: usize,
         dma: usize,
         tx_origin: u16,
+        dec_origin: u16,
         order: PinOrder,
     ) -> Self {
         Self {
@@ -61,6 +65,7 @@ impl HwPort {
             rx_sm,
             dma,
             tx_origin,
+            dec_origin,
             order,
         }
     }
@@ -105,13 +110,6 @@ impl HwPort {
         });
     }
 
-    /// Whether the previous transmission has finished.
-    ///
-    /// Only for callers that need to know the bus is free again; a transaction
-    /// does not wait for its own reply to drain.
-    pub fn tx_busy(&self) -> bool {
-        pac::DMA.ch(self.dma).ctrl_trig().read().busy()
-    }
 }
 
 impl Port for HwPort {
@@ -132,6 +130,39 @@ impl Port for HwPort {
     fn transmit(&mut self, symbols: &[u32]) {
         self.take_bus();
         self.fire(symbols);
+    }
+
+    fn tx_busy(&self) -> bool {
+        pac::DMA.ch(self.dma).ctrl_trig().read().busy()
+    }
+
+    fn reset_receiver(&mut self) {
+        // Mirrors `bus::prepare_decoder` and `bus::restart_edge_detector`, in
+        // registers rather than embassy's typed handles: stop, clear the FIFO,
+        // restart the shift counters, jump to the start, zero X, reload the
+        // all-ones OSR, restart the detector, clear the receive IRQ flags.
+        let sm = self.pio.sm(self.rx_sm);
+        let ctrl_bit = 1u8 << self.rx_sm;
+        self.pio
+            .ctrl()
+            .modify(|w| w.set_sm_enable(w.sm_enable() & !ctrl_bit));
+        self.pio
+            .ctrl()
+            .modify(|w| w.set_clkdiv_restart(ctrl_bit));
+        self.pio.ctrl().modify(|w| w.set_sm_restart(ctrl_bit));
+        for instr in [
+            self.dec_origin,
+            SET_X_ZERO,
+            MOV_OSR_NOT_NULL,
+        ] {
+            sm.instr().write(|w| w.set_instr(instr));
+        }
+        self.pio
+            .ctrl()
+            .modify(|w| w.set_sm_enable(w.sm_enable() | ctrl_bit));
+        // The edge detector blocks at its `irq wait` after an EOP; clearing the
+        // flags is what releases it to look for the next start of packet.
+        self.pio.irq().write(|w| w.set_irq(0xf << 1));
     }
 }
 

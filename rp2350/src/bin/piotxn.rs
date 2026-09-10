@@ -271,6 +271,7 @@ async fn main(_spawner: Spawner) {
             2,
             1, // DMA channel 1; channel 0 is the sampler's
             programs.tx.origin as u16,
+            programs.decoder.origin as u16,
             order,
         );
 
