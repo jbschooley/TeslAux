@@ -20,5 +20,8 @@ build pioloop "" teslamic-rp2350-PIOLOOP
 # Logic analyser: samples D+/D- at 96 MHz with a spare PIO block and dumps the
 # raw waveform over serial. See src/bin/piocap.rs.
 build piocap "" teslamic-rp2350-PIOCAP
+# Whole transactions: the CPU plays host, the engine replies, PIO2 watches.
+# See src/bin/piotxn.rs.
+build piotxn "" teslamic-rp2350-PIOTXN
 
 ls -l ./*.uf2

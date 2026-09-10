@@ -31,6 +31,12 @@ path = "src/bin/pioloop.rs"
 name = "piocap"
 path = "src/bin/piocap.rs"
 
+# Drives whole transactions against the device engine: the CPU plays host,
+# the engine replies, and PIO2 captures both halves. See src/bin/piotxn.rs.
+[[bin]]
+name = "piotxn"
+path = "src/bin/piotxn.rs"
+
 [dependencies]
 pio      = "0.3"
 pio-proc = "0.3"

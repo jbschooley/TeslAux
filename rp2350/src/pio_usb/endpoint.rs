@@ -82,12 +82,31 @@ impl<const RAW: usize, const WORDS: usize> PacketBuf<RAW, WORDS> {
         }
     }
 
+    /// Encode packet bytes that are already assembled.
+    ///
+    /// For packets that are not data packets — a token carries a CRC5 inside
+    /// its two bytes rather than a trailing CRC16, so it cannot go through
+    /// [`Self::prepare`]. The driver itself never sends one; this exists for
+    /// test harnesses that have to impersonate a host.
+    pub fn encode_raw(&mut self, raw: &[u8]) -> Option<usize> {
+        if raw.len() > RAW {
+            return None;
+        }
+        self.raw[..raw.len()].copy_from_slice(raw);
+        self.encode(raw.len())
+    }
+
     /// Assemble and encode a data packet. Returns the number of symbol words,
     /// or `None` if the payload does not fit.
     ///
     /// Everything expensive happens here, away from the interrupt handler.
     pub fn prepare(&mut self, pid: Pid, payload: &[u8]) -> Option<usize> {
         let n = build_data(pid, payload, &mut self.raw)?;
+        self.encode(n)
+    }
+
+    /// Encode the first `n` bytes of `raw` into the symbol words.
+    fn encode(&mut self, n: usize) -> Option<usize> {
 
         // Encode packed, then expand. An earlier version encoded into the
         // `words` storage and expanded in place from the back, which works but
