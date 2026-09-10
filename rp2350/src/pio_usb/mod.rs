@@ -57,6 +57,7 @@ pub mod endpoint;
 pub mod hw;
 pub mod packet;
 pub mod rx;
+pub mod table;
 pub mod tx;
 pub mod txn;
 
