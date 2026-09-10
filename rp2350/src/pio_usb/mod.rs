@@ -51,6 +51,7 @@
 pub mod bus;
 pub mod codec;
 pub mod device;
+pub mod endpoint;
 pub mod packet;
 pub mod rx;
 pub mod tx;
