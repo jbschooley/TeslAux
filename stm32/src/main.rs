@@ -288,6 +288,8 @@ async fn main(spawner: Spawner) {
         spawner.spawn(if3_log_task().unwrap());
         #[cfg(feature = "usb-timing")]
         spawner.spawn(usb_timing_task().unwrap());
+        #[cfg(feature = "watch-pops")]
+        spawner.spawn(watch_pops_task().unwrap());
         #[cfg(feature = "kbd-volume")]
         spawner.spawn(kbd_volume_task(kbd_writer).unwrap());
         #[cfg(not(feature = "kbd-volume"))]
@@ -361,6 +363,8 @@ async fn sink(mut ep: impl EndpointOut) -> ! {
                 // real silence and re-primes cleanly when audio returns. The
                 // endpoint is still enabled, so keep waiting on it.
                 Err(_) => {
+                    #[cfg(feature = "watch-pops")]
+                    events::bump(&events::SOURCE_TIMEOUT);
                     SOURCE_LIVE.store(false, Ordering::Relaxed);
                     PIPE.lock(|p| p.borrow_mut().reset());
                 }
@@ -389,6 +393,8 @@ async fn sink(mut ep: impl EndpointOut) -> ! {
                 Ok(Err(_)) => break,
             }
         }
+        #[cfg(feature = "watch-pops")]
+        events::bump(&events::EP_DISABLED);
         SOURCE_LIVE.store(false, Ordering::Relaxed);
         PIPE.lock(|p| p.borrow_mut().reset());
     }
@@ -423,6 +429,8 @@ async fn pump(mut iso_in: impl EndpointIn) -> ! {
     let mut last_poll = embassy_time::Instant::now();
     loop {
         iso_in.wait_enabled().await;
+        #[cfg(feature = "watch-pops")]
+        events::bump(&events::EP_ENABLED);
         #[cfg(feature = "usb-timing")]
         {
             last_poll = embassy_time::Instant::now();
@@ -523,6 +531,33 @@ async fn pump(mut iso_in: impl EndpointIn) -> ! {
                 }
             }
         }
+    }
+}
+
+/// Every event that can put a step in the audio, counted and timestamped.
+///
+/// The counters that existed already — underruns, overruns, slips — are the ones
+/// that were checked when a pop was heard, and they were clean every time. That
+/// only rules out those. It says nothing about the events that reset the pipe,
+/// which zero the held sample and un-prime it, so the output jumps to silence
+/// and back: a discontinuity that no existing counter records because nothing is
+/// lost or repeated.
+///
+/// Hearing a pop is a timestamp. This gives every candidate one too, so the two
+/// can be lined up instead of reasoned about.
+#[cfg(feature = "watch-pops")]
+mod events {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    /// Pipe reset because the phone stopped without disabling the endpoint.
+    pub static SOURCE_TIMEOUT: AtomicU32 = AtomicU32::new(0);
+    /// Pipe reset because the host went to alt 0 — normal between tracks.
+    pub static EP_DISABLED: AtomicU32 = AtomicU32::new(0);
+    /// The car re-enabled the endpoint, which is where the TX FIFO flush runs.
+    pub static EP_ENABLED: AtomicU32 = AtomicU32::new(0);
+
+    pub fn bump(c: &AtomicU32) {
+        c.store(c.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
     }
 }
 
@@ -695,5 +730,55 @@ async fn usb_timing_task() -> ! {
             max_us,
             timeouts,
         );
+    }
+}
+
+/// Log anything that could have made a noise, with the time it happened.
+///
+/// Polled rather than logged at the site, because several of these fire from
+/// inside the PIPE critical section and defmt there would be worse than the
+/// fault being chased.
+#[cfg(feature = "watch-pops")]
+#[embassy_executor::task]
+async fn watch_pops_task() -> ! {
+    use core::sync::atomic::Ordering;
+    let mut prev = [0u32; 7];
+    loop {
+        let (under, over, up, down, fill, primed) = PIPE.lock(|p| {
+            let b = p.borrow();
+            (
+                b.stats.underruns,
+                b.stats.overruns,
+                b.stats.adj_up,
+                b.stats.adj_down,
+                b.fill() as u32,
+                b.primed(),
+            )
+        });
+        let now = [
+            under,
+            over,
+            up,
+            down,
+            events::SOURCE_TIMEOUT.load(Ordering::Relaxed),
+            events::EP_DISABLED.load(Ordering::Relaxed),
+            events::EP_ENABLED.load(Ordering::Relaxed),
+        ];
+        if now != prev {
+            let t = embassy_time::Instant::now().as_millis();
+            defmt::warn!(
+                "{=u64:ms} pop-watch: underrun {} (+{}) | overrun {} (+{}) | slip up {} down {} | source-timeout {} (+{}) | ep off {} (+{}) | ep on {} (+{}) | fill {} primed {}",
+                t,
+                now[0], now[0].wrapping_sub(prev[0]),
+                now[1], now[1].wrapping_sub(prev[1]),
+                now[2], now[3],
+                now[4], now[4].wrapping_sub(prev[4]),
+                now[5], now[5].wrapping_sub(prev[5]),
+                now[6], now[6].wrapping_sub(prev[6]),
+                fill, primed,
+            );
+            prev = now;
+        }
+        embassy_time::Timer::after_millis(50).await;
     }
 }

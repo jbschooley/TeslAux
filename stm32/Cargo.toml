@@ -82,6 +82,12 @@ if3-log = []
 # bit-exact recording so far was captured on a Mac and says nothing about the
 # car's side; this does.
 usb-timing = []
+# DIAGNOSTIC: count and timestamp everything that can put a step in the audio —
+# underruns, overruns, slips, and the pipe resets that no existing counter
+# records because nothing is lost or repeated, only zeroed and un-primed.
+# Hearing a pop is a timestamp; this gives every candidate one too.
+watch-pops = []
+
 
 # DIAGNOSTIC (with kbd-volume): present IF2 as a Consumer Control device and send
 # Consumer-page usages instead of Keyboard-page ones. The car ignored Keyboard
