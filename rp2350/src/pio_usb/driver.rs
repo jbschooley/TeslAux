@@ -85,6 +85,10 @@ static WAKERS: [AtomicWaker; NUM_ENDPOINTS * 2] =
 pub mod stats {
     use core::sync::atomic::{AtomicU32, Ordering};
 
+    /// Every time the start-of-packet interrupt handler was entered, counted
+    /// before anything else happens. Compared against TRANSACTIONS this says
+    /// whether packets are being lost before the handler runs or inside it.
+    pub static IRQ_ENTRIES: AtomicU32 = AtomicU32::new(0);
     /// Every transaction the interrupt has serviced.
     pub static TRANSACTIONS: AtomicU32 = AtomicU32::new(0);
     /// Start-of-frame tokens. A host that is talking at all sends one every
@@ -187,6 +191,7 @@ const fn waker_index(ep: u8, is_in: bool) -> usize {
 /// Everything inside the critical section is bookkeeping; the packet the host
 /// asked for went out during [`service`], before any of this.
 pub fn on_packet_start() {
+    stats::bump(&stats::IRQ_ENTRIES);
     let woken = critical_section::with(|cs| {
         let mut guard = STATE.borrow_ref_mut(cs);
         let Some(inner) = guard.as_mut() else {

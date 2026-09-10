@@ -438,13 +438,30 @@ async fn main(_spawner: Spawner) {
             // Which bus states appeared: bit 1 = SE0, bit 2 = K, bit 4 = J.
             let quiet = seen.count_ones() == 1;
 
+            // Where does the edge detector spend its time? Its program counter
+            // is readable, and the answer is a direct observation rather than
+            // another hypothesis. Relative to its origin: 0 is blocked at the
+            // EOP, 1 is waiting for a start of packet — where it belongs at
+            // idle — 2 is a start of packet just seen, 3..9 the K-side loop,
+            // 10..16 the J-side loop and EOP test.
+            let edge_base = programs.edge.origin as u8;
+            let mut pc_hist = [0u32; 17];
+            let mut pc_other = 0u32;
+            for _ in 0..4000 {
+                let pc = embassy_rp::pac::PIO0.sm(1).addr().read().addr();
+                match pc.checked_sub(edge_base) {
+                    Some(rel) if (rel as usize) < pc_hist.len() => pc_hist[rel as usize] += 1,
+                    _ => pc_other += 1,
+                }
+            }
+
             if now != last || quiet != last_quiet {
                 last = now;
                 last_quiet = quiet;
                 line.clear();
                 let _ = write!(
                     line,
-                    "{:6} {:6} {:6} {:6} {:5} {:5} {:6} {:5} {:5}  bus {seen:04b} {}\r\n",
+                    "{:6} {:6} {:6} {:6} {:5} {:5} {:6} {:5} {:5}  bus {seen:04b} {}  irq {}\r\n",
                     now.0,
                     now.1,
                     now.2,
@@ -459,8 +476,23 @@ async fn main(_spawner: Spawner) {
                         .unwrap_or(0),
                     started.elapsed().as_secs(),
                     driver::address(),
-                    if quiet { "STATIC" } else { "moving" }
+                    if quiet { "STATIC" } else { "moving" },
+                    driver::stats::IRQ_ENTRIES.load(core::sync::atomic::Ordering::Relaxed),
                 );
+                emit(&mut log_class, &line).await;
+
+                // The detector's whereabouts, as counts of 4000 samples.
+                line.clear();
+                let _ = write!(line, "  edge pc:");
+                for (i, n) in pc_hist.iter().enumerate() {
+                    if *n > 0 {
+                        let _ = write!(line, " +{i}:{n}");
+                    }
+                }
+                if pc_other > 0 {
+                    let _ = write!(line, " other:{pc_other}");
+                }
+                let _ = write!(line, "\r\n");
                 emit(&mut log_class, &line).await;
             }
         }
