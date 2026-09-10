@@ -160,6 +160,17 @@ impl Port for HwPort {
         self.pio
             .ctrl()
             .modify(|w| w.set_sm_enable(w.sm_enable() & !ctrl_bit));
+
+        // Actually clear the FIFO. `sm_restart` resets the shift counters and
+        // leaves the FIFO contents alone, so until this was here the comment
+        // above described a step the code did not take — the one difference
+        // between this path and the embassy-typed one the loopback passed on.
+        // The SDK's `pio_sm_clear_fifos` is a join-state toggle: changing
+        // FJOIN discards whatever is queued, and toggling it back restores the
+        // configuration.
+        for _ in 0..2 {
+            sm.shiftctrl().modify(|w| w.set_fjoin_rx(!w.fjoin_rx()));
+        }
         self.pio
             .ctrl()
             .modify(|w| w.set_clkdiv_restart(ctrl_bit));
