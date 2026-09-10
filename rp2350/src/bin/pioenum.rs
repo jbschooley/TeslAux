@@ -290,26 +290,47 @@ async fn main(_spawner: Spawner) {
         emit(&mut log_class, &line).await;
 
         let mut last = (u32::MAX, 0, 0, 0, 0);
+        let mut last_quiet = false;
         loop {
             let now = driver::stats::read();
             // Only speak when something changed: a quiet line is a useful
             // signal in itself, and a scrolling wall of identical rows is not.
-            if now != last {
+            // Sample the pads across the interval. All-zero counters mean one
+            // of two very different things — the host has not detected us, or
+            // it is talking and we are deaf — and the bus itself says which.
+            //
+            // Idle J is D+ high, D- low, unchanging. A host that has noticed us
+            // drives a reset (both low) and then start-of-frame traffic every
+            // millisecond, so *any* movement here means it is talking.
+            let mut seen = 0u8;
+            for _ in 0..64 {
+                let (_, dp_status) = bus::pin_registers(13);
+                let (_, dm_status) = bus::pin_registers(12);
+                let dp = ((dp_status >> 17) & 1) as u8;
+                let dm = ((dm_status >> 17) & 1) as u8;
+                seen |= 1 << (dp * 2 + dm);
+                Timer::after_micros(200).await;
+            }
+            // Which bus states appeared: bit 1 = SE0, bit 2 = K, bit 4 = J.
+            let quiet = seen.count_ones() == 1;
+
+            if now != last || quiet != last_quiet {
                 last = now;
+                last_quiet = quiet;
                 line.clear();
                 let _ = write!(
                     line,
-                    "{:6} {:6} {:6} {:6} {:5} {:5}\r\n",
+                    "{:6} {:6} {:6} {:6} {:5} {:5}   bus {seen:04b} {}\r\n",
                     now.0,
                     now.1,
                     now.2,
                     now.3,
                     now.4,
-                    driver::address()
+                    driver::address(),
+                    if quiet { "STATIC" } else { "moving" }
                 );
                 emit(&mut log_class, &line).await;
             }
-            Timer::after_millis(250).await;
         }
     };
 
