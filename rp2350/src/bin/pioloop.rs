@@ -338,17 +338,34 @@ async fn main(_spawner: Spawner) {
             }
             emit(&mut class, &line).await;
 
-            // Always dump the head of both, so a wrong first byte — a sync or
-            // PID problem — is distinguishable from drift further in.
-            for (label, data) in [("  sent", &raw[..n]), ("  got ", &back[..got.min(n)])] {
+            // Dump both in full (to a limit), not truncated to the expected
+            // length. Bytes arriving *after* the expected end are as diagnostic
+            // as the ones before it: they say the receiver kept decoding past
+            // the EOP, which is a framing fault rather than a coding one.
+            for (label, data) in [
+                ("  sent", &raw[..n.min(32)]),
+                ("  got ", &back[..got.min(back.len()).min(32)]),
+            ] {
                 line.clear();
                 let _ = write!(line, "{label}");
-                for b in data.iter().take(16) {
+                for b in data {
                     let _ = write!(line, " {b:02x}");
                 }
                 let _ = write!(line, "\r\n");
                 emit(&mut class, &line).await;
             }
+
+            // The first symbol-bytes actually handed to the state machine. The
+            // encoder is unit-tested on the host, so this is not checking the
+            // encoding — it is checking that what the FIFO received is what the
+            // encoder produced, which the feed loop could get wrong on its own.
+            line.clear();
+            let _ = write!(line, "  syms");
+            for b in syms.iter().take(12) {
+                let _ = write!(line, " {b:02x}");
+            }
+            let _ = write!(line, "\r\n");
+            emit(&mut class, &line).await;
         }
 
         line.clear();
