@@ -24,8 +24,26 @@
 //!
 //! # Status
 //!
-//! **Nothing here has run on hardware.** The PIO programs assemble; that is
-//! all that is currently true of them.
+//! **The line coding round-trips on hardware.** `pioloop` sends five packets
+//! through the transmitter and back through the receiver on one chip, and all
+//! five return byte for byte — including a 192-byte payload, which is this
+//! project's iso IN endpoint size and three times what Pico-PIO-USB's buffers
+//! can hold. Encoder, PIO transmitter, edge detector, NRZI decoder,
+//! de-stuffing and CRC are all exercised by that.
+//!
+//! Two things it does **not** establish, both of which matter before this can
+//! face a real host:
+//!
+//! * **Clock recovery is untested.** In loopback the transmitter and receiver
+//!   both derive from `clk_sys`, so they are perfectly synchronous. Recovering
+//!   a host's *independent* crystal is the entire purpose of the edge
+//!   detector's six-instruction resync window, and nothing here puts it under
+//!   any strain at all.
+//! * **Framing still depends on knowing when a packet was sent.**
+//!   [`bus::prepare_decoder`] is called by the same CPU that schedules the
+//!   transmission. A host sends whenever it likes, so that reset has to move
+//!   into the interrupt path off `IRQ_RX_START` before any of this works
+//!   unattended.
 
 // Hardware bring-up needs the chip HAL, so it is target-only. The codec and
 // packet layers below stay host-buildable so their tests can run.
