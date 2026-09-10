@@ -37,7 +37,7 @@
 use core::fmt::Write as _;
 
 use embassy_executor::Spawner;
-use embassy_futures::join::join4;
+
 use embassy_rp::bind_interrupts;
 use embassy_rp::interrupt::typelevel::{Handler, Interrupt};
 use embassy_rp::peripherals::{PIO0, PIO1, PIO2, USB};
@@ -444,7 +444,7 @@ async fn main(_spawner: Spawner) {
                 line.clear();
                 let _ = write!(
                     line,
-                    "{:6} {:6} {:6} {:6} {:5} {:5} {:5}  {:5}/s  bus {seen:04b} {}\r\n",
+                    "{:6} {:6} {:6} {:6} {:5} {:5} {:5}  {:4}/s {:4}s  bus {seen:04b} {}\r\n",
                     now.0,
                     now.1,
                     now.2,
@@ -457,6 +457,7 @@ async fn main(_spawner: Spawner) {
                     (now.1 as u64 * 1000)
                         .checked_div(started.elapsed().as_millis().max(1))
                         .unwrap_or(0),
+                    started.elapsed().as_secs(),
                     driver::address(),
                     if quiet { "STATIC" } else { "moving" }
                 );
@@ -483,5 +484,32 @@ async fn main(_spawner: Spawner) {
         }
     };
 
-    join4(log_usb.run(), device.run(), report, heartbeat).await;
+    // Keep the receiver armed, continuously.
+    //
+    // The edge detector ends every packet on an `irq wait` and stops until the
+    // flag is acknowledged. `Engine::handle` does that at the end of each
+    // transaction — but only for a packet it actually handled, and if the
+    // detector is stopped there is no interrupt, so no transaction, so nothing
+    // to release it. The only other caller was the reporter, once per pass,
+    // which is why the counters showed about one packet per housekeeping cycle
+    // instead of the thousand a second a host actually sends.
+    //
+    // Doing it in its own task is a probe, not the answer: if the rate jumps,
+    // the per-packet reset is losing the race and belongs in Bus::poll or the
+    // interrupt itself rather than being papered over by polling.
+    let keep_armed = async {
+        loop {
+            driver::service_bus();
+            embassy_futures::yield_now().await;
+        }
+    };
+
+    embassy_futures::join::join5(
+        log_usb.run(),
+        device.run(),
+        report,
+        heartbeat,
+        keep_armed,
+    )
+    .await;
 }
