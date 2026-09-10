@@ -13,9 +13,21 @@ description = "Single-board TeslAux bridge on RP2350. Car on the native USB cont
 name = "ledtest"
 path = "src/bin/ledtest.rs"
 
+# Host-buildable dependencies. Keeping these out of the target-only block below
+# is what lets `cargo test` run on the development machine: the PIO USB codec
+# (NRZI, bit stuffing, CRC5/CRC16) is pure logic, and it is the only part of a
+# driver like this that can be verified without a logic analyser. That is worth
+# arranging the manifest around.
 [dependencies]
+pio      = "0.3"
+pio-proc = "0.3"
+
+# Chip dependencies, for the firmware target only. `cfg(target_os = "none")` is
+# false on the host, so `cargo test` never tries to compile embassy-rp for macOS.
+#
 # `rp235xa` is the 60-pin part on the Waveshare RP2350-USB-C. embassy-rp emits
 # the secure-exe IMAGE_DEF for us; memory.x only has to place `.start_block`.
+[target.'cfg(target_os = "none")'.dependencies]
 embassy-rp       = { version = "0.9", features = ["rp235xa", "time-driver", "critical-section-impl", "unstable-pac"] }
 embassy-usb      = { version = "0.6", default-features = false }
 embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread"] }
@@ -25,8 +37,6 @@ embassy-sync     = { version = "0.7" }
 
 cortex-m    = { version = "0.7", features = ["inline-asm"] }
 cortex-m-rt = "0.7"
-pio         = "0.3"
-pio-proc    = "0.3"
 fixed       = "1"
 # RGB8, for the board's onboard WS2812 (GPIO16, same pin as the RP2040-Zero).
 smart-leds  = "0.4"
