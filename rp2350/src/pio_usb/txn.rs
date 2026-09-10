@@ -76,8 +76,15 @@ pub enum Outcome {
     /// acknowledged. The host will retry; an isochronous host will not, and
     /// that is the trade.
     Corrupt,
-    /// Addressed elsewhere, or an endpoint we do not have.
-    Ignored,
+    /// A well-formed token this device did not act on: addressed elsewhere, an
+    /// endpoint we do not have, a PID that is not a token, or an isochronous
+    /// endpoint with nothing to send.
+    ///
+    /// Carries the token because "ignored" covers several situations that need
+    /// different fixes, and a bare counter cannot tell them apart. A host
+    /// sending SETUPs we discard and a host sending nothing look identical
+    /// until this says which.
+    Ignored { pid: u8, address: u8, endpoint: u8 },
     /// The token did not survive its own checks — bad SYNC, bad PID check
     /// nibble, or a failed CRC5. Answering it would mean replying on another
     /// device's behalf.
@@ -217,7 +224,11 @@ impl Engine {
             // `Sof` cannot reach here — it returned above — but matching it
             // explicitly keeps this exhaustive, so a new variant becomes a
             // compile error rather than being swallowed by a catch-all.
-            Response::Ignore | Response::Sof => Outcome::Ignored,
+            Response::Ignore | Response::Sof => Outcome::Ignored {
+                pid: pid_byte,
+                address: token.address,
+                endpoint: token.endpoint,
+            },
 
             Response::SendHandshake(pid) => {
                 port.transmit(handshakes.get(pid));
@@ -235,7 +246,11 @@ impl Engine {
                     // `respond` said the endpoint was ready and the buffer
                     // disagrees. Nothing safe can go on the wire, and a
                     // half-truth is worse than silence.
-                    return Outcome::Ignored;
+                    return Outcome::Ignored {
+                        pid: pid_byte,
+                        address: token.address,
+                        endpoint: token.endpoint,
+                    };
                 };
                 port.transmit(symbols);
 
@@ -451,10 +466,10 @@ mod tests {
     fn a_token_for_another_device_is_ignored_silently() {
         let mut port = Fake::new(&token_bytes(Pid::In, ADDR + 1, 1));
         let h = Handshakes::new();
-        assert_eq!(
+        assert!(matches!(
             engine().handle(&mut port, &h, one(EpType::Bulk, true), no_packet, &mut [0u8; 8]),
-            Outcome::Ignored
-        );
+            Outcome::Ignored { .. }
+        ));
         assert!(port.sent.is_empty());
     }
 
@@ -580,10 +595,10 @@ mod tests {
     fn an_in_with_no_prepared_buffer_stays_silent() {
         let mut port = Fake::new(&token_bytes(Pid::In, ADDR, 1));
         let h = Handshakes::new();
-        assert_eq!(
+        assert!(matches!(
             engine().handle(&mut port, &h, one(EpType::Bulk, true), no_packet, &mut [0u8; 8]),
-            Outcome::Ignored
-        );
+            Outcome::Ignored { .. }
+        ));
         assert!(port.sent.is_empty());
     }
 
@@ -592,10 +607,10 @@ mod tests {
     fn an_isochronous_in_with_no_data_says_nothing() {
         let mut port = Fake::new(&token_bytes(Pid::In, ADDR, 1));
         let h = Handshakes::new();
-        assert_eq!(
+        assert!(matches!(
             engine().handle(&mut port, &h, one(EpType::Isochronous, false), no_packet, &mut [0u8; 8]),
-            Outcome::Ignored
-        );
+            Outcome::Ignored { .. }
+        ));
         assert!(port.sent.is_empty(), "there is no NAK in isochronous");
     }
 
@@ -706,10 +721,10 @@ mod tests {
         // And the same token is not ours once an address has been assigned.
         e.address = ADDR;
         let mut port = Fake::new(&token_bytes(Pid::In, 0, 0));
-        assert_eq!(
+        assert!(matches!(
             e.handle(&mut port, &h, one(EpType::Control, false), no_packet, &mut [0u8; 8]),
-            Outcome::Ignored
-        );
+            Outcome::Ignored { .. }
+        ));
     }
 
     /// The receiver has to be armed again however the transaction ended. A

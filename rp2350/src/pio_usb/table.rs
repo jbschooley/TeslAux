@@ -446,7 +446,7 @@ pub fn service<P: super::txn::Port, const N: usize>(
         Outcome::Sof(_)
         | Outcome::Handshake(_)
         | Outcome::Corrupt
-        | Outcome::Ignored
+        | Outcome::Ignored { .. }
         | Outcome::BadToken
         | Outcome::Timeout => {}
     }

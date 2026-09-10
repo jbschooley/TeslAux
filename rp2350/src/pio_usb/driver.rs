@@ -103,6 +103,21 @@ pub mod stats {
     /// causes one; a steady stream of them means something else is stopping it.
     pub static REARMS: AtomicU32 = AtomicU32::new(0);
 
+    /// The last well-formed token this device declined to act on, packed as
+    /// `pid << 16 | address << 8 | endpoint`, with the top byte set once
+    /// anything has been recorded.
+    ///
+    /// "Ignored" covers a token for another device, an endpoint we do not have,
+    /// a PID that is not a token at all, and an isochronous endpoint with
+    /// nothing to send. Those need different fixes, and a count cannot tell
+    /// them apart — a host sending SETUPs we discard looks exactly like a host
+    /// sending nothing until the PID is visible.
+    pub static LAST_IGNORED: AtomicU32 = AtomicU32::new(0);
+    /// How many distinct PIDs have been ignored, as a bitmask over the low
+    /// nibble. A single stray fragment reads very differently from a host
+    /// retrying the same request.
+    pub static IGNORED_PIDS: AtomicU32 = AtomicU32::new(0);
+
     pub(super) fn bump(c: &AtomicU32) {
         c.fetch_add(1, Ordering::Relaxed);
     }
@@ -204,7 +219,22 @@ pub fn on_packet_start() {
                 stats::bump(&stats::BAD);
                 None
             }
-            Outcome::Ignored | Outcome::Timeout => None,
+            Outcome::Ignored {
+                pid,
+                address,
+                endpoint,
+            } => {
+                stats::LAST_IGNORED.store(
+                    1 << 24 | (pid as u32) << 16 | (address as u32) << 8 | endpoint as u32,
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+                stats::IGNORED_PIDS.fetch_or(
+                    1 << (pid & 0x0f),
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+                None
+            }
+            Outcome::Timeout => None,
         }
     });
     // Waking outside the critical section: a woken task may run immediately,
