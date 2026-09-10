@@ -18,6 +18,13 @@ path = "src/bin/ledtest.rs"
 # (NRZI, bit stuffing, CRC5/CRC16) is pure logic, and it is the only part of a
 # driver like this that can be verified without a logic analyser. That is worth
 # arranging the manifest around.
+# Loopback self-test for the PIO USB line coding: TX drives D+/D-, the receive
+# state machines read the same pads, and the LED reports pass or fail. No
+# instruments required. See src/bin/pioloop.rs.
+[[bin]]
+name = "pioloop"
+path = "src/bin/pioloop.rs"
+
 [dependencies]
 pio      = "0.3"
 pio-proc = "0.3"

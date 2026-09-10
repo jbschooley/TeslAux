@@ -204,3 +204,29 @@ pub fn check_sysclk() {
         "PIO USB needs a {SYSCLK_HZ} Hz system clock; init with bus::clock_config()"
     );
 }
+
+/// Preload the decoder's OSR with all ones.
+///
+/// `in osr, 1` is how [`super::rx::nrzi_decoder`] shifts in a 1 bit, so an OSR
+/// left at its reset value shifts in zeroes instead and every received byte is
+/// wrong — in a way that looks like a line fault rather than a missing setup
+/// step, which is why this is its own named function rather than a line in a
+/// bring-up sequence.
+///
+/// Must be called after `set_config` and before the state machine is enabled.
+pub fn preload_decoder_osr<'d, P: Instance, const SM: usize>(sm: &mut StateMachine<'d, P, SM>) {
+    let instr = pio::pio_asm!("mov osr, ~null").program.code[0];
+    // Safe in the sense that matters here: the state machine is stopped, so
+    // this cannot interleave with the program's own execution.
+    unsafe { sm.exec_instr(instr) };
+}
+
+/// Clear the EOP flag the edge detector raises at the end of a packet.
+///
+/// The program uses `irq wait`, which sets the flag and then blocks until
+/// something clears it. In the finished driver that is the interrupt handler
+/// acknowledging a completed packet; until then, anything driving the bus has
+/// to clear it by hand or the detector receives exactly one packet and stops.
+pub fn clear_eop_irq<P: Instance>(flags: &embassy_rp::pio::IrqFlags<'_, P>) {
+    flags.clear(super::rx::IRQ_RX_EOP as usize);
+}

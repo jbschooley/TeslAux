@@ -13,5 +13,9 @@ build() { # <bin> <features> <out>
   python3 $UF2 "/tmp/$3.bin" -c -b 0x10000000 -f 0xe48bff59 -o "$3.uf2"
 }
 build ledtest "" teslamic-rp2350-LEDTEST
+# Loopback self-test for the PIO USB line coding. Green = every packet decoded
+# back byte for byte; red = decoded but wrong; blue = nothing came back at all;
+# amber = the system clock is not 96 MHz. See src/bin/pioloop.rs.
+build pioloop "" teslamic-rp2350-PIOLOOP
 
 ls -l ./*.uf2
