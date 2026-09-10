@@ -19,4 +19,7 @@
 //! with real internal structure, and it wants a module tree and unit tests
 //! rather than to be textually pasted into each binary.
 
+// Bit-bangs the WS2812 from a panic handler, so it needs the chip.
+#[cfg(target_os = "none")]
+pub mod panic_led;
 pub mod pio_usb;

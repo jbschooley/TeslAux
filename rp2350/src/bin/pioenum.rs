@@ -59,11 +59,11 @@ use teslamic_rp2350::pio_usb::{
 #[path = "../../../rp2040/src/ws2812.rs"]
 mod ws2812;
 
+/// Strobes the LED rather than parking silently. A panic that looks exactly
+/// like a hang cost two round trips finding the one below.
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    loop {
-        cortex_m::asm::wfi();
-    }
+    teslamic_rp2350::panic_led::strobe()
 }
 
 /// Services a start of packet.
@@ -223,6 +223,13 @@ async fn main(_spawner: Spawner) {
     dev_config.max_packet_size_0 = 64;
     // Vendor class with no interfaces: the smallest thing that can enumerate,
     // so a failure is the driver rather than a class implementation.
+    //
+    // `composite_with_iads` defaults to *true*, and embassy-usb panics in
+    // `Builder::new` unless the class is then 0xEF — the magic value from the
+    // USB-IF interface-association ECN. Setting a vendor class without clearing
+    // it is what stopped the first two attempts: the panic handler parked
+    // silently and the board looked hung rather than crashed.
+    dev_config.composite_with_iads = false;
     dev_config.device_class = 0xff;
     dev_config.device_sub_class = 0x00;
     dev_config.device_protocol = 0x00;
