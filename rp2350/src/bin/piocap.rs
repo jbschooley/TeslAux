@@ -16,14 +16,23 @@
 //! and the capture is dumped over the native USB port for decoding off-chip.
 //!
 //! Two bits per sample, sixteen samples per 32-bit word, `CAPTURE_WORDS` words:
-//! at 96 MHz that is about 21 µs, against roughly 3 µs for the smallest test
+//! at 96 MHz that is about 42 µs, against roughly 3 µs for the smallest test
 //! packet. Plenty of room either side of the packet to see the idle state, the
 //! start of packet and the EOP.
 //!
+//! **The capture is DMA'd, not polled.** The FIFO fills at 6 MHz — a word every
+//! 167 ns, about sixteen CPU cycles — so a polling loop cannot keep up and the
+//! FIFO simply overflows. The first version of this did poll, and the giveaway
+//! was samples reading `11`: both lines high is not a legal bus state, so those
+//! were two fragments either side of a gap being read as one sample.
+//!
 //! Output is raw hex words, oldest first. Within a word the *oldest* sample is
-//! in the low bits, because the ISR shifts right. Each sample is `(dp << 1) |
-//! dm` — note these are the **pad** values, not the inverted ones the receive
-//! programs see.
+//! in the low bits, because the ISR shifts right.
+//!
+//! Rather than depend on getting the bit order right, read the capture
+//! self-calibrating: the bus is idle **J** for most of the window, so whichever
+//! sample value dominates *is* J, the opposite value is K, and `00` is SE0.
+//! A sample of both-bits-set cannot happen on a working bus.
 //!
 //! ```text
 //! screen /dev/tty.usbmodem* 115200
@@ -65,8 +74,8 @@ bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
 });
 
-/// 16 samples per word at 96 MHz: 128 words is about 21 µs.
-const CAPTURE_WORDS: usize = 128;
+/// 16 samples per word at 96 MHz: 256 words is about 42 µs.
+const CAPTURE_WORDS: usize = 256;
 
 /// The packet to send while capturing. Deliberately the smallest case — its
 /// whole transmission fits inside the capture window with idle either side.
@@ -253,36 +262,47 @@ async fn main(_spawner: Spawner) {
         emit(&mut class, &line).await;
 
         // --- capture ---
+        //
+        // DMA, because the FIFO produces a word every 167 ns and the CPU cannot
+        // drain that by polling. The state machine is enabled first: its FIFO is
+        // eight deep, which is far more slack than the few instructions before
+        // the transfer starts, so nothing is lost at the seam.
         let mut capture = [0u32; CAPTURE_WORDS];
         cap_sm.set_enable(true);
+        let transfer = cap_sm.rx().dma_pull(p.DMA_CH0, &mut capture, false);
+
         bus::tx_start(&mut tx_sm, &tx_prg, order);
 
+        // Feed the whole packet without stopping to check anything. Blocking on
+        // a full FIFO is fine here — the DMA is running independently.
         let mut fed = 0usize;
-        let mut got = 0usize;
-        let deadline = embassy_time::Instant::now() + embassy_time::Duration::from_millis(50);
-        while got < CAPTURE_WORDS && embassy_time::Instant::now() < deadline {
-            if fed < sym_bytes {
-                let mut word = 0u32;
-                let mut count = 0;
-                while count < 4 && fed < sym_bytes {
-                    word = (word << 8) | syms[fed] as u32;
-                    fed += 1;
-                    count += 1;
-                }
-                word <<= 8 * (4 - count);
-                if !tx_sm.tx().try_push(word) {
-                    fed -= count;
-                }
+        while fed < sym_bytes {
+            let mut word = 0u32;
+            let mut count = 0;
+            while count < 4 && fed < sym_bytes {
+                word = (word << 8) | syms[fed] as u32;
+                fed += 1;
+                count += 1;
             }
-            if let Some(w) = cap_sm.rx().try_pull() {
-                capture[got] = w;
-                got += 1;
-            }
+            word <<= 8 * (4 - count);
+            while !tx_sm.tx().try_push(word) {}
         }
+
+        // 256 words at 6 MHz is ~42 us; a timeout only matters if the sampler
+        // never started.
+        let filled =
+            embassy_time::with_timeout(embassy_time::Duration::from_millis(100), transfer)
+                .await
+                .is_ok();
         cap_sm.set_enable(false);
 
+        let got = CAPTURE_WORDS;
         line.clear();
-        let _ = write!(line, "captured {got} words (oldest sample in low bits)\r\n");
+        let _ = write!(
+            line,
+            "captured {got} words{} (oldest sample in low bits)\r\nidle J is whichever value dominates\r\n",
+            if filled { "" } else { " (TIMED OUT - sampler never ran)" }
+        );
         emit(&mut class, &line).await;
 
         for chunk in capture[..got].chunks(8) {
