@@ -37,7 +37,7 @@
 use core::fmt::Write as _;
 
 use embassy_executor::Spawner;
-use embassy_futures::join::join3;
+use embassy_futures::join::join4;
 use embassy_rp::bind_interrupts;
 use embassy_rp::interrupt::typelevel::{Handler, Interrupt};
 use embassy_rp::peripherals::{PIO0, PIO1, USB};
@@ -151,6 +151,8 @@ async fn main(_spawner: Spawner) {
         ..
     } = Pio::new(p.PIO1, Irqs);
     let mut led = ws2812::Ws2812::new(&mut led_common, led_sm, p.PIN_16);
+    // Solid from the first instruction that can run: this says the image
+    // booted, the clocks came up and PIO1 works, before any USB exists.
     led.set(RGB8::new(16, 16, 16));
 
     // --- diagnostics on the native port ---
@@ -304,5 +306,23 @@ async fn main(_spawner: Spawner) {
         }
     };
 
-    join3(log_usb.run(), device.run(), report).await;
+    // A heartbeat on the executor itself. USB is the thing under suspicion, so
+    // the liveness signal must not depend on it:
+    //
+    //   solid          — booted, but the executor never ran. Stuck in init.
+    //   blinking       — the executor is running and USB is the problem.
+    //   dark           — never got as far as the first instruction.
+    //
+    // Blink *count* rather than colour: this board's WS2812 appears to take RGB
+    // where the RP2040-Zero's takes GRB, so colours here are not trustworthy.
+    let heartbeat = async {
+        loop {
+            led.set(RGB8::new(24, 24, 24));
+            Timer::after_millis(150).await;
+            led.set(RGB8::new(0, 0, 0));
+            Timer::after_millis(850).await;
+        }
+    };
+
+    join4(log_usb.run(), device.run(), report, heartbeat).await;
 }
