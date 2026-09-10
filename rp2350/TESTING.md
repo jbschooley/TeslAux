@@ -1,6 +1,6 @@
 # Testing the RP2350 build
 
-Three binaries, in the order they are worth running. Each one is only meaningful
+Four binaries, in the order they are worth running. Each one is only meaningful
 if the one before it passed — they were written in this order for that reason,
 and every bug found so far was found by the cheapest test that could see it.
 
@@ -59,6 +59,24 @@ decoder, de-stuffing and CRC. It does **not** cover clock recovery: in loopback
 both ends derive from `clk_sys` and are perfectly synchronous, so the edge
 detector's six-instruction resync window — the entire mechanism for tracking a
 host's independent crystal — is never put under any strain.
+
+## `PIOTXN` — does the device answer a token correctly?
+
+The CPU plays host: it sends a token, and the transaction engine — reading
+through `HwPort`, the one module no host test can reach — decides and replies.
+PIO2 captures both halves.
+
+Five cases. The two that matter most are the ones where the right answer is
+silence: a token for another address, and an isochronous IN with nothing
+queued. Silence and a dropped reply are the same thing in an outcome code and
+obviously different on a capture.
+
+Two things it cannot show. **Timing**: a real host's token arrives unannounced
+with a 167–625 ns turnaround window, and here the CPU sends the token and then
+waits for it. **The handshake wait**: a bulk IN waits for an ACK and an
+isochronous IN does not, but a wait is silence, so the captures are identical —
+and the CPU cannot send an ACK while it is inside `handle` waiting for one.
+That difference is covered by host tests, and on hardware it needs a real host.
 
 ## `PIOCAP` — what is actually on the wire?
 

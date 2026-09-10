@@ -11,10 +11,27 @@
 //!
 //! This is as close to a real host as one board gets. What it exercises that
 //! loopback did not: token decoding, the address filter, `respond`'s dispatch,
-//! and a reply actually reaching the wire. What it still does not exercise is
-//! timing — a real host's token arrives whenever it likes and its turnaround
-//! window is 167 to 625 ns, whereas here the CPU sends the token and then waits
-//! for it, at its leisure.
+//! and a reply actually reaching the wire — including the two cases where the
+//! correct reply is *nothing*, which an outcome code cannot distinguish from a
+//! reply that was dropped.
+//!
+//! # What it cannot show
+//!
+//! **Timing.** A real host's token arrives unannounced and its turnaround
+//! window is 167 to 625 ns; here the CPU sends the token and then waits for it
+//! at its leisure.
+//!
+//! **The handshake wait.** A bulk IN waits for the host's ACK and an
+//! isochronous IN does not, but a wait is silence and silence looks like idle,
+//! so the two produce identical captures. Nor can this harness answer its own
+//! question: the CPU is the host *and* the device, so it cannot send an ACK
+//! while it is inside `handle` waiting for one. Both cases therefore report
+//! `acked: false` — one because the host said nothing, the other because it
+//! never listened.
+//!
+//! That difference is covered by the host tests in `txn`, which can script an
+//! ACK into the byte stream. On hardware it needs a real host, which is the
+//! next milestone regardless.
 //!
 //! ```text
 //! screen /dev/tty.usbmodem* 115200
