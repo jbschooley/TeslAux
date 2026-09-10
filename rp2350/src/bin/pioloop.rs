@@ -209,6 +209,24 @@ async fn main(_spawner: Spawner) {
         );
         emit(&mut class, &line).await;
 
+        // At rest the bus should be idle-J: D+ high (the board's 1.5k pull-up),
+        // D- low. The edge detector reads D- *inverted*, so it should see high
+        // and sit waiting. If it is instead free-running, the inversion is the
+        // first thing to doubt — hence dumping the registers rather than
+        // reasoning about them.
+        for (name, pin) in [("D+", dp.pin()), ("D-", dm.pin())] {
+            let (ctrl, status) = bus::pin_registers(pin);
+            line.clear();
+            let _ = write!(
+                line,
+                "{name} gp{pin}: ctrl {ctrl:08x} funcsel {} inover {}  status {status:08x} pad {}\r\n",
+                ctrl & 0x1f,
+                (ctrl >> 16) & 0x3,
+                (status >> 17) & 1,
+            );
+            emit(&mut class, &line).await;
+        }
+
         bus::init_tx(&mut sm0, &programs.tx, &dp, &dm);
         bus::init_edge_detector(&mut sm1, &programs.edge, &dp, &dm);
         bus::init_decoder(&mut sm2, &programs.decoder, &dp);

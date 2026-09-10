@@ -344,3 +344,17 @@ pub fn clear_rx_irqs<P: Instance>(flags: &embassy_rp::pio::IrqFlags<'_, P>) {
         flags.clear(irq as usize);
     }
 }
+
+/// Raw `GPIO_CTRL` and `GPIO_STATUS` for a pin, for bring-up diagnostics.
+///
+/// Returned unhelpfully as raw words on purpose: the RP2350 dropped the
+/// `INTOPERI` status field the RP2040 had, so there is no way to read back what
+/// the peripheral actually sees after inversion. The next best thing is the
+/// configuration and the pad level, decoded off-chip.
+///
+/// In `CTRL`, bit 0..4 is `FUNCSEL` (PIO0 is 6) and bits 16..17 are `INOVER`
+/// (1 = invert). In `STATUS`, bit 17 is `INFROMPAD`.
+pub fn pin_registers(pin: u8) -> (u32, u32) {
+    let gpio = pac::IO_BANK0.gpio(pin as usize);
+    (gpio.ctrl().read().0, gpio.status().read().0)
+}
