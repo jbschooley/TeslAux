@@ -494,6 +494,34 @@ async fn main(_spawner: Spawner) {
                 }
                 let _ = write!(line, "\r\n");
                 emit(&mut log_class, &line).await;
+
+                // The last packet that failed its checks, decoded. A SETUP
+                // token that fails CRC5 is 80 2d; a DATA0 that fails CRC16 is
+                // 80 c3. Which one it is says whether the token or its data
+                // stage is the problem.
+                if driver::stats::LAST_BAD_SEEN
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                    != 0
+                {
+                    let b = driver::stats::LAST_BAD
+                        .load(core::sync::atomic::Ordering::Relaxed)
+                        .to_be_bytes();
+                    let what = match (b[0], b[1]) {
+                        (0x80, 0x2d) => "SETUP token bad CRC5",
+                        (0x80, 0xc3) | (0x80, 0x4b) => "DATA bad CRC16",
+                        (0x80, 0xa5) => "SOF bad CRC5",
+                        (0x80, 0xe1) => "OUT token",
+                        (0x80, 0x69) => "IN token",
+                        (0x80, _) => "sync ok, bad PID",
+                        _ => "no sync",
+                    };
+                    let _ = write!(
+                        line,
+                        "  last bad: {:02x} {:02x} {:02x} {:02x}  {what}\r\n",
+                        b[0], b[1], b[2], b[3]
+                    );
+                    emit(&mut log_class, &line).await;
+                }
             }
         }
     };
