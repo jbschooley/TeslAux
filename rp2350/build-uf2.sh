@@ -7,11 +7,22 @@ set -e
 cd "$(dirname "$0")"
 UF2=../tools/uf2conv.py
 OBJ=${OBJCOPY:-arm-none-eabi-objcopy}
+# BOARD=usb-c (default) or BOARD=pizero. The two differ in flash size, GPIO
+# count and which pins carry D+/D-; see src/board.rs.
+BOARD=${BOARD:-usb-c}
+SUFFIX=""
+[ "$BOARD" = "usb-c" ] || SUFFIX="-$BOARD"
+
 build() { # <bin> <features> <out>
-  cargo build --release --bin "$1" ${2:+--features "$2"}
+  cargo build --release --bin "$1" --no-default-features \
+    --features "board-$BOARD${2:+,$2}"
   $OBJ -O binary "target/thumbv8m.main-none-eabihf/release/$1" "/tmp/$3.bin"
-  python3 $UF2 "/tmp/$3.bin" -c -b 0x10000000 -f 0xe48bff59 -o "$3.uf2"
+  python3 $UF2 "/tmp/$3.bin" -c -b 0x10000000 -f 0xe48bff59 -o "$3$SUFFIX.uf2"
 }
+# Measures which GPIO carries the device pull-up. Run this first on any board:
+# it answers both "which pins are D+/D-" and "is this port wired as a device at
+# all", and both have cost days when assumed. See src/bin/pinscan.rs.
+build pinscan "" teslamic-rp2350-PINSCAN
 build ledtest "" teslamic-rp2350-LEDTEST
 # Loopback self-test for the PIO USB line coding. Green = every packet decoded
 # back byte for byte; red = decoded but wrong; blue = nothing came back at all;

@@ -52,12 +52,12 @@ use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::Builder;
 use smart_leds::RGB8;
 
+use teslamic_rp2350::board;
 use teslamic_rp2350::pio_usb::{
     bus,
     driver::{self, PioUsb},
     hw::HwPort,
     rx::IRQ_RX_START,
-    tx,
 };
 
 #[path = "../../../rp2040/src/ws2812.rs"]
@@ -193,10 +193,11 @@ async fn main(_spawner: Spawner) {
         ..
     } = Pio::new(p.PIO0, Irqs);
 
-    let mut dp = common.make_pio_pin(p.PIN_13);
-    let mut dm = common.make_pio_pin(p.PIN_12);
+    let (dp_pin, dm_pin) = teslamic_rp2350::usb_pins!(p);
+    let mut dp = common.make_pio_pin(dp_pin);
+    let mut dm = common.make_pio_pin(dm_pin);
     bus::configure_pins(&mut dp, &mut dm);
-    let order = tx::PinOrder::DmBelowDp;
+    let order = board::pin_order();
     let programs = bus::load(&mut common, order);
     programs.check_tx_offset();
     bus::init_tx(&mut sm0, &programs.tx, &dp, &dm);
@@ -405,8 +406,8 @@ async fn main(_spawner: Spawner) {
             let mut seen = 0u8;
             for _ in 0..8 {
                 for _ in 0..2_000 {
-                    let (_, dp_status) = bus::pin_registers(13);
-                    let (_, dm_status) = bus::pin_registers(12);
+                    let (_, dp_status) = bus::pin_registers(board::DP_PIN);
+                    let (_, dm_status) = bus::pin_registers(board::DM_PIN);
                     let dp = ((dp_status >> 17) & 1) as u8;
                     let dm = ((dm_status >> 17) & 1) as u8;
                     seen |= 1 << (dp * 2 + dm);

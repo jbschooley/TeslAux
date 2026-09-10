@@ -191,8 +191,9 @@ async fn main(_spawner: Spawner) {
 
         // D+ is gp13 and D- is gp12 — the opposite of the schematic's apparent
         // reading, settled by the board itself. See bus.rs.
-        let mut dp = common.make_pio_pin(p.PIN_13);
-        let mut dm = common.make_pio_pin(p.PIN_12);
+        let (dp_pin, dm_pin) = teslamic_rp2350::usb_pins!(p);
+        let mut dp = common.make_pio_pin(dp_pin);
+        let mut dm = common.make_pio_pin(dm_pin);
         bus::configure_pins(&mut dp, &mut dm);
 
         let order = if dp.pin() < dm.pin() {

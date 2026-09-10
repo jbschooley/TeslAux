@@ -22,4 +22,5 @@
 // Bit-bangs the WS2812 from a panic handler, so it needs the chip.
 #[cfg(target_os = "none")]
 pub mod panic_led;
+pub mod board;
 pub mod pio_usb;

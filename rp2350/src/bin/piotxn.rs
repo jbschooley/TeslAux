@@ -54,13 +54,13 @@ use embassy_usb::Builder;
 use fixed::traits::ToFixed;
 use smart_leds::RGB8;
 
+use teslamic_rp2350::board;
 use teslamic_rp2350::pio_usb::{
     bus,
     device::{EpState, EpType},
     endpoint::{words_for_payload, Handshakes, PacketBuf},
     hw::HwPort,
     packet::{encode_token, Pid, SYNC},
-    tx,
     txn::{Engine, Port},
 };
 
@@ -243,10 +243,11 @@ async fn main(_spawner: Spawner) {
             ..
         } = Pio::new(p.PIO0, Irqs);
 
-        let mut dp = common.make_pio_pin(p.PIN_13);
-        let mut dm = common.make_pio_pin(p.PIN_12);
+        let (dp_pin, dm_pin) = teslamic_rp2350::usb_pins!(p);
+        let mut dp = common.make_pio_pin(dp_pin);
+        let mut dm = common.make_pio_pin(dm_pin);
         bus::configure_pins(&mut dp, &mut dm);
-        let order = tx::PinOrder::DmBelowDp;
+        let order = board::pin_order();
         let programs = bus::load(&mut common, order);
         programs.check_tx_offset();
         bus::init_tx(&mut sm0, &programs.tx, &dp, &dm);

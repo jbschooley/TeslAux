@@ -43,6 +43,22 @@ path = "src/bin/piotxn.rs"
 name = "pioenum"
 path = "src/bin/pioenum.rs"
 
+[features]
+default = ["board-usb-c"]
+# Waveshare RP2350-USB-C: RP2350A, 2 MB flash, PIO USB on gp13/gp12 (measured).
+board-usb-c = ["embassy-rp/rp235xa"]
+# Waveshare RP2350-PiZero: RP2350B, 16 MB flash. The B part differs only in
+# package and pin count — 48 GPIO against 30 — and the extra feature exists
+# solely so PIN_30..PIN_47 are declared. Everything the driver touches is
+# identical between the two.
+board-pizero = ["embassy-rp/rp235xb"]
+
+# Measures which GPIO carries the 1.5k device pull-up, so a new board's D+/D-
+# come from the hardware rather than from a schematic. See src/bin/pinscan.rs.
+[[bin]]
+name = "pinscan"
+path = "src/bin/pinscan.rs"
+
 [dependencies]
 pio      = "0.3"
 pio-proc = "0.3"
@@ -53,7 +69,7 @@ pio-proc = "0.3"
 # `rp235xa` is the 60-pin part on the Waveshare RP2350-USB-C. embassy-rp emits
 # the secure-exe IMAGE_DEF for us; memory.x only has to place `.start_block`.
 [target.'cfg(target_os = "none")'.dependencies]
-embassy-rp       = { version = "0.9", features = ["rp235xa", "time-driver", "critical-section-impl", "unstable-pac"] }
+embassy-rp       = { version = "0.9", default-features = false, features = ["rt", "time-driver", "critical-section-impl", "unstable-pac"] }
 embassy-usb      = { version = "0.6", default-features = false }
 embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread"] }
 embassy-time     = { version = "0.5" }
