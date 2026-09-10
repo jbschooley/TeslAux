@@ -211,20 +211,6 @@ async fn main(_spawner: Spawner) {
         order,
     );
 
-    // Route the start-of-packet flag to the CPU. Without this the handler is
-    // never called and the device is deaf while looking perfectly healthy.
-    // `sm3` is the enable for PIO IRQ flag 3, which is IRQ_RX_START. The
-    // register names them sm0..sm3 after the state machines that usually raise
-    // them; here it is the edge detector, and the flag number is what matters.
-    const _: () = assert!(IRQ_RX_START == 3, "the enable below names flag 3");
-    embassy_rp::pac::PIO0
-        .irqs(1)
-        .inte()
-        .modify(|w| w.set_sm3(true));
-    unsafe {
-        embassy_rp::interrupt::typelevel::PIO0_IRQ_1::enable();
-    }
-
     // --- the device the host will see ---
     let pio_driver = PioUsb::new(port);
     let mut dev_config = embassy_usb::Config::new(0x1209, 0x0001);
@@ -268,6 +254,30 @@ async fn main(_spawner: Spawner) {
             programs.edge.origin,
             programs.decoder.origin,
         );
+        emit(&mut log_class, &line).await;
+
+        // Only now route the start-of-packet flag to the CPU.
+        //
+        // Deliberately last. Servicing a transaction runs with interrupts
+        // disabled, so a fault in that path takes the diagnostics down with it
+        // — which is exactly what happened the first time this was run, and it
+        // left nothing to look at on either port. Arming it after the log is up
+        // and has printed means a board that goes quiet from here has told us
+        // where it went quiet.
+        //
+        // `sm3` is the enable for PIO IRQ flag 3, which is IRQ_RX_START. The
+        // register names them after the state machines that usually raise them;
+        // here it is the edge detector, and the flag number is what matters.
+        const _: () = assert!(IRQ_RX_START == 3, "the enable below names flag 3");
+        embassy_rp::pac::PIO0
+            .irqs(1)
+            .inte()
+            .modify(|w| w.set_sm3(true));
+        unsafe {
+            embassy_rp::interrupt::typelevel::PIO0_IRQ_1::enable();
+        }
+        line.clear();
+        let _ = write!(line, "start-of-packet interrupt armed\r\n");
         emit(&mut log_class, &line).await;
 
         let mut last = (u32::MAX, 0, 0, 0, 0);

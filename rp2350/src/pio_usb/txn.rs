@@ -86,13 +86,28 @@ pub enum Outcome {
     Timeout,
 }
 
-/// How many spins to wait for each byte before giving up.
+/// Spins to wait for one byte before giving up.
 ///
-/// A byte is eight bit times, about 667 ns. This is generous enough to cover
-/// a slow host and short enough that a disconnected bus does not wedge the
-/// interrupt handler — which, with interrupts off, would take the whole device
-/// down rather than just one transfer.
-const SPIN_LIMIT: u32 = 20_000;
+/// This runs with interrupts disabled, so the arithmetic matters. A byte is
+/// eight bit times — 667 ns, about 64 cycles at 96 MHz — and the loop body is a
+/// register read and a test, call it a dozen cycles. Five iterations covers a
+/// byte; 128 covers twenty-five of them, roughly 17 µs.
+///
+/// The first version of this was 20,000, which is two to three milliseconds of
+/// disabled interrupts every time a byte failed to arrive. With a host plugged
+/// in sending a start of frame every millisecond, the CPU never left the
+/// handler: the device stopped answering and the *other* USB port — the one
+/// carrying the diagnostics — went dead with it. A timeout long enough to be
+/// safe is not the same as one long enough to be harmless.
+const BYTE_SPINS: u32 = 128;
+
+/// Spins without progress before abandoning a packet mid-flight.
+///
+/// Bounded by inactivity rather than by total time, because a 192-byte packet
+/// legitimately takes 128 µs and a fixed budget would either cut it short or be
+/// far too generous for a bus that has simply gone quiet. The counter resets on
+/// every byte, so this is "nothing for about 17 µs", the same as above.
+const IDLE_SPINS: u32 = 128;
 
 /// Device-wide state a transaction needs.
 pub struct Engine {
@@ -119,7 +134,7 @@ impl Engine {
 
     /// Read one byte, spinning until it arrives or the bus goes quiet.
     fn byte<P: Port>(port: &mut P) -> Option<u8> {
-        for _ in 0..SPIN_LIMIT {
+        for _ in 0..BYTE_SPINS {
             if let Some(b) = port.rx() {
                 return Some(b);
             }
@@ -284,13 +299,19 @@ impl Engine {
         let _pid = Self::byte(port)?;
 
         let mut n = 0;
-        for _ in 0..SPIN_LIMIT {
+        let mut idle = 0u32;
+        while idle < IDLE_SPINS {
+            let mut progressed = false;
             while let Some(b) = port.rx() {
                 if n < buf.len() {
                     buf[n] = b;
                 }
                 n += 1;
+                progressed = true;
             }
+            // Reset on progress: a long packet is not a stalled one, and the
+            // difference is whether bytes are still arriving.
+            idle = if progressed { 0 } else { idle + 1 };
             if port.eop() {
                 // Drain whatever landed between the last read and the flag.
                 while let Some(b) = port.rx() {
