@@ -77,6 +77,51 @@ static STATE: Mutex<RefCell<Option<Inner>>> = Mutex::new(RefCell::new(None));
 static WAKERS: [AtomicWaker; NUM_ENDPOINTS * 2] =
     [const { AtomicWaker::new() }; NUM_ENDPOINTS * 2];
 
+/// Counters, so a device that does not enumerate can say how far it got.
+///
+/// Plain atomics rather than anything in the critical section: the interrupt
+/// writes them and the diagnostic reads them, and a torn read of a counter is
+/// not worth excluding the interrupt for.
+pub mod stats {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    /// Every transaction the interrupt has serviced.
+    pub static TRANSACTIONS: AtomicU32 = AtomicU32::new(0);
+    /// Start-of-frame tokens. A host that is talking at all sends one every
+    /// millisecond, so this separates "nothing is arriving" from "nothing is
+    /// arriving *for us*".
+    pub static SOF: AtomicU32 = AtomicU32::new(0);
+    /// Tokens addressed to this device that produced a reply.
+    pub static ANSWERED: AtomicU32 = AtomicU32::new(0);
+    /// Tokens that failed their own checks — bad sync, bad PID, failed CRC5.
+    /// A steady trickle of these against a live host points at clock recovery
+    /// rather than at anything above the wire.
+    pub static BAD: AtomicU32 = AtomicU32::new(0);
+    /// SETUP packets received. The first one is the host asking what we are.
+    pub static SETUPS: AtomicU32 = AtomicU32::new(0);
+
+    pub(super) fn bump(c: &AtomicU32) {
+        c.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A snapshot for printing: transactions, SOFs, answered, bad, setups.
+    pub fn read() -> (u32, u32, u32, u32, u32) {
+        (
+            TRANSACTIONS.load(Ordering::Relaxed),
+            SOF.load(Ordering::Relaxed),
+            ANSWERED.load(Ordering::Relaxed),
+            BAD.load(Ordering::Relaxed),
+            SETUPS.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// The address the device currently answers to. Zero until SET_ADDRESS lands,
+/// so a non-zero value proves enumeration got at least that far.
+pub fn address() -> u8 {
+    with(|inner| inner.engine.address)
+}
+
 const fn waker_index(ep: u8, is_in: bool) -> usize {
     ep as usize + if is_in { 0 } else { NUM_ENDPOINTS }
 }
@@ -103,10 +148,32 @@ pub fn on_packet_start() {
         } = inner;
         let outcome = service(engine, port, handshakes, table, rx);
         use super::txn::Outcome;
+        stats::bump(&stats::TRANSACTIONS);
         match outcome {
-            Outcome::Sent { ep, .. } => Some(waker_index(ep, true)),
-            Outcome::Received { ep, .. } => Some(waker_index(ep, false)),
-            _ => None,
+            Outcome::Sent { ep, .. } => {
+                stats::bump(&stats::ANSWERED);
+                Some(waker_index(ep, true))
+            }
+            Outcome::Received { ep, setup, .. } => {
+                stats::bump(&stats::ANSWERED);
+                if setup {
+                    stats::bump(&stats::SETUPS);
+                }
+                Some(waker_index(ep, false))
+            }
+            Outcome::Handshake(_) => {
+                stats::bump(&stats::ANSWERED);
+                None
+            }
+            Outcome::Sof(_) => {
+                stats::bump(&stats::SOF);
+                None
+            }
+            Outcome::BadToken | Outcome::Corrupt => {
+                stats::bump(&stats::BAD);
+                None
+            }
+            Outcome::Ignored | Outcome::Timeout => None,
         }
     });
     // Waking outside the critical section: a woken task may run immediately,

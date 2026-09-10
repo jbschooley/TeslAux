@@ -23,5 +23,8 @@ build piocap "" teslamic-rp2350-PIOCAP
 # Whole transactions: the CPU plays host, the engine replies, PIO2 watches.
 # See src/bin/piotxn.rs.
 build piotxn "" teslamic-rp2350-PIOTXN
+# Stands the port up as a real device for a computer to enumerate. The first
+# test with a host on the other end. See src/bin/pioenum.rs.
+build pioenum "" teslamic-rp2350-PIOENUM
 
 ls -l ./*.uf2

@@ -37,6 +37,12 @@ path = "src/bin/piocap.rs"
 name = "piotxn"
 path = "src/bin/piotxn.rs"
 
+# Stands the PIO port up as a real device so a computer can enumerate it. The
+# first test with a host on the other end. See src/bin/pioenum.rs.
+[[bin]]
+name = "pioenum"
+path = "src/bin/pioenum.rs"
+
 [dependencies]
 pio      = "0.3"
 pio-proc = "0.3"
