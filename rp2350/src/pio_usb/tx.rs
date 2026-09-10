@@ -60,29 +60,75 @@ pub enum Symbol {
     J = 3,
 }
 
-/// Assemble the transmitter.
+/// Which physical pin carries D+, relative to D-.
+///
+/// The bus is driven by a two-bit side-set whose bit 0 is the lower-numbered
+/// pin, so the encoding of "drive J" depends on which line got the lower GPIO.
+/// The reference ships two separate programs for this rather than computing it,
+/// and so does this.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum PinOrder {
+    /// D+ is the lower-numbered pin. J is `0b01`.
+    DpBelowDm,
+    /// D- is the lower-numbered pin. J is `0b10`.
+    ///
+    /// This is the Waveshare RP2350-USB-C: D+ is gp13 and D- is gp12, which the
+    /// board reported itself — with internal pull-downs on both, gp13 still
+    /// read high, and only the 1.5 kOhm device pull-up does that.
+    DmBelowDp,
+}
+
+impl PinOrder {
+    /// Side-set value that drives an idle J bus.
+    pub const fn idle_j(self) -> u8 {
+        match self {
+            PinOrder::DpBelowDm => 0b01,
+            PinOrder::DmBelowDp => 0b10,
+        }
+    }
+}
+
+/// Assemble the transmitter for a given pin order.
 ///
 /// Placed at offset 0 in instruction memory: the symbol values above are raw
 /// addresses, so the program cannot be relocated without rewriting the encoder.
-pub fn program() -> Program<32> {
-    pio::pio_asm!(
-        ".side_set 2",
-        // J while full-speed idle. (The low-speed variant swaps these; this
-        // port is full-speed only, so the distinction is compiled away.)
-        ".define FJ_LK 0b01",
-        ".define FK_LJ 0b10",
-        ".define SE0   0b00",
-        // Entry point is `reset`, one past the IRQ: the state machine is
-        // started at offset+1 so this fires only at the end of a packet.
-        "    irq 0             side SE0 [7]",
-        "reset:",
-        ".wrap_target",
-        "    out pc, 2         side FJ_LK [3]",
-        "    set pindirs, 0b00 side FJ_LK [3]",
-        "    out pc, 2         side FK_LJ [3]",
-        "start:",
-        "    set pindirs, 0b11 side FJ_LK",
-        ".wrap",
-    )
-    .program
+///
+/// The two variants differ only in the two side-set constants. They are written
+/// out separately rather than generated because `pio_asm!` needs literals, and
+/// because a side-set polarity is not something to compute in a macro argument.
+pub fn program(order: PinOrder) -> Program<32> {
+    match order {
+        PinOrder::DpBelowDm => pio::pio_asm!(
+            ".side_set 2",
+            ".define FJ_LK 0b01",
+            ".define FK_LJ 0b10",
+            ".define SE0   0b00",
+            "    irq 0             side SE0 [7]",
+            "reset:",
+            ".wrap_target",
+            "    out pc, 2         side FJ_LK [3]",
+            "    set pindirs, 0b00 side FJ_LK [3]",
+            "    out pc, 2         side FK_LJ [3]",
+            "start:",
+            "    set pindirs, 0b11 side FJ_LK",
+            ".wrap",
+        )
+        .program,
+        PinOrder::DmBelowDp => pio::pio_asm!(
+            ".side_set 2",
+            ".define FJ_LK 0b10",
+            ".define FK_LJ 0b01",
+            ".define SE0   0b00",
+            "    irq 0             side SE0 [7]",
+            "reset:",
+            ".wrap_target",
+            "    out pc, 2         side FJ_LK [3]",
+            "    set pindirs, 0b00 side FJ_LK [3]",
+            "    out pc, 2         side FK_LJ [3]",
+            "start:",
+            "    set pindirs, 0b11 side FJ_LK",
+            ".wrap",
+        )
+        .program,
+    }
 }

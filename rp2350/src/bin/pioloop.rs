@@ -189,11 +189,18 @@ async fn main(_spawner: Spawner) {
             ..
         } = Pio::new(p.PIO0, Irqs);
 
-        let mut dp = common.make_pio_pin(p.PIN_12);
-        let mut dm = common.make_pio_pin(p.PIN_13);
+        // D+ is gp13 and D- is gp12 — the opposite of the schematic's apparent
+        // reading, settled by the board itself. See bus.rs.
+        let mut dp = common.make_pio_pin(p.PIN_13);
+        let mut dm = common.make_pio_pin(p.PIN_12);
         bus::configure_pins(&mut dp, &mut dm);
 
-        let programs = bus::load(&mut common);
+        let order = if dp.pin() < dm.pin() {
+            teslamic_rp2350::pio_usb::tx::PinOrder::DpBelowDm
+        } else {
+            teslamic_rp2350::pio_usb::tx::PinOrder::DmBelowDp
+        };
+        let programs = bus::load(&mut common, order);
 
         line.clear();
         let _ = write!(
@@ -257,7 +264,7 @@ async fn main(_spawner: Spawner) {
             back.fill(0);
             // Enable the line drivers. Without this the symbols clock out onto
             // pins that are still inputs and the bus never moves.
-            bus::tx_start(&mut sm0, &programs.tx);
+            bus::tx_start(&mut sm0, &programs.tx, programs.order);
 
             let mut got = 0usize;
             let mut fed = 0usize;

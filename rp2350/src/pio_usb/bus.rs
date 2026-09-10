@@ -7,10 +7,19 @@
 //!
 //! # Pin requirements
 //!
-//! On the Waveshare RP2350-USB-C the second connector is D+ on GPIO12 and D- on
-//! GPIO13, each behind 27 Ω, with a 1.5 kΩ pull-up from D+ to 3V3 (R13) that
-//! makes the port a full-speed *device*. Those defaults are in [`DP_PIN`] and
-//! [`DM_PIN`], but nothing here assumes them.
+//! On the Waveshare RP2350-USB-C the second connector is **D+ on GPIO13 and D-
+//! on GPIO12**, each behind 27 Ω, with a 1.5 kΩ pull-up on D+ that makes the
+//! port a full-speed *device*.
+//!
+//! That assignment is the opposite of what the schematic PDF appears to say,
+//! and it was settled by asking the board. With internal pull-downs on both
+//! pins, gp12 reads low and gp13 reads high; only a 1.5 kΩ pull-up holds a pin
+//! high against an internal pull-down, so the device pull-up — and therefore
+//! D+ — is on gp13. Reading it the other way leaves the bus idling in K, which
+//! makes the edge detector free-run instead of waiting for a start of packet.
+//!
+//! Note this puts D- on the *lower* GPIO, which the transmitter cares about:
+//! see [`super::tx::PinOrder`].
 
 use embassy_rp::pac;
 use embassy_rp::pio::{
@@ -21,10 +30,11 @@ use fixed::traits::ToFixed;
 
 use super::{RX_CLOCK_HZ, SYSCLK_HZ, TX_CLOCK_HZ};
 
-/// D+ on the Waveshare RP2350-USB-C's PIO-USB connector.
-pub const DP_PIN: u8 = 12;
-/// D- on the same connector.
-pub const DM_PIN: u8 = 13;
+/// D+ on the Waveshare RP2350-USB-C's PIO-USB connector. Carries the 1.5 kΩ
+/// device pull-up, which is how it was identified — see the module docs.
+pub const DP_PIN: u8 = 13;
+/// D- on the same connector, and the lower-numbered of the pair.
+pub const DM_PIN: u8 = 12;
 
 /// Invert a pin's *input* logic.
 ///
@@ -58,6 +68,9 @@ pub struct Programs<'d, P: Instance> {
     pub tx: LoadedProgram<'d, P>,
     pub edge: LoadedProgram<'d, P>,
     pub decoder: LoadedProgram<'d, P>,
+    /// Which line got the lower GPIO. Kept because the side-set value that
+    /// means "idle J" depends on it, and [`tx_start`] needs that value.
+    pub order: super::tx::PinOrder,
 }
 
 /// Load all three programs into one PIO block.
@@ -67,11 +80,19 @@ pub struct Programs<'d, P: Instance> {
 /// relocated transmitter silently plays the wrong instructions. It is loaded
 /// first for that reason, and [`Programs::check_tx_offset`] verifies it rather
 /// than trusting the allocator.
-pub fn load<'d, P: Instance>(common: &mut Common<'d, P>) -> Programs<'d, P> {
-    let tx = common.load_program(&super::tx::program());
+pub fn load<'d, P: Instance>(
+    common: &mut Common<'d, P>,
+    order: super::tx::PinOrder,
+) -> Programs<'d, P> {
+    let tx = common.load_program(&super::tx::program(order));
     let edge = common.load_program(&super::rx::edge_detector());
     let decoder = common.load_program(&super::rx::nrzi_decoder());
-    Programs { tx, edge, decoder }
+    Programs {
+        tx,
+        edge,
+        decoder,
+        order,
+    }
 }
 
 impl<P: Instance> Programs<'_, P> {
@@ -91,8 +112,9 @@ impl<P: Instance> Programs<'_, P> {
 
 /// Configure the transmitter's state machine.
 ///
-/// `dp` and `dm` must be consecutive with D+ lower, since the side-set that
-/// drives the bus writes both at once from a two-bit field.
+/// `dp` and `dm` must be consecutive. They are handed to the side-set in
+/// **ascending pin order**, because side-set bit 0 is always the base pin —
+/// which is why the program itself has to know which line ended up lower.
 pub fn init_tx<'d, P: Instance, const SM: usize>(
     sm: &mut StateMachine<'d, P, SM>,
     prg: &LoadedProgram<'d, P>,
@@ -102,8 +124,9 @@ pub fn init_tx<'d, P: Instance, const SM: usize>(
     let mut cfg = Config::default();
     // Side-set drives the line states; `set pindirs` releases them for the
     // bus turnaround. Both need the pair, D+ first.
-    cfg.use_program(prg, &[dp, dm]);
-    cfg.set_set_pins(&[dp, dm]);
+    let (lo, hi) = if dp.pin() < dm.pin() { (dp, dm) } else { (dm, dp) };
+    cfg.use_program(prg, &[lo, hi]);
+    cfg.set_set_pins(&[lo, hi]);
     // The symbol stream is packed four to a byte, most significant pair first,
     // and `out pc, 2` consumes it two bits at a time.
     cfg.shift_out = ShiftConfig {
@@ -226,12 +249,15 @@ pub fn preload_decoder_osr<'d, P: Instance, const SM: usize>(sm: &mut StateMachi
 }
 
 
-/// Side-set field for an idle-J bus, positioned for a two-bit side-set.
+/// Position an idle-J side-set value into an instruction word.
 ///
-/// The RP2040/RP2350 side-set field occupies the top bits of the delay/side-set
-/// field, so a 2-bit value is shifted by `13 - 2`. This mirrors the SDK's
-/// `pio_encode_sideset(2, FJ_LK)` with `FJ_LK = 0b01` for a D+/D- pin order.
-const SIDESET_J: u16 = 0b01 << 11;
+/// The side-set field occupies the top bits of the delay/side-set field, so a
+/// 2-bit value is shifted by `13 - 2`. Mirrors the SDK's
+/// `pio_encode_sideset(2, FJ_LK)`, with the value itself coming from the pin
+/// order rather than being fixed.
+const fn sideset_j(order: super::tx::PinOrder) -> u16 {
+    (order.idle_j() as u16) << 11
+}
 
 /// Offset of `start:` in the TX program — the `set pindirs, 0b11` that turns
 /// the line drivers on. Not reachable through the symbol stream, whose values
@@ -259,8 +285,9 @@ const TX_RELEASE_OFFSET: u16 = 2;
 pub fn tx_start<'d, P: Instance, const SM: usize>(
     sm: &mut StateMachine<'d, P, SM>,
     prg: &LoadedProgram<'d, P>,
+    order: super::tx::PinOrder,
 ) {
-    let instr = SIDESET_J | (prg.origin as u16 + TX_START_OFFSET);
+    let instr = sideset_j(order) | (prg.origin as u16 + TX_START_OFFSET);
     // Injecting into a running state machine is exactly what this is for.
     unsafe { sm.exec_instr(instr) };
 }
@@ -269,8 +296,9 @@ pub fn tx_start<'d, P: Instance, const SM: usize>(
 pub fn tx_release<'d, P: Instance, const SM: usize>(
     sm: &mut StateMachine<'d, P, SM>,
     prg: &LoadedProgram<'d, P>,
+    order: super::tx::PinOrder,
 ) {
-    let instr = SIDESET_J | (prg.origin as u16 + TX_RELEASE_OFFSET);
+    let instr = sideset_j(order) | (prg.origin as u16 + TX_RELEASE_OFFSET);
     unsafe { sm.exec_instr(instr) };
 }
 

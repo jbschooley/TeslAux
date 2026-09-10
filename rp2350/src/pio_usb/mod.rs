@@ -73,7 +73,7 @@ mod tests {
     /// needs one more instruction, something else has to give.
     #[test]
     fn the_three_programs_fit_one_pio_block() {
-        let tx = tx::program().code.len();
+        let tx = tx::program(tx::PinOrder::DmBelowDp).code.len();
         let edge = rx::edge_detector().code.len();
         let dec = rx::nrzi_decoder().code.len();
         assert!(
@@ -82,12 +82,29 @@ mod tests {
         );
     }
 
+    /// Both pin orders must assemble identically apart from their side-set
+    /// polarity, and J must be the two lines in opposite states — a side-set of
+    /// 0b00 or 0b11 would be SE0 or an illegal both-high, not an idle bus.
+    #[test]
+    fn both_pin_orders_are_the_same_program_with_opposite_polarity() {
+        use tx::PinOrder;
+        let a = tx::program(PinOrder::DpBelowDm);
+        let b = tx::program(PinOrder::DmBelowDp);
+        assert_eq!(a.code.len(), b.code.len());
+        assert_eq!(PinOrder::DpBelowDm.idle_j(), 0b01);
+        assert_eq!(PinOrder::DmBelowDp.idle_j(), 0b10);
+        for order in [PinOrder::DpBelowDm, PinOrder::DmBelowDp] {
+            let j = order.idle_j();
+            assert!(j == 0b01 || j == 0b10, "idle J must drive exactly one line");
+        }
+    }
+
     /// The TX symbol values are raw instruction addresses, so the transmitter
     /// must be loaded at offset 0 and must not grow past the four symbol slots
     /// plus its EOP entry point.
     #[test]
     fn tx_symbols_stay_within_the_program() {
-        let tx = tx::program().code.len();
+        let tx = tx::program(tx::PinOrder::DmBelowDp).code.len();
         for s in [
             tx::Symbol::Se0,
             tx::Symbol::K,
