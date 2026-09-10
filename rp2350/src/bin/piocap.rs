@@ -275,17 +275,8 @@ async fn main(_spawner: Spawner) {
 
         // Feed the whole packet without stopping to check anything. Blocking on
         // a full FIFO is fine here — the DMA is running independently.
-        let mut fed = 0usize;
-        while fed < sym_bytes {
-            let mut word = 0u32;
-            let mut count = 0;
-            while count < 4 && fed < sym_bytes {
-                word = (word << 8) | syms[fed] as u32;
-                fed += 1;
-                count += 1;
-            }
-            word <<= 8 * (4 - count);
-            while !tx_sm.tx().try_push(word) {}
+        for &byte in &syms[..sym_bytes] {
+            while !bus::try_push_symbol(&mut tx_sm, byte) {}
         }
 
         // 256 words at 6 MHz is ~42 us; a timeout only matters if the sampler

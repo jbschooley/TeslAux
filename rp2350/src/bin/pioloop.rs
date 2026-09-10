@@ -270,20 +270,8 @@ async fn main(_spawner: Spawner) {
             let mut fed = 0usize;
             let deadline = embassy_time::Instant::now() + embassy_time::Duration::from_millis(50);
             while embassy_time::Instant::now() < deadline {
-                if fed < sym_bytes {
-                    let mut word = 0u32;
-                    let mut count = 0;
-                    while count < 4 && fed < sym_bytes {
-                        word = (word << 8) | syms[fed] as u32;
-                        fed += 1;
-                        count += 1;
-                    }
-                    word <<= 8 * (4 - count);
-                    if !sm0.tx().try_push(word) {
-                        // The FIFO was full: this group has not been sent, so
-                        // do not count it as fed.
-                        fed -= count;
-                    }
+                if fed < sym_bytes && bus::try_push_symbol(&mut sm0, syms[fed]) {
+                    fed += 1;
                 }
                 while let Some(w) = sm2.rx().try_pull() {
                     if got < back.len() {

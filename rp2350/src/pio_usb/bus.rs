@@ -386,3 +386,31 @@ pub fn pin_registers(pin: u8) -> (u32, u32) {
     let gpio = pac::IO_BANK0.gpio(pin as usize);
     (gpio.ctrl().read().0, gpio.status().read().0)
 }
+
+/// Hand one symbol byte to the transmitter. Returns `false` if the FIFO is
+/// full, having written nothing.
+///
+/// **One byte per FIFO entry, in the top octet.** Both halves of that matter.
+///
+/// The state machine autopulls at a threshold of 8 with a left-shifting OSR, so
+/// it consumes exactly eight bits — four symbols — from each word it pulls and
+/// then refills, discarding whatever else that word held. Packing four bytes
+/// into a 32-bit push therefore transmits the first and silently drops the
+/// other three. The reference avoids this by DMAing bytes (`DMA_SIZE_8` in
+/// `configure_tx_channel`); doing it by hand needs the same discipline.
+///
+/// And a left-shifting OUT takes from bit 31 down, while the encoder packs the
+/// *first* symbol into the high bits of each byte, so the byte belongs at the
+/// top of the word rather than the bottom.
+///
+/// The failure is silent and looks like a hardware fault: the bus gets a few
+/// correct bit times, then the state machine runs dry and stalls at whichever
+/// `out pc, 2` it reached, holding that instruction's side-set — so the line
+/// sits in J or K for as long as the stall lasts. On a capture it reads as
+/// bursts of activity separated by implausibly long constant levels.
+pub fn try_push_symbol<'d, P: Instance, const SM: usize>(
+    sm: &mut StateMachine<'d, P, SM>,
+    byte: u8,
+) -> bool {
+    sm.tx().try_push((byte as u32) << 24)
+}
