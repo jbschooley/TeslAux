@@ -225,15 +225,6 @@ pub fn preload_decoder_osr<'d, P: Instance, const SM: usize>(sm: &mut StateMachi
     unsafe { sm.exec_instr(instr) };
 }
 
-/// Clear the EOP flag the edge detector raises at the end of a packet.
-///
-/// The program uses `irq wait`, which sets the flag and then blocks until
-/// something clears it. In the finished driver that is the interrupt handler
-/// acknowledging a completed packet; until then, anything driving the bus has
-/// to clear it by hand or the detector receives exactly one packet and stops.
-pub fn clear_eop_irq<P: Instance>(flags: &embassy_rp::pio::IrqFlags<'_, P>) {
-    flags.clear(super::rx::IRQ_RX_EOP as usize);
-}
 
 /// Side-set field for an idle-J bus, positioned for a two-bit side-set.
 ///
@@ -281,4 +272,75 @@ pub fn tx_release<'d, P: Instance, const SM: usize>(
 ) {
     let instr = SIDESET_J | (prg.origin as u16 + TX_RELEASE_OFFSET);
     unsafe { sm.exec_instr(instr) };
+}
+
+/// Offset of `start:` in the edge detector — the instruction that waits for the
+/// falling edge that begins a packet. Instruction 0 is the `irq wait` at EOP.
+const EDGE_START_OFFSET: u16 = 1;
+
+/// Reset the decoder so the next packet starts on a clean byte boundary.
+///
+/// **Must be called before every packet.** The decoder has no idea where a
+/// packet begins — it shifts whatever the edge detector triggers it to sample
+/// into an ISR that autopushes every eight bits. Left running across packets,
+/// those eight-bit groups land wherever they happen to, so the SYNC byte
+/// arrives split across two pushes and every byte after it is rotated. The
+/// symptom is a stream that contains recognisable fragments but matches nothing
+/// at offset 0.
+///
+/// Mirrors `pio_usb_bus_prepare_receive` (`pio_usb.c`): stop, clear the FIFO,
+/// restart the shift counters, jump back to the program start, and zero X — the
+/// previous-line-state reference, which is meaningless across a gap in the
+/// stream.
+pub fn prepare_decoder<'d, P: Instance, const SM: usize>(
+    sm: &mut StateMachine<'d, P, SM>,
+    prg: &LoadedProgram<'d, P>,
+) {
+    sm.set_enable(false);
+    sm.clear_fifos();
+    sm.restart();
+    let jmp_to_start = prg.origin as u16;
+    let set_x_zero = pio::pio_asm!("set x, 0").program.code[0];
+    // Stopped, so nothing can interleave with these.
+    unsafe {
+        sm.exec_instr(jmp_to_start);
+        sm.exec_instr(set_x_zero);
+    }
+    // `restart` clears the shift counters; put the all-ones OSR back rather
+    // than depend on it having survived.
+    preload_decoder_osr(sm);
+    sm.set_enable(true);
+}
+
+/// Return the edge detector to waiting for a start of packet.
+///
+/// Its instruction 0 is an `irq wait` that blocks until the EOP flag is
+/// acknowledged, so in the finished driver [`clear_rx_irqs`] is enough to
+/// release it. This is the blunter version, for a caller firing discrete
+/// packets that wants the detector in a known state regardless of where the
+/// last one left it.
+pub fn restart_edge_detector<'d, P: Instance, const SM: usize>(
+    sm: &mut StateMachine<'d, P, SM>,
+    prg: &LoadedProgram<'d, P>,
+) {
+    sm.set_enable(false);
+    sm.restart();
+    unsafe { sm.exec_instr(prg.origin as u16 + EDGE_START_OFFSET) };
+    sm.set_enable(true);
+}
+
+/// Clear every receive-side IRQ flag.
+///
+/// A stale `DECODER_TRIGGER` left over from the previous packet makes the
+/// decoder sample a bit that no edge detector asked for, which costs exactly
+/// one bit of alignment — enough to corrupt everything after it.
+pub fn clear_rx_irqs<P: Instance>(flags: &embassy_rp::pio::IrqFlags<'_, P>) {
+    for irq in [
+        super::rx::IRQ_RX_BS_ERR,
+        super::rx::IRQ_RX_EOP,
+        super::rx::IRQ_RX_START,
+        super::rx::DECODER_TRIGGER,
+    ] {
+        flags.clear(irq as usize);
+    }
 }

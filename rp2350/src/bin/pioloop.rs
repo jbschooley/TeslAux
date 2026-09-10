@@ -230,7 +230,12 @@ async fn main(_spawner: Spawner) {
                 buf.bytes()
             };
 
-            bus::clear_eop_irq(&irq_flags);
+            // Put the receiver in a known state: the decoder byte-aligned from
+            // this packet's first bit, the edge detector waiting for its start,
+            // and no stale trigger to consume a phantom bit.
+            bus::prepare_decoder(&mut sm2, &programs.decoder);
+            bus::restart_edge_detector(&mut sm1, &programs.edge);
+            bus::clear_rx_irqs(&irq_flags);
             back.fill(0);
             // Enable the line drivers. Without this the symbols clock out onto
             // pins that are still inputs and the bus never moves.
