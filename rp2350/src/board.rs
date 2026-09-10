@@ -51,30 +51,34 @@ mod sel {
 mod sel {
     /// Waveshare RP2350-PiZero. RP2350B, 16 MB flash, Pi Zero form factor.
     ///
-    /// D+ on gp6 and D- on gp7, each behind 22 Ohm, read from the RP2040-PiZero
-    /// schematic — the same board in the earlier silicon, and the closest
-    /// published source. Unconfirmed for the RP2350 variant until `pinscan`
-    /// says otherwise.
+    /// D+ on gp28 and D- on gp29, each behind 22 Ohm (R8/R9), from the board's
+    /// own schematic. Both are inside the first thirty GPIOs, so nothing here
+    /// actually needs the B part's extra pins — the feature is selected to
+    /// match the silicon rather than because the driver requires it.
     ///
-    /// # This port is wired as a host, not a device
+    /// # Whether it can be a device is unresolved
     ///
-    /// There is **no 1.5 kOhm resistor anywhere on that schematic**. A
-    /// full-speed device announces itself by pulling D+ up through 1.5 kOhm,
-    /// and with no such resistor no host will ever look at the data lines. The
-    /// CC pins carry 5.1 kOhm to VBUS, which is the source role — a host
-    /// advertising that it can supply power.
+    /// There is no 1.5 kOhm anywhere on the schematic, which is what a
+    /// full-speed device normally uses to announce itself on D+. But R22 is
+    /// fitted at **2.2 kOhm** with R23 unfitted beside it, between the data
+    /// lines and 3V3/GND, and 2.2 kOhm against a host's 15 kOhm pull-down still
+    /// gives 2.88 V — comfortably over the 2.0 V a host needs to see. So it
+    /// could be a device pull-up in an unusual value, or a pull-down, or on the
+    /// wrong line. The PDF does not say which, and reading pull-up orientation
+    /// off these schematics has been wrong twice already.
     ///
-    /// So "USB 1.1 Device or Host via PIO" describes what the PIO can do, not
-    /// how the board is fitted. Running this firmware against it unmodified
-    /// will reproduce exactly what the RP2350-USB-C does: a bus that never
-    /// moves, because nothing on the other end has been told there is anything
-    /// to talk to.
+    /// `pinscan` settles it in ten seconds: gp28 reading high against an
+    /// internal pull-down means a device pull-up is fitted and this board can
+    /// work. Nothing high means no host will ever look at the data lines,
+    /// whatever the documentation claims, and it needs a resistor first.
     ///
-    /// Making it a device needs a 1.5 kOhm from D+ to 3V3, and the CC
-    /// resistors moved from VBUS to ground.
-    pub const NAME_: &str = "RP2350-PiZero (host-wired; see board.rs)";
-    pub const DP_: u8 = 6;
-    pub const DM_: u8 = 7;
+    /// The CC pins carry 5.1 kOhm near VBUS, which is the source role, so a
+    /// USB-C host may ignore the port regardless — the same thing that made the
+    /// RP2350-USB-C invisible on a C-to-C cable while working through a USB-A
+    /// adapter.
+    pub const NAME_: &str = "RP2350-PiZero (pull-up unverified; run pinscan)";
+    pub const DP_: u8 = 28;
+    pub const DM_: u8 = 29;
     pub const LED_: u8 = 16;
     pub const CONFIRMED_: bool = false;
 }
@@ -112,7 +116,7 @@ macro_rules! usb_pins {
         }
         #[cfg(feature = "board-pizero")]
         {
-            ($p.PIN_6, $p.PIN_7)
+            ($p.PIN_28, $p.PIN_29)
         }
     }};
 }
