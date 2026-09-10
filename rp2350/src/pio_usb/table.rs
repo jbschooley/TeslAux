@@ -64,6 +64,13 @@ pub struct Slot {
     /// Set by the interrupt when a transfer completes, cleared by the
     /// application when it notices. What a waker is armed against.
     pub complete: bool,
+    /// Whether the host has selected this endpoint. An alternate setting that
+    /// is not current must not answer, or a device with a zero-bandwidth alt 0
+    /// would stream audio the host never asked for.
+    pub enabled: bool,
+    /// Whether the packet in `rx` arrived on a SETUP token rather than an OUT.
+    /// The control pipe needs to tell them apart, and the PID is gone by then.
+    pub was_setup: bool,
 }
 
 impl Default for Slot {
@@ -81,6 +88,8 @@ impl Slot {
             rx_len: 0,
             allocated: false,
             complete: false,
+            enabled: true,
+            was_setup: false,
         }
     }
 
@@ -213,8 +222,14 @@ impl<const N: usize> Table<N> {
     }
 
     /// The state the transaction engine asks about.
+    /// The state the transaction engine asks about.
+    ///
+    /// A disabled endpoint is invisible, exactly like an unallocated one. That
+    /// is what makes a zero-bandwidth alternate setting mean anything: the host
+    /// selects alt 0 to stop the stream, and an endpoint that kept answering
+    /// would keep streaming.
     pub fn state(&self, ep: u8, is_in: bool) -> Option<EpState> {
-        self.slot(ep, is_in).map(|s| s.state)
+        self.slot(ep, is_in).filter(|s| s.enabled).map(|s| s.state)
     }
 }
 
@@ -412,8 +427,9 @@ pub fn service<P: super::txn::Port, const N: usize>(
                 slot.sent(acked);
             }
         }
-        Outcome::Received { ep, len } => {
+        Outcome::Received { ep, len, setup } => {
             if let Some(slot) = table.slot_mut(ep, false) {
+                slot.was_setup = setup;
                 // A packet the application has not collected yet is dropped.
                 // For isochronous that is the correct outcome — a late frame is
                 // a lost frame — and for anything else the endpoint should have
@@ -547,7 +563,7 @@ mod service_tests {
             &mut t,
             &mut [0u8; 64],
         );
-        assert_eq!(out, Outcome::Received { ep: 2, len: 3 });
+        assert_eq!(out, Outcome::Received { ep: 2, len: 3, setup: false });
 
         let s = t.slot_mut(2, false).unwrap();
         assert!(!s.state.ready, "nowhere to put another until this is read");

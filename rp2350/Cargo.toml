@@ -53,6 +53,8 @@ embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executo
 embassy-time     = { version = "0.5" }
 embassy-futures  = { version = "0.1" }
 embassy-sync     = { version = "0.7" }
+embassy-usb-driver = { version = "0.2" }
+critical-section = { version = "1" }
 
 cortex-m    = { version = "0.7", features = ["inline-asm"] }
 cortex-m-rt = "0.7"

@@ -68,7 +68,10 @@ pub enum Outcome {
     Handshake(Pid),
     /// A data packet arrived and was accepted, with this many payload bytes
     /// now in the caller's buffer.
-    Received { ep: u8, len: usize },
+    ///
+    /// `setup` distinguishes a SETUP from an OUT. The control pipe has to tell
+    /// them apart and the PID is gone by the time it looks.
+    Received { ep: u8, len: usize, setup: bool },
     /// A data packet arrived and its CRC16 failed, so nothing was
     /// acknowledged. The host will retry; an isochronous host will not, and
     /// that is the trade.
@@ -267,6 +270,7 @@ impl Engine {
                 Outcome::Received {
                     ep: token.endpoint,
                     len,
+                    setup: token.pid == Pid::Setup,
                 }
             }
         }
@@ -588,7 +592,7 @@ mod tests {
         let mut buf = [0u8; 64];
         assert_eq!(
             engine().handle(&mut port, &h, one(EpType::Bulk, true), no_packet, &mut buf),
-            Outcome::Received { ep: 2, len: payload.len() }
+            Outcome::Received { ep: 2, len: payload.len(), setup: false }
         );
         assert_eq!(&buf[..payload.len()], &payload);
         assert_eq!(port.sent[0], h.get(Pid::Ack));
@@ -607,7 +611,7 @@ mod tests {
         let mut buf = [0u8; 64];
         assert_eq!(
             engine().handle(&mut port, &h, one(EpType::Isochronous, true), no_packet, &mut buf),
-            Outcome::Received { ep: 2, len: payload.len() }
+            Outcome::Received { ep: 2, len: payload.len(), setup: false }
         );
         assert!(port.sent.is_empty(), "isochronous acknowledges nothing");
     }
@@ -652,7 +656,7 @@ mod tests {
         };
         assert_eq!(
             engine().handle(&mut port, &h, halted, no_packet, &mut [0u8; 64]),
-            Outcome::Received { ep: 0, len: 8 }
+            Outcome::Received { ep: 0, len: 8, setup: true }
         );
         assert_eq!(port.sent[0], h.get(Pid::Ack), "that is how a halt is cleared");
     }
