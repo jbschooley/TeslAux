@@ -351,10 +351,7 @@ async fn main(_spawner: Spawner) {
             while port.tx_busy() {}
             embassy_time::block_for(embassy_time::Duration::from_micros(10));
 
-            let mut engine = Engine {
-                address: ADDR,
-                frame: 0,
-            };
+            let mut engine = Engine::at_address(ADDR);
             let ep_type = case.ep_type;
             let ready = case.ready;
             let mut rx_buf = [0u8; 64];
