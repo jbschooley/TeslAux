@@ -342,6 +342,12 @@ async fn main(_spawner: Spawner) {
 
         let mut last = (u32::MAX, 0, 0, 0, 0, 0);
         let mut last_quiet = false;
+        // A host sends a start of frame every millisecond, so the rate is a
+        // direct measure of how much of the bus we are actually hearing. The
+        // counters only ever showed a total, which looks healthy while ninety
+        // per cent of the traffic goes past unnoticed — and a SETUP lost that
+        // way leaves no trace at all, not even in `bad`.
+        let started = embassy_time::Instant::now();
         loop {
             let now = driver::stats::read();
             // Only speak when something changed: a quiet line is a useful
@@ -438,13 +444,19 @@ async fn main(_spawner: Spawner) {
                 line.clear();
                 let _ = write!(
                     line,
-                    "{:6} {:6} {:6} {:6} {:5} {:5} {:5}   bus {seen:04b} {}\r\n",
+                    "{:6} {:6} {:6} {:6} {:5} {:5} {:5}  {:5}/s  bus {seen:04b} {}\r\n",
                     now.0,
                     now.1,
                     now.2,
                     now.3,
                     now.4,
                     now.5,
+                    // Start-of-frames per second. About 1000 means we are
+                    // hearing the whole bus; anything far below means packets
+                    // are being missed rather than mis-decoded.
+                    (now.1 as u64 * 1000)
+                        .checked_div(started.elapsed().as_millis().max(1))
+                        .unwrap_or(0),
                     driver::address(),
                     if quiet { "STATIC" } else { "moving" }
                 );
