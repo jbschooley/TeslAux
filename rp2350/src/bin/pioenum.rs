@@ -324,52 +324,15 @@ async fn main(_spawner: Spawner) {
         let _ = write!(line, "start-of-packet interrupt armed\r\n");
         emit(&mut log_class, &line).await;
 
-        // Capture the first thing the host does, before settling into the
-        // counter loop. Retried until it lands on activity: the host resets in
-        // bursts, and a fixed window mostly catches idle.
+        // The capture lives in the reporting loop, not before it.
+        //
+        // The first version ran once at startup, found four hundred
+        // milliseconds of idle, and stopped — and the port was plugged in after
+        // that, so it missed the only thing worth seeing. An instrument that
+        // watches at the wrong moment is not an instrument.
         const CAP: usize = 4096; // ~680 us at 96 MHz
         let mut capture = [0u32; CAP];
-        let mut caught = false;
-        for _ in 0..600 {
-            cap_sm.set_enable(true);
-            let t = cap_sm
-                .rx()
-                .dma_pull(cap_dma.reborrow(), &mut capture, false);
-            let _ =
-                embassy_time::with_timeout(embassy_time::Duration::from_millis(50), t).await;
-            cap_sm.set_enable(false);
-            let idle = capture[0];
-            if capture.iter().any(|w| *w != idle) {
-                caught = true;
-                break;
-            }
-            Timer::after_millis(5).await;
-        }
-
-        line.clear();
-        if caught {
-            let idle = capture[0];
-            let first = capture.iter().position(|w| *w != idle).unwrap_or(0);
-            let from = first.saturating_sub(2);
-            let to = (from + 96).min(CAP);
-            let _ = write!(
-                line,
-                "\r\nwire w{from}..w{to} of {CAP} (idle {idle:08x})\r\n"
-            );
-            emit(&mut log_class, &line).await;
-            for chunk in capture[from..to].chunks(8) {
-                line.clear();
-                let _ = write!(line, "  ");
-                for w in chunk {
-                    let _ = write!(line, "{w:08x} ");
-                }
-                let _ = write!(line, "\r\n");
-                emit(&mut log_class, &line).await;
-            }
-        } else {
-            let _ = write!(line, "\r\nwire: nothing but idle in 600 windows\r\n");
-            emit(&mut log_class, &line).await;
-        }
+        let mut dumped = false;
 
         let mut last = (u32::MAX, 0, 0, 0, 0, 0);
         let mut last_quiet = false;
@@ -390,6 +353,42 @@ async fn main(_spawner: Spawner) {
             // belongs in `Bus::poll`; here it runs in the reporter, which is
             // the only thing guaranteed to keep ticking.
             driver::service_bus();
+
+            // One capture window per pass. Whenever the host does anything —
+            // whenever the port is plugged in — this is watching.
+            if !dumped {
+                cap_sm.set_enable(true);
+                let t = cap_sm
+                    .rx()
+                    .dma_pull(cap_dma.reborrow(), &mut capture, false);
+                let _ = embassy_time::with_timeout(
+                    embassy_time::Duration::from_millis(50),
+                    t,
+                )
+                .await;
+                cap_sm.set_enable(false);
+                let idle = capture[0];
+                if let Some(first) = capture.iter().position(|w| *w != idle) {
+                    dumped = true;
+                    let from = first.saturating_sub(2);
+                    let to = (from + 96).min(CAP);
+                    line.clear();
+                    let _ = write!(
+                        line,
+                        "\r\nwire w{from}..w{to} of {CAP} (idle {idle:08x})\r\n"
+                    );
+                    emit(&mut log_class, &line).await;
+                    for chunk in capture[from..to].chunks(8) {
+                        line.clear();
+                        let _ = write!(line, "  ");
+                        for w in chunk {
+                            let _ = write!(line, "{w:08x} ");
+                        }
+                        let _ = write!(line, "\r\n");
+                        emit(&mut log_class, &line).await;
+                    }
+                }
+            }
 
             // Sample in a tight loop rather than with awaits. A start of frame
             // is about a microsecond and arrives once a millisecond, so
