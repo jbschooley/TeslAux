@@ -255,14 +255,18 @@ pub fn preload_decoder_osr<'d, P: Instance, const SM: usize>(sm: &mut StateMachi
 /// 2-bit value is shifted by `13 - 2`. Mirrors the SDK's
 /// `pio_encode_sideset(2, FJ_LK)`, with the value itself coming from the pin
 /// order rather than being fixed.
-const fn sideset_j(order: super::tx::PinOrder) -> u16 {
+pub const fn sideset_j(order: super::tx::PinOrder) -> u16 {
     (order.idle_j() as u16) << 11
 }
 
 /// Offset of `start:` in the TX program — the `set pindirs, 0b11` that turns
 /// the line drivers on. Not reachable through the symbol stream, whose values
 /// only address 0..=3, so it can only be entered by injecting a jump.
-const TX_START_OFFSET: u16 = 4;
+///
+/// Public because [`super::hw`] injects the same instruction from an interrupt
+/// handler, and two independently maintained copies of this would disagree
+/// eventually — silently, as a bus that never moves.
+pub const TX_START_OFFSET: u16 = 4;
 
 /// Offset of the `set pindirs, 0b00` that releases the drivers.
 const TX_RELEASE_OFFSET: u16 = 2;

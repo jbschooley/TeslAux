@@ -1,0 +1,142 @@
+// SPDX-License-Identifier: MIT
+//! The hardware behind [`super::txn::Port`].
+//!
+//! Deliberately the thinnest thing that can work. Everything worth getting
+//! wrong lives in `txn` and `device`, where a host test can reach it; this
+//! moves bytes and starts DMAs and makes no decisions at all.
+//!
+//! # Why this talks to the PAC directly
+//!
+//! An interrupt handler cannot hold embassy's typed state-machine handles
+//! without a good deal of lifetime and `static` machinery, and it cannot use
+//! `dma_push` at all: that returns a `Transfer` whose `Drop` **aborts the
+//! channel**, so firing one and returning would cancel the packet on the way
+//! out. What is needed instead is fire-and-forget — arm the DMA, let the
+//! transfer finish on its own — and the register sequence for that is short
+//! and fixed.
+//!
+//! So this holds raw PAC handles and plain indices. It is `Copy`, `Send` and
+//! has no lifetimes, which is what makes it usable from a `static` in an
+//! interrupt handler.
+
+use embassy_rp::pac;
+
+use super::rx::IRQ_RX_EOP;
+use super::tx::PinOrder;
+use super::txn::Port;
+
+/// Which PIO block and state machines the USB port occupies.
+#[derive(Copy, Clone)]
+pub struct HwPort {
+    pio: pac::pio::Pio,
+    /// Index of the PIO block, 0..=2. Needed for the DMA data request, which
+    /// is `block * 8 + state machine`.
+    pio_no: u8,
+    tx_sm: usize,
+    rx_sm: usize,
+    /// DMA channel used to send packets.
+    dma: usize,
+    /// Instruction offset the transmitter was loaded at. Zero in practice —
+    /// its symbols are absolute addresses — but carried rather than assumed.
+    tx_origin: u16,
+    order: PinOrder,
+}
+
+impl HwPort {
+    /// `pio_no` is 0, 1 or 2 and must match `pio`; they are separate because
+    /// the PAC handle does not carry its own index and the DMA needs it.
+    pub const fn new(
+        pio: pac::pio::Pio,
+        pio_no: u8,
+        tx_sm: usize,
+        rx_sm: usize,
+        dma: usize,
+        tx_origin: u16,
+        order: PinOrder,
+    ) -> Self {
+        Self {
+            pio,
+            pio_no,
+            tx_sm,
+            rx_sm,
+            dma,
+            tx_origin,
+            order,
+        }
+    }
+
+    /// Take the bus, driving it to idle J.
+    ///
+    /// The transmitter's symbol values only address instructions 0..=3, so the
+    /// `set pindirs` at offset 4 is unreachable from the symbol stream and has
+    /// to be injected. Without it the packet clocks out onto pins that are
+    /// still inputs and the bus never moves — silently.
+    fn take_bus(&self) {
+        let instr = super::bus::sideset_j(self.order) | (self.tx_origin + super::bus::TX_START_OFFSET);
+        self.pio
+            .sm(self.tx_sm)
+            .instr()
+            .write(|w| w.set_instr(instr));
+    }
+
+    /// Arm the DMA and return without waiting.
+    ///
+    /// Fire-and-forget on purpose: this runs inside the bus turnaround window,
+    /// and the transfer has to outlive the call. `symbols` must therefore stay
+    /// valid until the packet has gone out, which is why endpoint buffers are
+    /// owned for the life of the driver rather than borrowed per transfer.
+    fn fire(&self, symbols: &[u32]) {
+        let ch = pac::DMA.ch(self.dma);
+        ch.read_addr().write_value(symbols.as_ptr() as u32);
+        ch.write_addr()
+            .write_value(self.pio.txf(self.tx_sm).as_ptr() as u32);
+        ch.trans_count().write(|w| w.set_count(symbols.len() as u32));
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        ch.ctrl_trig().write(|w| {
+            // One data request per FIFO slot, from this state machine's TX.
+            w.set_treq_sel(pac::dma::vals::TreqSel::from(
+                self.pio_no * 8 + self.tx_sm as u8,
+            ));
+            w.set_data_size(pac::dma::vals::DataSize::SIZE_WORD);
+            w.set_incr_read(true);
+            w.set_incr_write(false);
+            w.set_chain_to(self.dma as u8);
+            w.set_en(true);
+        });
+    }
+
+    /// Whether the previous transmission has finished.
+    ///
+    /// Only for callers that need to know the bus is free again; a transaction
+    /// does not wait for its own reply to drain.
+    pub fn tx_busy(&self) -> bool {
+        pac::DMA.ch(self.dma).ctrl_trig().read().busy()
+    }
+}
+
+impl Port for HwPort {
+    fn rx(&mut self) -> Option<u8> {
+        // One bit per state machine; set means that FIFO is empty.
+        if self.pio.fstat().read().rxempty() & (1 << self.rx_sm) != 0 {
+            return None;
+        }
+        // The decoder shifts right with an 8-bit threshold, so the byte
+        // arrives in the top octet.
+        Some((self.pio.rxf(self.rx_sm).read() >> 24) as u8)
+    }
+
+    fn eop(&self) -> bool {
+        self.pio.irq().read().irq() & (1 << IRQ_RX_EOP) != 0
+    }
+
+    fn transmit(&mut self, symbols: &[u32]) {
+        self.take_bus();
+        self.fire(symbols);
+    }
+}
+
+// The raw PAC handle is a bare pointer, so this is not automatically `Send`.
+// It is safe to move between contexts for the same reason the PAC's own
+// handles are: it names a fixed peripheral, and every access here is a single
+// volatile register operation.
+unsafe impl Send for HwPort {}

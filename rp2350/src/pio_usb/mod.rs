@@ -52,6 +52,9 @@ pub mod bus;
 pub mod codec;
 pub mod device;
 pub mod endpoint;
+// Talks to the PAC rather than embassy's typed handles, so it is target-only.
+#[cfg(target_os = "none")]
+pub mod hw;
 pub mod packet;
 pub mod rx;
 pub mod tx;
