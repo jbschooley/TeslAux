@@ -56,31 +56,28 @@ mod sel {
     /// actually needs the B part's extra pins — the feature is selected to
     /// match the silicon rather than because the driver requires it.
     ///
-    /// # Whether it can be a device is unresolved
+    /// # It is a device, and the pull-up is 2.2 kOhm
     ///
-    /// There is no 1.5 kOhm anywhere on the schematic, which is what a
-    /// full-speed device normally uses to announce itself on D+. But R22 is
-    /// fitted at **2.2 kOhm** with R23 unfitted beside it, between the data
-    /// lines and 3V3/GND, and 2.2 kOhm against a host's 15 kOhm pull-down still
-    /// gives 2.88 V — comfortably over the 2.0 V a host needs to see. So it
-    /// could be a device pull-up in an unusual value, or a pull-down, or on the
-    /// wrong line. The PDF does not say which, and reading pull-up orientation
-    /// off these schematics has been wrong twice already.
+    /// `pinscan` settled what the schematic could not: with internal
+    /// pull-downs applied, **gp28 reads high** and nothing else nearby does.
+    /// That is R22, fitted at 2.2 kOhm rather than the usual 1.5 kOhm, and it
+    /// makes this a full-speed device — against a host's 15 kOhm pull-down it
+    /// holds D+ at about 2.9 V, comfortably over the 2.0 V a host needs to see.
     ///
-    /// `pinscan` settles it in ten seconds: gp28 reading high against an
-    /// internal pull-down means a device pull-up is fitted and this board can
-    /// work. Nothing high means no host will ever look at the data lines,
-    /// whatever the documentation claims, and it needs a resistor first.
+    /// Note D+ has the *lower* GPIO here, the opposite of the RP2350-USB-C.
+    /// [`pin_order`] derives the transmitter's side-set polarity from that
+    /// rather than taking it as configuration, because getting it backwards
+    /// inverts the bus.
     ///
-    /// The CC pins carry 5.1 kOhm near VBUS, which is the source role, so a
-    /// USB-C host may ignore the port regardless — the same thing that made the
-    /// RP2350-USB-C invisible on a C-to-C cable while working through a USB-A
-    /// adapter.
-    pub const NAME_: &str = "RP2350-PiZero (pull-up unverified; run pinscan)";
+    /// The CC pins still carry 5.1 kOhm near VBUS, the source role, so a USB-C
+    /// host may ignore the port regardless of the pull-up. That is what made
+    /// the RP2350-USB-C invisible on a C-to-C cable while working through a
+    /// USB-A adapter, so try the adapter first.
+    pub const NAME_: &str = "RP2350-PiZero";
     pub const DP_: u8 = 28;
     pub const DM_: u8 = 29;
     pub const LED_: u8 = 16;
-    pub const CONFIRMED_: bool = false;
+    pub const CONFIRMED_: bool = true;
 }
 
 use sel::*;
