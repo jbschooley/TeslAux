@@ -161,21 +161,17 @@ impl Port for HwPort {
     }
 
     fn realign_decoder(&mut self) {
-        // Exactly the reference's restart_usb_receiver: set x, 0 (NRZI
-        // previous-state), restart the shift counters so the next bit begins a
-        // fresh byte, clear the receive flags. Nothing else.
-        //
-        // In particular it does NOT reload the OSR. `in osr, 1` reads the OSR
-        // without consuming it, so the all-ones value set at init survives — and
-        // forcing a `mov osr` here executes an out-of-sequence instruction right
-        // as the data packet begins, which was leaving the decoder one bit off:
-        // every bad packet read 01 (0x80 >> 7) where a SYNC belonged.
+        // set x, 0 (NRZI previous-state), restart the shift counters, reload the
+        // all-ones OSR, clear the flags. The OSR reload is required, not
+        // optional: without it `in osr, 1` shifts zeros and the data reads as
+        // 00 00 00 .. garbage. It cannot fully fix alignment on its own — the
+        // remaining error is timing jitter in when this runs relative to the
+        // data packet, which a shared-core interrupt cannot make deterministic.
         let ctrl_bit = 1u8 << self.rx_sm;
-        self.pio
-            .sm(self.rx_sm)
-            .instr()
-            .write(|w| w.set_instr(SET_X_ZERO));
+        let sm = self.pio.sm(self.rx_sm);
+        sm.instr().write(|w| w.set_instr(SET_X_ZERO));
         self.pio.ctrl().modify(|w| w.set_sm_restart(ctrl_bit));
+        sm.instr().write(|w| w.set_instr(MOV_OSR_NOT_NULL));
         self.pio.irq().write(|w| w.set_irq(0xf << 1));
     }
 
