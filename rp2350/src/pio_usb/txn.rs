@@ -384,7 +384,14 @@ impl Engine {
                 // of packet outright. This is the difference between the `01`
                 // (near-byte) misalignment of an un-realigned read and a clean
                 // one.
-                port.realign_decoder();
+                // No realign. The token just decoded cleanly with the decoder
+                // running continuously, and a token is a whole number of bytes,
+                // so the decoder is still byte-aligned as the data begins. The
+                // realign that used to sit here reset the decoder mid-gap and
+                // was itself the thing that mangled the data's alignment — with
+                // it gone the data stays on the same boundary the token was on.
+                // Only the token's stale EOP flag has to be cleared so the data
+                // reader does not stop on it.
                 port.clear_eop();
                 let n = match Self::receive(port, rx_buf) {
                     Some(n) => n,
