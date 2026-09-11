@@ -64,6 +64,12 @@ stub-irq = []
 name = "pinscan"
 path = "src/bin/pinscan.rs"
 
+# Reproduces the token-then-data alignment problem in loopback: two packets
+# back to back, decoder read straight through with no realign. See piopair.rs.
+[[bin]]
+name = "piopair"
+path = "src/bin/piopair.rs"
+
 [dependencies]
 pio      = "0.3"
 pio-proc = "0.3"
