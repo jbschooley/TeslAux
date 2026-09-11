@@ -142,6 +142,28 @@ whether `setup` climbs off zero and `addr` becomes non-zero. The bench harness
 `piopair` still reproduces the underlying decoder-boundary behaviour for
 developing the single-core Option 1 later.
 
+## Where the SETUP data stands (control-transfer debugging)
+
+Core 1 made the receive deterministic, and the token instrumentation then
+pinned the remaining fault precisely:
+
+* The SETUP **token** decodes perfectly, every time — `80 2d 00 10`, and the
+  count climbs. The host is enumerating us and the receive path is sound.
+* The SETUP **data** stage never reads cleanly. Its packet rides ~167 ns behind
+  the token's EOP, and that gap is too short for the edge detector to lock a
+  clean start of packet, so the data's SYNC decodes as `01` instead of `80`
+  every time. The realign before the read is needed just to get the decoder
+  emitting the data at all (without it the read times out at zero bytes), but
+  it cannot cure the mangled SYNC.
+
+This is the same back-to-back boundary problem `piopair` reproduces on the
+bench, now shown to be exactly what blocks enumeration: not the token, not the
+timing jitter (core 1 removed that), but a data packet's SYNC decoded wrong
+because it immediately follows another packet. The fix is at the receiver level
+— the merged single-SM self-aligning receiver (Option 1), which detects each
+packet's SYNC in hardware and so does not depend on a clean inter-packet gap.
+`piopair` is the harness to build and verify it against.
+
 ## What is still untested
 
 * **Clock recovery**, as above. The first real test is plugging the PIO port

@@ -384,14 +384,14 @@ impl Engine {
                 // of packet outright. This is the difference between the `01`
                 // (near-byte) misalignment of an un-realigned read and a clean
                 // one.
-                // No realign. The token just decoded cleanly with the decoder
-                // running continuously, and a token is a whole number of bytes,
-                // so the decoder is still byte-aligned as the data begins. The
-                // realign that used to sit here reset the decoder mid-gap and
-                // was itself the thing that mangled the data's alignment — with
-                // it gone the data stays on the same boundary the token was on.
-                // Only the token's stale EOP flag has to be cleared so the data
-                // reader does not stop on it.
+                // The realign is required to get the decoder emitting the data
+                // to this inline reader at all — without it the read times out
+                // with zero bytes. It does not fix alignment, though: the data
+                // packet rides ~167 ns behind the token's EOP, too close for a
+                // clean start-of-packet, so its SYNC decodes as 01 rather than
+                // 80 every time. That is the back-to-back boundary problem the
+                // `piopair` harness isolates, surfacing here as the SETUP data.
+                port.realign_decoder();
                 port.clear_eop();
                 let n = match Self::receive(port, rx_buf) {
                     Some(n) => n,
@@ -433,23 +433,13 @@ impl Engine {
     /// Read a data packet's body — everything after its PID, including the two
     /// CRC bytes — until the receiver reports the end of the packet.
     fn receive<P: Port>(port: &mut P, buf: &mut [u8]) -> Option<usize> {
-        // Find the data packet's SYNC, then skip it and the PID.
-        //
-        // Scanning rather than assuming the first byte is the SYNC, because the
-        // realign that precedes a data read leaves the decoder one bit early and
-        // emits a stray byte before the real SYNC — 01 where 80 belongs, seen
-        // consistently on hardware. The SYNC is the packet delimiter, so
-        // skipping to it discards that stray byte and any gap bits with it. A
-        // data byte that happens to be 0x80 cannot be mistaken for it: the scan
-        // only runs at the head, before the packet, and stops at the first SYNC.
-        let mut scan = 0;
-        loop {
-            match Self::byte(port) {
-                Some(super::packet::SYNC) => break,
-                Some(_) if scan < 4 => scan += 1,
-                _ => return None,
-            }
-        }
+        // Skip the data packet's own SYNC and PID. Scanning to a real 0x80
+        // SYNC was tried and does not work here: a data packet riding right
+        // behind the token has its SYNC decoded as 01, not 80, so there is no
+        // 0x80 to find and the scan times out. Blind skip at least reads the
+        // (misaligned) data so its shape can be seen while the boundary
+        // problem is the real fix.
+        let _sync = Self::byte(port)?;
         let _pid = Self::byte(port)?;
 
         let mut n = 0;
