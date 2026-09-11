@@ -99,6 +99,32 @@ fail visibly — it produced plausible-looking output with samples that were two
 fragments either side of a dropped run. If you ever see a sample that is neither
 J, K nor SE0, the capture is broken, not the bus.
 
+## `PIOPAIR` — can the decoder cross a packet boundary?
+
+Transmits two packets back to back in one DMA — packet A, an EOP, a short idle,
+packet B — and reads the decoder straight through with no realign between them.
+It reproduces, deterministically and without a host, the token-then-data
+boundary that a SETUP transaction depends on.
+
+The result as of this writing: packet A decodes perfectly (80 c3 11 22 72 06),
+packet B does not (0f 5c 52 — no SYNC, truncated). So the decoder cannot hold
+byte alignment across a boundary while the edge detector's EOP is non-blocking.
+
+That is the crux of the whole enumeration effort, and the trade behind it:
+
+* A **blocking** EOP (`irq wait 2`, the reference's choice) halts the detector
+  at end of packet and freezes the decoder on a clean boundary — alignment is
+  perfect — but the detector then needs a CPU re-arm before the next packet,
+  within ~167 ns for a SETUP's data stage, which a shared core cannot hit.
+* A **non-blocking** EOP lets the detector free-run — throughput is fine — but
+  the bits it shifts through the EOP and gap move the decoder's byte boundary,
+  so every packet after the first misaligns.
+
+Breaking that trade is Option B: a decoder that re-aligns itself to each
+packet's SYNC in hardware, so non-blocking EOP becomes safe. Then the receiver
+is single-core, low-latency, and needs no bit-timed CPU re-arm. Develop it
+against this harness — one flash per iteration, deterministic — not the car.
+
 ## What is still untested
 
 * **Clock recovery**, as above. The first real test is plugging the PIO port
