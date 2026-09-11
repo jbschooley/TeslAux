@@ -41,6 +41,7 @@ use embassy_usb::Builder;
 use teslamic_rp2350::board;
 use teslamic_rp2350::pio_usb::{
     bus,
+    codec::SymbolBuf,
     packet::{build_data, Pid},
     tx::Symbol,
 };
@@ -101,45 +102,25 @@ async fn emit<'d>(c: &mut CdcAcmClass<'d, UsbDriver<'d, USB>>, l: &Line) {
 ///
 /// Mirrors `codec::encode`'s bit rule exactly; kept separate so the EOP between
 /// the two packets can be controlled by hand.
-fn nrzi(data: &[u8], out: &mut SymVec) {
+fn nrzi(data: &[u8], out: &mut SymbolBuf) {
     let mut k = true;
     let mut ones = 0u8;
     for &byte in data {
         for b in 0..8 {
             if byte & (1 << b) != 0 {
-                out.push(if k { Symbol::K } else { Symbol::J });
+                let _ = out.push(if k { Symbol::K } else { Symbol::J });
                 ones += 1;
             } else {
                 k = !k;
-                out.push(if k { Symbol::K } else { Symbol::J });
+                let _ = out.push(if k { Symbol::K } else { Symbol::J });
                 ones = 0;
             }
             if ones == 6 {
                 k = !k;
-                out.push(if k { Symbol::K } else { Symbol::J });
+                let _ = out.push(if k { Symbol::K } else { Symbol::J });
                 ones = 0;
             }
         }
-    }
-}
-
-/// A tiny fixed-capacity symbol vector, packed four to a word for the DMA.
-struct SymVec {
-    words: [u32; 512],
-    n: usize,
-}
-impl SymVec {
-    fn new() -> Self {
-        Self { words: [0; 512], n: 0 }
-    }
-    fn push(&mut self, s: Symbol) {
-        if self.n < self.words.len() {
-            self.words[self.n] = (s as u32) << 24;
-            self.n += 1;
-        }
-    }
-    fn words(&self) -> &[u32] {
-        &self.words[..self.n]
     }
 }
 
@@ -200,21 +181,28 @@ async fn main(_spawner: Spawner) {
         let nb = build_data(Pid::Data1, &[0xAA, 0xBB, 0xCC, 0xDD], &mut raw_b).unwrap();
 
         // Stitch: packet A bits, SE0 EOP, a couple of idle J, packet B bits,
-        // SE0 EOP, release, pad to a word boundary.
-        let mut v = SymVec::new();
-        nrzi(&raw_a[..na], &mut v);
-        v.push(Symbol::Se0);
-        v.push(Symbol::Se0);
-        v.push(Symbol::J);
-        v.push(Symbol::J);
-        let boundary = v.n; // where packet B begins, for reference
-        nrzi(&raw_b[..nb], &mut v);
-        v.push(Symbol::Se0);
-        v.push(Symbol::Se0);
-        v.push(Symbol::Release);
-        while v.n % 4 != 0 {
-            v.push(Symbol::K);
+        // SE0 EOP, release, pad to a word boundary. Symbols are packed four to
+        // a byte by SymbolBuf, exactly as the transmitter's autopull expects —
+        // one symbol per word was the mistake that drove a static bus.
+        let mut packed = [0u8; 256];
+        let mut buf = SymbolBuf::new(&mut packed);
+        nrzi(&raw_a[..na], &mut buf);
+        buf.push(Symbol::Se0);
+        buf.push(Symbol::Se0);
+        buf.push(Symbol::J);
+        buf.push(Symbol::J);
+        let boundary = buf.len(); // symbol index where packet B begins
+        nrzi(&raw_b[..nb], &mut buf);
+        buf.push(Symbol::Se0);
+        buf.push(Symbol::Se0);
+        buf.push(Symbol::Release);
+        while buf.len() % 4 != 0 {
+            buf.push(Symbol::K);
         }
+        let sym_bytes = buf.bytes();
+        let mut words = [0u32; 256];
+        bus::expand_symbols(&packed[..sym_bytes], &mut words).unwrap();
+        let words = &words[..sym_bytes];
 
         line.clear();
         let _ = write!(
@@ -236,7 +224,7 @@ async fn main(_spawner: Spawner) {
         let mut got = [0u8; 64];
         let mut n = 0usize;
         bus::tx_start(&mut sm0, &programs.tx, order);
-        let feed = bus::dma_symbols(&mut sm0, p.DMA_CH0, v.words());
+        let feed = bus::dma_symbols(&mut sm0, p.DMA_CH0, words);
         let deadline = embassy_time::Instant::now() + embassy_time::Duration::from_millis(20);
         while embassy_time::Instant::now() < deadline {
             while let Some(w) = sm2.rx().try_pull() {
