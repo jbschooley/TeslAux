@@ -161,24 +161,64 @@ impl Port for HwPort {
     }
 
     fn realign_decoder(&mut self) {
-        // set x, 0 (NRZI previous-state), restart the shift counters, reload the
-        // all-ones OSR, clear the flags. The OSR reload is required, not
-        // optional: without it `in osr, 1` shifts zeros and the data reads as
-        // 00 00 00 .. garbage. It cannot fully fix alignment on its own — the
-        // remaining error is timing jitter in when this runs relative to the
-        // data packet, which a shared-core interrupt cannot make deterministic.
-        let ctrl_bit = 1u8 << self.rx_sm;
-        let sm = self.pio.sm(self.rx_sm);
-        sm.instr().write(|w| w.set_instr(SET_X_ZERO));
-        self.pio.ctrl().modify(|w| w.set_sm_restart(ctrl_bit));
-        sm.instr().write(|w| w.set_instr(MOV_OSR_NOT_NULL));
-        self.pio.irq().write(|w| w.set_irq(0xf << 1));
+        // Reset the decoder in full for the packet that immediately follows a
+        // token — the SETUP/OUT data stage — leaving the edge detector alone so
+        // it stays locked on the incoming data's start of packet. This mirrors
+        // the reference's `pio_usb_bus_prepare_receive`, which restarts only the
+        // decoder state machine and then reads.
+        //
+        // The earlier version of this did `set x, 0` + `sm_restart` + reload
+        // OSR and nothing else. That is not enough: `sm_restart` leaves the
+        // program counter wherever it was, so the decoder resumed mid-loop with
+        // the wrong bit-stuffing phase and produced fixed garbage (02 87 01 0a
+        // ..) for every data packet. It also left the FIFO holding the token's
+        // trailing bytes. A full reset — jump the PC back to the decoder's
+        // start, zero X, reload the all-ones OSR, and clear the FIFO — is what
+        // makes the data stage decode.
+        self.reset_decoder_sm();
+        // Clear the token's end-of-packet flag so the data reader does not stop
+        // on it before a byte arrives.
+        self.pio.irq().write(|w| w.set_irq(1 << IRQ_RX_EOP));
     }
 
 }
 
 impl HwPort {
-    /// Revive the receiver after a packet: realign the decoder and put the edge
+    /// Reset the NRZI decoder state machine to a clean packet start, leaving the
+    /// edge detector running.
+    ///
+    /// Stop it, clear the FIFO, restart the clock and shift counters, jump the
+    /// program counter back to the decoder's `start`, zero X (the NRZI
+    /// previous-line-state), reload the all-ones OSR the decoder shifts a 1 out
+    /// of, then re-enable. Every step matters: without the FIFO clear the token's
+    /// trailing bytes are read as data; without the jump the decoder resumes
+    /// mid-loop on the wrong bit-stuffing phase; without the OSR reload `in osr,
+    /// 1` shifts zeros and the payload reads as 00 00 ...
+    fn reset_decoder_sm(&self) {
+        let sm = self.pio.sm(self.rx_sm);
+        let ctrl_bit = 1u8 << self.rx_sm;
+        self.pio
+            .ctrl()
+            .modify(|w| w.set_sm_enable(w.sm_enable() & !ctrl_bit));
+
+        // The SDK's `pio_sm_clear_fifos` is a join-state toggle: changing FJOIN
+        // discards whatever is queued, and toggling it back restores the
+        // configuration. `sm_restart` alone resets the shift counters but leaves
+        // the FIFO contents alone.
+        for _ in 0..2 {
+            sm.shiftctrl().modify(|w| w.set_fjoin_rx(!w.fjoin_rx()));
+        }
+        self.pio.ctrl().modify(|w| w.set_clkdiv_restart(ctrl_bit));
+        self.pio.ctrl().modify(|w| w.set_sm_restart(ctrl_bit));
+        for instr in [self.dec_origin, SET_X_ZERO, MOV_OSR_NOT_NULL] {
+            sm.instr().write(|w| w.set_instr(instr));
+        }
+        self.pio
+            .ctrl()
+            .modify(|w| w.set_sm_enable(w.sm_enable() | ctrl_bit));
+    }
+
+    /// Revive the receiver after a packet: reset the decoder and put the edge
     /// detector back to waiting for a start of packet.
     ///
     /// Callable from the EOP interrupt as well as the transaction path, because
@@ -186,40 +226,7 @@ impl HwPort {
     /// clear it promptly — the bottleneck the stub handler exposed was this
     /// running only at transaction or report-loop rate.
     pub fn do_reset(&mut self) {
-        // Mirrors `bus::prepare_decoder` and `bus::restart_edge_detector`, in
-        // registers rather than embassy's typed handles: stop, clear the FIFO,
-        // restart the shift counters, jump to the start, zero X, reload the
-        // all-ones OSR, restart the detector, clear the receive IRQ flags.
-        let sm = self.pio.sm(self.rx_sm);
-        let ctrl_bit = 1u8 << self.rx_sm;
-        self.pio
-            .ctrl()
-            .modify(|w| w.set_sm_enable(w.sm_enable() & !ctrl_bit));
-
-        // Actually clear the FIFO. `sm_restart` resets the shift counters and
-        // leaves the FIFO contents alone, so until this was here the comment
-        // above described a step the code did not take — the one difference
-        // between this path and the embassy-typed one the loopback passed on.
-        // The SDK's `pio_sm_clear_fifos` is a join-state toggle: changing
-        // FJOIN discards whatever is queued, and toggling it back restores the
-        // configuration.
-        for _ in 0..2 {
-            sm.shiftctrl().modify(|w| w.set_fjoin_rx(!w.fjoin_rx()));
-        }
-        self.pio
-            .ctrl()
-            .modify(|w| w.set_clkdiv_restart(ctrl_bit));
-        self.pio.ctrl().modify(|w| w.set_sm_restart(ctrl_bit));
-        for instr in [
-            self.dec_origin,
-            SET_X_ZERO,
-            MOV_OSR_NOT_NULL,
-        ] {
-            sm.instr().write(|w| w.set_instr(instr));
-        }
-        self.pio
-            .ctrl()
-            .modify(|w| w.set_sm_enable(w.sm_enable() | ctrl_bit));
+        self.reset_decoder_sm();
 
         // And the edge detector, which clearing the flag alone does not put
         // right. Releasing it from `irq wait` resumes it wherever it happened

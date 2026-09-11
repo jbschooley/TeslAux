@@ -193,14 +193,6 @@ pub enum DataEnd {
 /// safe is not the same as one long enough to be harmless.
 const BYTE_SPINS: u32 = 128;
 
-/// Spins without progress before abandoning a packet mid-flight.
-///
-/// Bounded by inactivity rather than by total time, because a 192-byte packet
-/// legitimately takes 128 µs and a fixed budget would either cut it short or be
-/// far too generous for a bus that has simply gone quiet. The counter resets on
-/// every byte, so this is "nothing for about 17 µs", the same as above.
-const IDLE_SPINS: u32 = 128;
-
 /// Device-wide state a transaction needs.
 pub struct Engine {
     /// The address this device answers to. Zero until SET_ADDRESS, which is
