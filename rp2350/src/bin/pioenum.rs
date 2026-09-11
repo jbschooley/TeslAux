@@ -39,7 +39,7 @@ use core::fmt::Write as _;
 use embassy_executor::Spawner;
 
 use embassy_rp::bind_interrupts;
-use embassy_rp::interrupt::typelevel::{Handler, Interrupt};
+use embassy_rp::multicore::{spawn_core1, Stack};
 use embassy_rp::peripherals::{PIO0, PIO1, PIO2, USB};
 use embassy_rp::pio::{
     Config as PioConfig, FifoJoin, InterruptHandler as PioInterruptHandler, Pio, ShiftConfig,
@@ -57,7 +57,6 @@ use teslamic_rp2350::pio_usb::{
     bus,
     driver::{self, PioUsb},
     hw::HwPort,
-    rx::IRQ_RX_START,
 };
 
 #[path = "../../../rp2040/src/ws2812.rs"]
@@ -70,33 +69,8 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
     teslamic_rp2350::panic_led::strobe()
 }
 
-/// Services a start of packet.
-///
-/// On its own vector, not the one embassy's PIO futures use: the transaction
-/// engine must run the moment a packet begins, and sharing a handler with the
-/// executor's own PIO bookkeeping would put a scheduler between the token and
-/// the reply.
-struct StartOfPacket;
-
-impl Handler<embassy_rp::interrupt::typelevel::PIO0_IRQ_1> for StartOfPacket {
-    unsafe fn on_interrupt() {
-        // Acknowledge first. The flag is set by a plain `irq` rather than an
-        // `irq wait`, so nothing is blocked on it — but leaving it set would
-        // re-enter this handler the instant it returns.
-        embassy_rp::pac::PIO0
-            .irq()
-            .write(|w| w.set_irq(1 << IRQ_RX_START));
-        driver::on_packet_start();
-    }
-}
-
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
-    // The vector has to be declared here, not merely implemented: this macro is
-    // what emits the `PIO0_IRQ_1` symbol the hardware jumps to. Implementing
-    // `Handler` alone leaves the handler installed nowhere, and the device is
-    // deaf while looking perfectly healthy.
-    PIO0_IRQ_1 => StartOfPacket;
     PIO1_IRQ_0 => PioInterruptHandler<PIO1>;
     PIO2_IRQ_0 => PioInterruptHandler<PIO2>;
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
@@ -149,6 +123,8 @@ async fn emit<'d>(class: &mut CdcAcmClass<'d, UsbDriver<'d, USB>>, line: &Line) 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let p = embassy_rp::init(bus::clock_config());
+    // Reserve the second core before p is picked apart by the setup below.
+    let core1 = p.CORE1;
 
     let Pio {
         common: mut led_common,
@@ -306,28 +282,19 @@ async fn main(_spawner: Spawner) {
         );
         emit(&mut log_class, &line).await;
 
-        // Only now route the start-of-packet flag to the CPU.
-        //
-        // Deliberately last. Servicing a transaction runs with interrupts
-        // disabled, so a fault in that path takes the diagnostics down with it
-        // — which is exactly what happened the first time this was run, and it
-        // left nothing to look at on either port. Arming it after the log is up
-        // and has printed means a board that goes quiet from here has told us
-        // where it went quiet.
-        //
-        // `sm3` is the enable for PIO IRQ flag 3, which is IRQ_RX_START. The
-        // register names them after the state machines that usually raise them;
-        // here it is the edge detector, and the flag number is what matters.
-        const _: () = assert!(IRQ_RX_START == 3, "the enable below names flag 3");
-        embassy_rp::pac::PIO0
-            .irqs(1)
-            .inte()
-            .modify(|w| w.set_sm3(true));
-        unsafe {
-            embassy_rp::interrupt::typelevel::PIO0_IRQ_1::enable();
-        }
+        // Hand the receiver to core 1 (Option 2). It polls the start-of-packet
+        // flag and runs each transaction with no preemption, so the token ->
+        // realign -> data timing is deterministic. STATE is already initialised
+        // (Driver::start ran when the device was built), and the PIO is running,
+        // so there is nothing for it to race.
+        // A 'static stack for core 1. static mut is the no-dependency way to get
+        // one; it is written once here and never again, and core 1 is the only
+        // user of it after the spawn.
+        static mut CORE1_STACK: Stack<4096> = Stack::new();
+        let stack = unsafe { &mut *core::ptr::addr_of_mut!(CORE1_STACK) };
+        spawn_core1(core1, stack, || driver::core1_receive());
         line.clear();
-        let _ = write!(line, "start-of-packet interrupt armed\r\n");
+        let _ = write!(line, "receiver running on core 1\r\n");
         emit(&mut log_class, &line).await;
 
         // The capture lives in the reporting loop, not before it.
@@ -360,11 +327,11 @@ async fn main(_spawner: Spawner) {
             // drives a reset (both low) and then start-of-frame traffic every
             // millisecond, so *any* movement here means it is talking.
             // Release the receiver if a bus reset has stopped it. Nothing in
-            // the packet path can do this: the detector is blocked precisely
-            // because no packet is being handled. In a finished driver this
-            // belongs in `Bus::poll`; here it runs in the reporter, which is
-            // the only thing guaranteed to keep ticking.
-            driver::service_bus();
+            // No service_bus() here any more: core 1 owns the receive path and
+            // re-arms it after every transaction. Calling reset_receiver from
+            // core 0 as well would be two cores driving the same state machines
+            // at once. The reporter only reads now — counters and the PC — and
+            // leaves the hardware to core 1.
 
             // One capture window per pass. Whenever the host does anything —
             // whenever the port is plugged in — this is watching.

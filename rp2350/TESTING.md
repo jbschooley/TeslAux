@@ -125,6 +125,23 @@ packet's SYNC in hardware, so non-blocking EOP becomes safe. Then the receiver
 is single-core, low-latency, and needs no bit-timed CPU re-arm. Develop it
 against this harness — one flash per iteration, deterministic — not the car.
 
+## Running the receiver on core 1 (Option 2)
+
+The timing-critical receive — token, realign, data, response — runs on core 1
+in `driver::core1_receive`, spawned by `pioenum` once the device is built. Core
+0 keeps the executor, the native USB and the async endpoint methods; the two
+share the endpoint table under a hardware-spinlock critical section, and wakes
+cross cores through atomic wakers.
+
+This is the reference's architecture and the answer to the SETUP-data timing:
+the token-to-realign-to-data path has no preemption on core 1, so it lands
+inside the ~167 ns window that a shared core could not hit. Whether it actually
+carries enumeration through is the current open test — flash the core-1
+`pioenum`, plug the PIO port into a host through a USB-A adapter, and watch
+whether `setup` climbs off zero and `addr` becomes non-zero. The bench harness
+`piopair` still reproduces the underlying decoder-boundary behaviour for
+developing the single-core Option 1 later.
+
 ## What is still untested
 
 * **Clock recovery**, as above. The first real test is plugging the PIO port

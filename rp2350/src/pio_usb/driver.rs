@@ -20,7 +20,49 @@
 //! here decides anything about USB — by the time any of it runs, the reply is
 //! already on the wire.
 //!
+//! # Where the receiver runs (Option 2)
+//!
+//! The timing-critical receive — token, decoder realign, data, response — runs
+//! on **core 1**, in [`core1_receive`], and nowhere else. This is the reference
+//! driver's architecture and it is here for the reason the reference chose it:
+//! a SETUP's data packet follows its token by ~167 ns, and the realign that
+//! aligns the decoder to the data has to land inside that window. On core 0 the
+//! sequence shares the core with the executor and the native USB interrupt, so
+//! the realign arrives at a jittering time relative to the fixed data deadline
+//! — which misaligned every SETUP and stalled enumeration. On core 1 there is
+//! nothing to preempt it, so the interval is fixed by the code and the wire.
+//!
+//! The split is: **core 1** polls the start-of-packet flag and runs each
+//! transaction, updating the endpoint [`Table`]; **core 0** runs everything
+//! else — the executor, the native USB, and the async `Driver`/`Endpoint`/
+//! `ControlPipe` methods that read and write those same endpoints. The two
+//! share [`STATE`] under a `critical_section`, which on the RP2350 is a
+//! hardware spinlock and so is safe across cores. Wakes cross cores too: an
+//! [`AtomicWaker`] woken on core 1 signals core 0's executor.
+//!
+//! `on_packet_start`, the old interrupt entry, still exists and still works;
+//! nothing calls it once core 1 is running. It stays as the single-core path
+//! for reference and for boards where core 1 is spoken for.
+//!
+//! # Why not one core
+//!
+//! Keeping the receiver on core 0 needs the decoder to re-align itself to each
+//! packet's SYNC in hardware, so no bit-timed CPU step is on the critical path.
+//! That is Option 1, and it founders on a PIO limit: a state machine has one
+//! `jmp pin` and cannot conditionally branch on an IRQ or a second pin, so the
+//! decoder cannot both branch on D+ to decode and branch on a reset signal to
+//! re-align. It would take merging the edge detector and decoder into one
+//! state machine that sees the whole packet including its EOP — a from-scratch
+//! receiver that has to fit 32 instructions and hold its timing. Worth
+//! revisiting; not the path taken here. Core 1 costs no latency (the cross-core
+//! audio buffer adds a memory write, not a buffering stage), so nothing is lost
+//! by it.
+//!
 //! # Status
+//!
+//! **The core-1 receive path has not yet been confirmed to fix enumeration on
+//! hardware.** It builds, the split is in place, and it is the next thing to
+//! test. Earlier single-core status below still holds for what has run.
 //!
 //! **None of this has run.** It is the largest piece of the port that no host
 //! test can reach and no single-board harness exercises: it only comes alive
@@ -186,31 +228,63 @@ const fn waker_index(ep: u8, is_in: bool) -> usize {
     ep as usize + if is_in { 0 } else { NUM_ENDPOINTS }
 }
 
+/// The dedicated receive loop, to run on core 1 and nowhere else.
+///
+/// This is Option 2, and the reason it exists is timing. A SETUP's data packet
+/// follows its token by ~167 ns; the receiver has to read the token, realign
+/// the decoder, and catch the data inside that window. On core 0 the sequence
+/// shares the core with the executor and the native USB interrupt, and the
+/// realign lands at a jittering time relative to the data — which misaligned
+/// every SETUP and stalled enumeration.
+///
+/// On core 1 there is nothing else. The loop polls the start-of-packet flag and
+/// runs the whole transaction with no preemption, so the interval from token to
+/// realign is fixed by the code path and the wire, not by whatever else wanted
+/// the core. That determinism is the entire point — it is the reference's
+/// architecture, which runs its receiver on core 1 for exactly this reason.
+///
+/// Never returns. `spawn_core1` requires that.
+pub fn core1_receive() -> ! {
+    loop {
+        // Poll the start-of-packet flag directly. No interrupt: an interrupt
+        // would hand control to core 1's vector table with its own latency, and
+        // the point is a tight, predictable path.
+        let raised = embassy_rp::pac::PIO0.irq().read().irq() & (1 << super::rx::IRQ_RX_START) != 0;
+        if raised {
+            // Acknowledge before servicing, so a packet that starts while we are
+            // still in `service` sets the flag again and is not lost.
+            embassy_rp::pac::PIO0
+                .irq()
+                .write(|w| w.set_irq(1 << super::rx::IRQ_RX_START));
+            service_one();
+        }
+    }
+}
+
 /// Service one transaction. Call from the `IRQ_RX_START` handler.
 ///
 /// Everything inside the critical section is bookkeeping; the packet the host
 /// asked for went out during [`service`], before any of this.
 pub fn on_packet_start() {
+    embassy_rp::pac::PIO0
+        .irq()
+        .write(|w| w.set_irq(1 << super::rx::IRQ_RX_START));
+    service_one();
+}
+
+/// The body of one transaction: decide, act, record, wake. Shared by the core-1
+/// loop and the (legacy) interrupt path.
+///
+/// The wake is done outside the critical section it takes, because a woken
+/// core-0 task may run immediately and will want the lock this holds — and the
+/// wake crosses cores, which is why it is an atomic waker rather than anything
+/// core-local.
+fn service_one() {
     stats::bump(&stats::IRQ_ENTRIES);
-
-    // Bisection probe. When enabled the handler does nothing but acknowledge
-    // the start-of-packet flag and return, running no transaction and no reset.
-    // If the entry count then climbs toward a thousand a second, the interrupt
-    // was being raised all along and the transaction path was the bottleneck.
-    // If it stays where it is, the flag is genuinely being raised that rarely,
-    // and the fault is upstream of the handler entirely. One flash answers
-    // which half to work on.
-    #[cfg(feature = "stub-irq")]
-    {
-        embassy_rp::pac::PIO0
-            .irq()
-            .write(|w| w.set_irq(1 << super::rx::IRQ_RX_START));
-        return;
-    }
-
-    #[allow(unreachable_code)]
     let woken = critical_section::with(|cs| {
         let mut guard = STATE.borrow_ref_mut(cs);
+        // Not started yet: core 1 may be polling before Driver::start has run.
+        // Nothing to do, and certainly nothing to panic about.
         let Some(inner) = guard.as_mut() else {
             return None;
         };
