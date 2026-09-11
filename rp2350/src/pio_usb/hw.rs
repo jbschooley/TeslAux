@@ -21,7 +21,14 @@
 
 use embassy_rp::pac;
 
-use super::rx::{IRQ_RX_EOP, MOV_OSR_NOT_NULL, SET_X_ZERO};
+use super::rx::{DECODER_TRIGGER, IRQ_RX_EOP, IRQ_RX_START, MOV_OSR_NOT_NULL, SET_X_ZERO};
+
+/// Spins waiting for the data packet's start of packet before reading it.
+///
+/// Interrupts are disabled here, so this is bounded small — a few microseconds,
+/// comfortably longer than the token-to-data gap. The loop body is a register
+/// read and a test, a handful of cycles, so this is roughly 5 µs at 96 MHz.
+const START_SPINS: u32 = 1024;
 
 /// Offset of `start:` in the edge detector: instruction 0 is the `irq wait`
 /// that ends a packet, so waiting for the next one begins at 1.
@@ -161,24 +168,71 @@ impl Port for HwPort {
     }
 
     fn realign_decoder(&mut self) {
-        // Reset the decoder in full for the packet that immediately follows a
-        // token — the SETUP/OUT data stage — leaving the edge detector alone so
-        // it stays locked on the incoming data's start of packet. This mirrors
-        // the reference's `pio_usb_bus_prepare_receive`, which restarts only the
-        // decoder state machine and then reads.
+        // Reset the decoder for the data packet that immediately follows a
+        // token, leaving the free-running edge detector locked on the incoming
+        // start of packet.
         //
-        // The earlier version of this did `set x, 0` + `sm_restart` + reload
-        // OSR and nothing else. That is not enough: `sm_restart` leaves the
-        // program counter wherever it was, so the decoder resumed mid-loop with
-        // the wrong bit-stuffing phase and produced fixed garbage (02 87 01 0a
-        // ..) for every data packet. It also left the FIFO holding the token's
-        // trailing bytes. A full reset — jump the PC back to the decoder's
-        // start, zero X, reload the all-ones OSR, and clear the FIFO — is what
-        // makes the data stage decode.
-        self.reset_decoder_sm();
-        // Clear the token's end-of-packet flag so the data reader does not stop
-        // on it before a byte arrives.
-        self.pio.irq().write(|w| w.set_irq(1 << IRQ_RX_EOP));
+        // The wire proved the data packet is clean and our clock recovery
+        // decodes it correctly — so this is purely about resetting the decoder's
+        // state (NRZI previous level, FIFO, byte boundary) cleanly and at the
+        // right time. Only the full disable/clear-FIFO/restart does that: an
+        // in-place reset while the state machine runs neither clears the FIFO
+        // (the token's trailing bytes leak into the data read) nor reliably
+        // resets the NRZI state, and the data decodes as continuous garbage.
+        //
+        // Clear the token's leftover end-of-packet AND decoder-trigger flags —
+        // but NOT the start-of-packet flag. The interrupt that got us here
+        // already cleared the token's start of packet on entry, so the next
+        // start flag to appear is the data packet's own, and
+        // [`Port::wait_rx_start`] must be left to see it.
+        //
+        // Clearing the decoder-trigger flag is what keeps the data packet from
+        // decoding one bit late. The edge detector raises it once per bit and
+        // the decoder consumes it with `wait 1 irq`; a trigger left set from the
+        // token makes the freshly-armed decoder's first wait return at once and
+        // decode a phantom bit before the real SYNC, shifting the whole packet
+        // by one (SYNC read as 81 rather than 80).
+        self.pio
+            .irq()
+            .write(|w| w.set_irq((1 << IRQ_RX_EOP) | (1 << DECODER_TRIGGER)));
+
+        // A fast disable/reset/enable. The forced `set x, 0` and `jmp` only take
+        // effect while the state machine is stopped — done in place, live, the
+        // decoder kept its stale NRZI previous-line-state and decoded the data's
+        // first bit wrong (SYNC read as 81 instead of 80, shifting the whole
+        // packet). So disable is required. But the full reset's FIFO clear (two
+        // read-modify-writes of the join state) made it ~1 µs, longer than the
+        // ~300-480 ns before the data packet's start of packet, so it re-armed
+        // partway through. Skip it: the FIFO is already empty (the token's four
+        // bytes were just read out), and the OSR stays all-ones on its own
+        // (`in osr, 1` reads it without consuming it). That leaves disable,
+        // `sm_restart`, forced `jmp` to the decoder start, `set x, 0`, enable —
+        // five register writes, short enough to finish inside the gap.
+        let ctrl_bit = 1u8 << self.rx_sm;
+        self.pio
+            .ctrl()
+            .modify(|w| w.set_sm_enable(w.sm_enable() & !ctrl_bit));
+        self.pio.ctrl().modify(|w| w.set_sm_restart(ctrl_bit));
+        let sm = self.pio.sm(self.rx_sm);
+        sm.instr().write(|w| w.set_instr(self.dec_origin));
+        sm.instr().write(|w| w.set_instr(SET_X_ZERO));
+        self.pio
+            .ctrl()
+            .modify(|w| w.set_sm_enable(w.sm_enable() | ctrl_bit));
+    }
+
+    fn wait_rx_start(&self) -> bool {
+        // Spin until the edge detector flags the data packet's start of packet,
+        // or give up. Bounded well under the old byte timeout: at 96 MHz this is
+        // roughly 5 µs, longer than the token-to-data gap and short enough not
+        // to stall the interrupt. Interrupts are off here, so like the byte
+        // spin this stays deliberately small.
+        for _ in 0..START_SPINS {
+            if self.pio.irq().read().irq() & (1 << IRQ_RX_START) != 0 {
+                return true;
+            }
+        }
+        false
     }
 
 }

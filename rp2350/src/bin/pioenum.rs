@@ -355,10 +355,35 @@ async fn main(_spawner: Spawner) {
                 // 0b01. Finding one of those means real data.
                 let has_k = |w: &u32| (0..16).any(|i| (w >> (i * 2)) & 0b11 == 0b01);
                 let idle = capture[0];
-                if let Some(first) = capture.iter().position(has_k) {
+                // Trigger on the token->data boundary, not on the first packet.
+                //
+                // The first K in the window is almost always a start-of-frame: a
+                // lone token then a ~1 ms idle. Word-level K presence can't tell
+                // packets apart — inside one packet the words alternate K and J.
+                // The one unambiguous marker is the EOP: an SE0 (both lines low,
+                // sampled 0b11 after inversion) ends every packet. A SETUP is a
+                // token whose EOP is followed within a couple of bit-times — well
+                // under two words — by the DATA0's start of packet. A SOF's EOP
+                // is followed by a ~1 ms idle. So find an SE0 with a K close
+                // behind it: that SE0 is a token's EOP, and its packet is the
+                // token we want, its data the packet after.
+                let has_se0 = |w: &u32| (0..16).any(|i| (w >> (i * 2)) & 0b11 == 0b11);
+                let boundary = (1..CAP).find(|&e| {
+                    has_se0(&capture[e])
+                        && !has_se0(&capture[e + 1.min(CAP - 1 - e)]) // short EOP, not a reset
+                        && (e + 1..(e + 4).min(CAP)).any(|k| has_k(&capture[k]))
+                });
+                // Only dump a real token->data pair. SETUPs are sparse — most
+                // 680 us windows hold only SOFs — so if this window has none,
+                // leave `dumped` false and let the next pass capture again,
+                // rather than falling back to dumping a SOF.
+                let start = boundary.map(|e| e.saturating_sub(24)); // token's start
+                if let Some(first) = start {
                     dumped = true;
-                    let from = first.saturating_sub(4);
-                    let to = (from + 160).min(CAP);
+                    let from = first.saturating_sub(2);
+                    // Enough to carry the token and its DATA0 (~30 words); a bit
+                    // more for context.
+                    let to = (from + 96).min(CAP);
                     line.clear();
                     let _ = write!(
                         line,

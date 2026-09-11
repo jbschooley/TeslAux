@@ -482,6 +482,9 @@ mod service_tests {
         fn reset_receiver(&mut self) {}
         fn clear_eop(&mut self) {}
         fn realign_decoder(&mut self) {}
+        fn wait_rx_start(&self) -> bool {
+            true
+        }
     }
 
     fn fake(bytes: &[u8]) -> Fake {

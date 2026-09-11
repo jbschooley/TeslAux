@@ -57,11 +57,18 @@ pub trait Port {
     /// byte arrived. Clearing it between the two stages is what lets a
     /// two-packet transaction be read as one.
     fn clear_eop(&mut self);
-    /// Realign the decoder to the next packet's byte boundary — its shift
-    /// counter and NRZI state only, not the edge detector. Light enough to run
-    /// in the ~167 ns gap before a SETUP's data packet, which the full reset is
-    /// not. Mirrors the reference's `restart_usb_receiver`.
+    /// Reset the decoder for the data packet that immediately follows a token,
+    /// leaving the edge detector locked on the incoming start of packet, and
+    /// clear the stale start/end-of-packet flags so [`Port::wait_rx_start`] can
+    /// see the data packet's fresh one. Mirrors the reference's
+    /// `pio_usb_bus_prepare_receive`.
     fn realign_decoder(&mut self);
+    /// Spin until the receiver flags a start of packet, or a short timeout. The
+    /// data stage is read only after this returns, so the decoder — reset by
+    /// [`Port::realign_decoder`] — is armed and the data packet has actually
+    /// begun before the first byte is taken. Mirrors the reference's
+    /// `pio_usb_bus_wait_for_rx_start`. Returns whether a start was seen.
+    fn wait_rx_start(&self) -> bool;
 }
 
 /// How a transaction ended.
@@ -382,25 +389,17 @@ impl Engine {
                 // packet, ~167 ns behind — far too close for the CPU to return
                 // from this interrupt and catch the data on a fresh one. So the
                 // data is read here, in the same pass, exactly as the reference
-                // does: realign the decoder to the data's byte boundary, wait
-                // for its start, and read it.
+                // does: reset the decoder, wait for the data packet's start of
+                // packet, then read it.
                 //
-                // The realign is deliberately light — the decoder's shift
-                // counter and NRZI state, nothing more. The heavy reset that
-                // also tears down the edge detector is far too slow to fit the
-                // gap, and tearing down the detector would lose the data's start
-                // of packet outright. This is the difference between the `01`
-                // (near-byte) misalignment of an un-realigned read and a clean
-                // one.
-                // The realign is required to get the decoder emitting the data
-                // to this inline reader at all — without it the read times out
-                // with zero bytes. It does not fix alignment, though: the data
-                // packet rides ~167 ns behind the token's EOP, too close for a
-                // clean start-of-packet, so its SYNC decodes as 01 rather than
-                // 80 every time. That is the back-to-back boundary problem the
-                // `piopair` harness isolates, surfacing here as the SETUP data.
+                // The wait is the load-bearing step. It parks the CPU until the
+                // edge detector flags the data packet's start, so the decoder —
+                // just reset and re-armed by realign_decoder — is settled and
+                // the packet has actually begun before the first byte is taken.
+                // Reading immediately instead raced the reset against the data
+                // and decoded fixed garbage (02 87 01 0a ..).
                 port.realign_decoder();
-                port.clear_eop();
+                port.wait_rx_start();
                 let n = match Self::receive(port, rx_buf) {
                     Some(n) => n,
                     None => {
@@ -546,6 +545,9 @@ mod tests {
         }
         fn clear_eop(&mut self) {}
         fn realign_decoder(&mut self) {}
+        fn wait_rx_start(&self) -> bool {
+            true
+        }
     }
 
     const ADDR: u8 = 7;
