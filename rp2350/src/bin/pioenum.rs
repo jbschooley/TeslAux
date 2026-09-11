@@ -491,10 +491,18 @@ async fn main(_spawner: Spawner) {
                     2 => "ok",
                     _ => "?",
                 };
+                let rl = trace::RAW_LEN.load(Relaxed);
+                let rh = trace::RAW_HEAD.load(Relaxed).to_be_bytes();
+                let rm = trace::RAW_MID.load(Relaxed).to_be_bytes();
+                let rt = trace::RAW_TAIL.load(Relaxed).to_be_bytes();
                 line.clear();
                 let _ = write!(
                     line,
-                    "  data-read: {end} {}B  head {:02x} {:02x} {:02x} {:02x}\r\n",
+                    "  data-raw:  {}B  {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}\r\n  data-read: {end} {}B  head {:02x} {:02x} {:02x} {:02x}\r\n",
+                    rl & 0xff,
+                    rh[0], rh[1], rh[2], rh[3],
+                    rm[0], rm[1], rm[2], rm[3],
+                    rt[0], rt[1], rt[2], rt[3],
                     dr & 0xff,
                     dh[0], dh[1], dh[2], dh[3],
                 );
