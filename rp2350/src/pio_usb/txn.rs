@@ -141,6 +141,25 @@ pub mod trace {
     pub(super) fn last(b: [u8; 4]) {
         LAST.store(u32::from_be_bytes(b), Ordering::Relaxed);
     }
+
+    /// How the last data-stage read ended, and its shape: bytes read in the low
+    /// byte, DataEnd tag in the next, and the first four bytes read above.
+    pub static DATA_READ: AtomicU32 = AtomicU32::new(0);
+    pub static DATA_HEAD: AtomicU32 = AtomicU32::new(0);
+
+    pub(super) fn data_read(n: u8, head: [u8; 4], end: super::DataEnd) {
+        DATA_READ.store((n as u32) | ((end as u32) << 8), Ordering::Relaxed);
+        DATA_HEAD.store(u32::from_be_bytes(head), Ordering::Relaxed);
+    }
+}
+
+/// How a data-stage read ended, for the trace.
+#[cfg(target_os = "none")]
+#[derive(Copy, Clone)]
+pub enum DataEnd {
+    Timeout = 0,
+    BadCrc = 1,
+    Ok = 2,
 }
 
 /// Spins to wait for one byte before giving up.
@@ -369,8 +388,25 @@ impl Engine {
                 port.clear_eop();
                 let n = match Self::receive(port, rx_buf) {
                     Some(n) => n,
-                    None => return Outcome::Timeout,
+                    None => {
+                        #[cfg(target_os = "none")]
+                        trace::data_read(0, [0; 4], DataEnd::Timeout);
+                        return Outcome::Timeout;
+                    }
                 };
+                #[cfg(target_os = "none")]
+                {
+                    let mut head = [0u8; 4];
+                    for (i, b) in rx_buf.iter().take(4).enumerate() {
+                        head[i] = *b;
+                    }
+                    let ok = check_data(&rx_buf[..n]).is_some();
+                    trace::data_read(
+                        n as u8,
+                        head,
+                        if ok { DataEnd::Ok } else { DataEnd::BadCrc },
+                    );
+                }
                 let Some(payload) = check_data(&rx_buf[..n]) else {
                     return Outcome::Corrupt;
                 };

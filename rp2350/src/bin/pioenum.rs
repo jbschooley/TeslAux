@@ -480,6 +480,26 @@ async fn main(_spawner: Spawner) {
                 );
                 emit(&mut log_class, &line).await;
 
+                // The last data-stage read: how it ended, how many bytes, and
+                // its first four. This is the SETUP's DATA0 as we actually saw
+                // it — the exact thing that is failing.
+                let dr = trace::DATA_READ.load(Relaxed);
+                let dh = trace::DATA_HEAD.load(Relaxed).to_be_bytes();
+                let end = match (dr >> 8) & 0xff {
+                    0 => "timeout",
+                    1 => "bad-crc",
+                    2 => "ok",
+                    _ => "?",
+                };
+                line.clear();
+                let _ = write!(
+                    line,
+                    "  data-read: {end} {}B  head {:02x} {:02x} {:02x} {:02x}\r\n",
+                    dr & 0xff,
+                    dh[0], dh[1], dh[2], dh[3],
+                );
+                emit(&mut log_class, &line).await;
+
                 // The last packet that failed its checks, decoded. A SETUP
                 // token that fails CRC5 is 80 2d; a DATA0 that fails CRC16 is
                 // 80 c3. Which one it is says whether the token or its data
