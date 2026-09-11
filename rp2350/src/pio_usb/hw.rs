@@ -161,16 +161,21 @@ impl Port for HwPort {
     }
 
     fn realign_decoder(&mut self) {
-        // The reference's restart_usb_receiver: reset the NRZI previous-state
-        // (set x, 0), restart the shift counters so the next bit begins a fresh
-        // byte, reload the all-ones OSR, and clear the receive flags. No FIFO
-        // teardown, no edge-detector restart — a few register writes that fit
-        // inside the gap before the data packet.
-        let sm = self.pio.sm(self.rx_sm);
+        // Exactly the reference's restart_usb_receiver: set x, 0 (NRZI
+        // previous-state), restart the shift counters so the next bit begins a
+        // fresh byte, clear the receive flags. Nothing else.
+        //
+        // In particular it does NOT reload the OSR. `in osr, 1` reads the OSR
+        // without consuming it, so the all-ones value set at init survives — and
+        // forcing a `mov osr` here executes an out-of-sequence instruction right
+        // as the data packet begins, which was leaving the decoder one bit off:
+        // every bad packet read 01 (0x80 >> 7) where a SYNC belonged.
         let ctrl_bit = 1u8 << self.rx_sm;
-        sm.instr().write(|w| w.set_instr(SET_X_ZERO));
+        self.pio
+            .sm(self.rx_sm)
+            .instr()
+            .write(|w| w.set_instr(SET_X_ZERO));
         self.pio.ctrl().modify(|w| w.set_sm_restart(ctrl_bit));
-        sm.instr().write(|w| w.set_instr(MOV_OSR_NOT_NULL));
         self.pio.irq().write(|w| w.set_irq(0xf << 1));
     }
 
