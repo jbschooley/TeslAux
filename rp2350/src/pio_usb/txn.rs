@@ -433,42 +433,114 @@ impl Engine {
     /// Read a data packet's body — everything after its PID, including the two
     /// CRC bytes — until the receiver reports the end of the packet.
     fn receive<P: Port>(port: &mut P, buf: &mut [u8]) -> Option<usize> {
-        // Skip the data packet's own SYNC and PID. Scanning to a real 0x80
-        // SYNC was tried and does not work here: a data packet riding right
-        // behind the token has its SYNC decoded as 01, not 80, so there is no
-        // 0x80 to find and the scan times out. Blind skip at least reads the
-        // (misaligned) data so its shape can be seen while the boundary
-        // problem is the real fix.
-        let _sync = Self::byte(port)?;
-        let _pid = Self::byte(port)?;
-
+        // Read the whole packet as the decoder gives it — bytes and all,
+        // including its SYNC and PID — into a scratch, then realign in
+        // software.
+        //
+        // A data packet riding ~167 ns behind its token never gets a clean
+        // start of packet, so the decoder's byte boundary is off and its SYNC
+        // comes out as 01, not 80. Core 1 made that offset the *same* every
+        // time, which is what makes a software fix sound: reconstruct the bit
+        // stream, find where the SYNC really falls, and slide the byte boundary
+        // there. See [`realign`]. The hardware fix — a self-aligning receiver —
+        // is better but is a from-scratch PIO receiver; this gets enumeration
+        // moving without it.
+        let mut raw = [0u8; RX_SCRATCH];
         let mut n = 0;
         let mut idle = 0u32;
         while idle < IDLE_SPINS {
             let mut progressed = false;
             while let Some(b) = port.rx() {
-                if n < buf.len() {
-                    buf[n] = b;
+                if n < raw.len() {
+                    raw[n] = b;
                 }
                 n += 1;
                 progressed = true;
             }
-            // Reset on progress: a long packet is not a stalled one, and the
-            // difference is whether bytes are still arriving.
             idle = if progressed { 0 } else { idle + 1 };
             if port.eop() {
-                // Drain whatever landed between the last read and the flag.
                 while let Some(b) = port.rx() {
-                    if n < buf.len() {
-                        buf[n] = b;
+                    if n < raw.len() {
+                        raw[n] = b;
                     }
                     n += 1;
                 }
-                return (n <= buf.len()).then_some(n);
+                break;
             }
         }
-        None
+        if n == 0 || n > raw.len() {
+            return None;
+        }
+        realign(&raw[..n], buf)
     }
+}
+
+/// Scratch for a raw, possibly-misaligned received packet before realignment.
+const RX_SCRATCH: usize = 80;
+
+/// Recover a data packet from a bit-misaligned byte stream.
+///
+/// The decoder assembles bytes on whatever boundary it was on when the packet
+/// began; a data packet that came in right behind its token is off by a fixed
+/// number of bits, so its SYNC (chronologically seven 0-bits then a 1) does not
+/// land on a byte boundary. This rebuilds the chronological bit stream, tries
+/// every bit offset, and keeps the one whose SYNC, PID and CRC16 all check out.
+/// Writes the payload-plus-CRC (everything after SYNC and PID) into `out` and
+/// returns its length, so the caller's `check_data` validates exactly as for an
+/// aligned read.
+///
+/// When no offset validates, it falls back to the byte-aligned reading — SYNC
+/// and PID as `raw[0]` and `raw[1]`, body from `raw[2]`. That is what a
+/// correctly aligned but genuinely corrupt packet looks like, and the caller's
+/// own `check_data` must see its body to report [`Outcome::Corrupt`]: a damaged
+/// packet must not come back as an empty one, or the host is never told to
+/// retry.
+///
+/// A decoder byte holds its eight bits least-significant-first — the earliest
+/// bit is bit 0 — because the decoder shifts right. So the SYNC byte 0x80
+/// (bit 7 set) is the chronological pattern 0,0,0,0,0,0,0,1.
+fn realign(raw: &[u8], out: &mut [u8]) -> Option<usize> {
+    let total_bits = raw.len() * 8;
+    let bit = |i: usize| (raw[i / 8] >> (i % 8)) & 1;
+    let byte_at = |o: usize| -> u8 {
+        let mut b = 0u8;
+        for k in 0..8 {
+            b |= bit(o + k) << k;
+        }
+        b
+    };
+
+    // Search bit offsets for a SYNC, then confirm the packet at that offset.
+    for off in 0..total_bits.saturating_sub(8) {
+        if byte_at(off) != crate::pio_usb::packet::SYNC {
+            continue;
+        }
+        // Bytes from just after the SYNC: PID, then payload and CRC.
+        let start = off + 8;
+        let avail = (total_bits - start) / 8;
+        if avail < 3 {
+            continue; // need at least PID + 2 CRC bytes
+        }
+        let body_len = avail - 1; // drop the PID
+        if body_len > out.len() {
+            continue;
+        }
+        for j in 0..body_len {
+            out[j] = byte_at(start + 8 + j * 8);
+        }
+        if check_data(&out[..body_len]).is_some() {
+            return Some(body_len);
+        }
+    }
+
+    // Nothing validated. Hand back the byte-aligned body so the caller reports
+    // Corrupt rather than Timeout.
+    let body = raw.get(2..)?;
+    if body.is_empty() || body.len() > out.len() {
+        return None;
+    }
+    out[..body.len()].copy_from_slice(body);
+    Some(body.len())
 }
 
 #[cfg(test)]
@@ -800,6 +872,46 @@ mod tests {
             port.sent.is_empty(),
             "acknowledging damage is worse than silence — the host must retry"
         );
+    }
+
+    /// The reason `realign` exists: a data packet that came in behind its token
+    /// is byte-misaligned by a fixed number of bits, its SYNC no longer on a
+    /// byte boundary. Rebuild that: take a real packet's chronological bit
+    /// stream, insert `shift` leading bits (as a late start-of-packet does),
+    /// repack, and confirm `realign` slides the boundary back and recovers the
+    /// exact body `check_data` accepts.
+    #[test]
+    fn realign_recovers_a_bit_shifted_packet() {
+        let payload = [0x12u8, 0x34, 0x56, 0x78, 0x9a];
+        let mut data = [0u8; 16];
+        let n = build_data(Pid::Data0, &payload, &mut data).unwrap();
+
+        // The decoder packs bits least-significant-first (it shifts right), so
+        // bit i of the stream is raw[i/8] >> (i%8). Expand to a flat bit vector.
+        let mut bits = [0u8; 16 * 8];
+        for i in 0..n * 8 {
+            bits[i] = (data[i / 8] >> (i % 8)) & 1;
+        }
+
+        for shift in 1..8usize {
+            // Prepend `shift` idle-ish bits, then the packet's bits, and repack
+            // into bytes the same LSB-first way.
+            let mut shifted = [0u8; 20];
+            let total = shift + n * 8;
+            for i in 0..n * 8 {
+                if bits[i] == 1 {
+                    shifted[(shift + i) / 8] |= 1 << ((shift + i) % 8);
+                }
+            }
+            let raw_len = total.div_ceil(8);
+
+            let mut out = [0u8; 64];
+            let len = realign(&shifted[..raw_len], &mut out)
+                .unwrap_or_else(|| panic!("shift {shift} did not realign"));
+            let recovered = check_data(&out[..len])
+                .unwrap_or_else(|| panic!("shift {shift} realigned but failed CRC"));
+            assert_eq!(recovered, &payload, "shift {shift}");
+        }
     }
 
     #[test]
