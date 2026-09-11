@@ -57,6 +57,11 @@ pub trait Port {
     /// byte arrived. Clearing it between the two stages is what lets a
     /// two-packet transaction be read as one.
     fn clear_eop(&mut self);
+    /// Realign the decoder to the next packet's byte boundary — its shift
+    /// counter and NRZI state only, not the edge detector. Light enough to run
+    /// in the ~167 ns gap before a SETUP's data packet, which the full reset is
+    /// not. Mirrors the reference's `restart_usb_receiver`.
+    fn realign_decoder(&mut self);
 }
 
 /// How a transaction ended.
@@ -105,9 +110,6 @@ pub enum Outcome {
     BadToken { bytes: [u8; 4] },
     /// The bus went quiet mid-packet.
     Timeout,
-    /// A SETUP or OUT token was accepted; its data packet is expected next as a
-    /// separate transaction. Nothing goes on the wire yet.
-    AwaitingData { ep: u8 },
 }
 
 /// Spins to wait for one byte before giving up.
@@ -140,19 +142,6 @@ pub struct Engine {
     pub address: u8,
     /// The most recent frame number seen in a SOF.
     pub frame: u16,
-    /// After a SETUP or OUT token, the data packet is expected next — as its
-    /// own packet, with its own interrupt. It must be read with the decoder
-    /// realigned to *its* start, which `reset_receiver` does between the two.
-    /// Reading it inline with the token's alignment was the misalignment that
-    /// showed up as `01` where a SYNC byte belonged.
-    pending: Option<Pending>,
-}
-
-#[derive(Copy, Clone)]
-struct Pending {
-    endpoint: u8,
-    reply: Option<Pid>,
-    setup: bool,
 }
 
 impl Default for Engine {
@@ -166,7 +155,6 @@ impl Engine {
         Self {
             address: 0,
             frame: 0,
-            pending: None,
         }
     }
 
@@ -176,7 +164,6 @@ impl Engine {
         Self {
             address: addr,
             frame: 0,
-            pending: None,
         }
     }
 
@@ -239,29 +226,11 @@ impl Engine {
         };
         let seen = [sync, pid_byte, b0, b1];
         if sync != SYNC {
-            // A pending data stage that arrives without a clean SYNC is lost;
-            // drop the expectation so a later token is not mistaken for it.
-            self.pending = None;
             return Outcome::BadToken { bytes: seen };
         }
         let Some(pid) = Pid::from_byte(pid_byte) else {
-            self.pending = None;
             return Outcome::BadToken { bytes: seen };
         };
-
-        // The DATA stage of a SETUP or OUT, arriving as its own packet after
-        // the token deferred it. b0/b1 are already the first two payload bytes.
-        if pid.is_data() {
-            if let Some(p) = self.pending.take() {
-                return self.data_stage(port, handshakes, p, b0, b1, rx_buf);
-            }
-            // A data packet with nothing expecting it. Not ours to answer.
-            return Outcome::Ignored {
-                pid: pid_byte,
-                address: 0,
-                endpoint: 0,
-            };
-        }
 
         if pid == Pid::Sof {
             return match decode_sof(b0, b1) {
@@ -343,68 +312,39 @@ impl Engine {
             }
 
             Response::Receive { reply } => {
-                // Defer the data to its own packet. The token has ended; the
-                // data follows as a separate packet with a separate interrupt,
-                // and reset_receiver realigns the decoder for it in between.
-                self.pending = Some(Pending {
-                    endpoint: token.endpoint,
-                    reply,
+                // A SETUP or OUT token is immediately followed by its DATA
+                // packet, ~167 ns behind — far too close for the CPU to return
+                // from this interrupt and catch the data on a fresh one. So the
+                // data is read here, in the same pass, exactly as the reference
+                // does: realign the decoder to the data's byte boundary, wait
+                // for its start, and read it.
+                //
+                // The realign is deliberately light — the decoder's shift
+                // counter and NRZI state, nothing more. The heavy reset that
+                // also tears down the edge detector is far too slow to fit the
+                // gap, and tearing down the detector would lose the data's start
+                // of packet outright. This is the difference between the `01`
+                // (near-byte) misalignment of an un-realigned read and a clean
+                // one.
+                port.realign_decoder();
+                port.clear_eop();
+                let n = match Self::receive(port, rx_buf) {
+                    Some(n) => n,
+                    None => return Outcome::Timeout,
+                };
+                let Some(payload) = check_data(&rx_buf[..n]) else {
+                    return Outcome::Corrupt;
+                };
+                let len = payload.len();
+                if let Some(pid) = reply {
+                    port.transmit(handshakes.get(pid));
+                }
+                Outcome::Received {
+                    ep: token.endpoint,
+                    len,
                     setup: token.pid == Pid::Setup,
-                });
-                Outcome::AwaitingData { ep: token.endpoint }
-            }
-        }
-    }
-
-    /// Read the DATA packet of a deferred SETUP or OUT, having already consumed
-    /// its SYNC and PID and the first two payload bytes.
-    fn data_stage<P: Port>(
-        &mut self,
-        port: &mut P,
-        handshakes: &Handshakes,
-        p: Pending,
-        b0: u8,
-        b1: u8,
-        buf: &mut [u8],
-    ) -> Outcome {
-        buf[0] = b0;
-        buf[1] = b1;
-        let mut n = 2;
-        let mut idle = 0u32;
-        while idle < IDLE_SPINS {
-            let mut progressed = false;
-            while let Some(b) = port.rx() {
-                if n < buf.len() {
-                    buf[n] = b;
                 }
-                n += 1;
-                progressed = true;
             }
-            idle = if progressed { 0 } else { idle + 1 };
-            if port.eop() {
-                while let Some(b) = port.rx() {
-                    if n < buf.len() {
-                        buf[n] = b;
-                    }
-                    n += 1;
-                }
-                break;
-            }
-        }
-        if n > buf.len() {
-            return Outcome::Corrupt;
-        }
-        let Some(payload) = check_data(&buf[..n]) else {
-            return Outcome::Corrupt;
-        };
-        let len = payload.len();
-        if let Some(reply) = p.reply {
-            port.transmit(handshakes.get(reply));
-        }
-        Outcome::Received {
-            ep: p.endpoint,
-            len,
-            setup: p.setup,
         }
     }
 
@@ -486,6 +426,7 @@ mod tests {
             self.resets += 1;
         }
         fn clear_eop(&mut self) {}
+        fn realign_decoder(&mut self) {}
     }
 
     const ADDR: u8 = 7;
@@ -726,15 +667,8 @@ mod tests {
         let mut port = Fake::new(&bytes);
         let h = Handshakes::new();
         let mut buf = [0u8; 64];
-        let mut e = engine();
-        // Token phase: accepted, data deferred.
         assert_eq!(
-            e.handle(&mut port, &h, one(EpType::Bulk, true), no_packet, &mut buf),
-            Outcome::AwaitingData { ep: 2 }
-        );
-        // Data phase: the packet that follows.
-        assert_eq!(
-            e.handle(&mut port, &h, one(EpType::Bulk, true), no_packet, &mut buf),
+            engine().handle(&mut port, &h, one(EpType::Bulk, true), no_packet, &mut buf),
             Outcome::Received { ep: 2, len: payload.len(), setup: false }
         );
         assert_eq!(&buf[..payload.len()], &payload);
@@ -752,13 +686,8 @@ mod tests {
         let mut port = Fake::new(&bytes);
         let h = Handshakes::new();
         let mut buf = [0u8; 64];
-        let mut e = engine();
         assert_eq!(
-            e.handle(&mut port, &h, one(EpType::Isochronous, true), no_packet, &mut buf),
-            Outcome::AwaitingData { ep: 2 }
-        );
-        assert_eq!(
-            e.handle(&mut port, &h, one(EpType::Isochronous, true), no_packet, &mut buf),
+            engine().handle(&mut port, &h, one(EpType::Isochronous, true), no_packet, &mut buf),
             Outcome::Received { ep: 2, len: payload.len(), setup: false }
         );
         assert!(port.sent.is_empty(), "isochronous acknowledges nothing");
@@ -776,13 +705,8 @@ mod tests {
 
         let mut port = Fake::new(&bytes);
         let h = Handshakes::new();
-        let mut e = engine();
         assert_eq!(
-            e.handle(&mut port, &h, one(EpType::Bulk, true), no_packet, &mut [0u8; 64]),
-            Outcome::AwaitingData { ep: 2 }
-        );
-        assert_eq!(
-            e.handle(&mut port, &h, one(EpType::Bulk, true), no_packet, &mut [0u8; 64]),
+            engine().handle(&mut port, &h, one(EpType::Bulk, true), no_packet, &mut [0u8; 64]),
             Outcome::Corrupt
         );
         assert!(
@@ -807,13 +731,8 @@ mod tests {
                 ..EpState::new(EpType::Control)
             })
         };
-        let mut e = engine();
         assert_eq!(
-            e.handle(&mut port, &h, halted, no_packet, &mut [0u8; 64]),
-            Outcome::AwaitingData { ep: 0 }
-        );
-        assert_eq!(
-            e.handle(&mut port, &h, halted, no_packet, &mut [0u8; 64]),
+            engine().handle(&mut port, &h, halted, no_packet, &mut [0u8; 64]),
             Outcome::Received { ep: 0, len: 8, setup: true }
         );
         assert_eq!(port.sent[0], h.get(Pid::Ack), "that is how a halt is cleared");

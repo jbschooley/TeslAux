@@ -276,7 +276,6 @@ pub fn on_packet_start() {
                 None
             }
             Outcome::Timeout => None,
-            Outcome::AwaitingData { .. } => None,
         }
     });
     // Waking outside the critical section: a woken task may run immediately,

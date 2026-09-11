@@ -160,6 +160,20 @@ impl Port for HwPort {
         self.pio.irq().write(|w| w.set_irq(1 << IRQ_RX_EOP));
     }
 
+    fn realign_decoder(&mut self) {
+        // The reference's restart_usb_receiver: reset the NRZI previous-state
+        // (set x, 0), restart the shift counters so the next bit begins a fresh
+        // byte, reload the all-ones OSR, and clear the receive flags. No FIFO
+        // teardown, no edge-detector restart — a few register writes that fit
+        // inside the gap before the data packet.
+        let sm = self.pio.sm(self.rx_sm);
+        let ctrl_bit = 1u8 << self.rx_sm;
+        sm.instr().write(|w| w.set_instr(SET_X_ZERO));
+        self.pio.ctrl().modify(|w| w.set_sm_restart(ctrl_bit));
+        sm.instr().write(|w| w.set_instr(MOV_OSR_NOT_NULL));
+        self.pio.irq().write(|w| w.set_irq(0xf << 1));
+    }
+
 }
 
 impl HwPort {

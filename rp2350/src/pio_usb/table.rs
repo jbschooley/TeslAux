@@ -448,8 +448,7 @@ pub fn service<P: super::txn::Port, const N: usize>(
         | Outcome::Corrupt
         | Outcome::Ignored { .. }
         | Outcome::BadToken { .. }
-        | Outcome::Timeout
-        | Outcome::AwaitingData { .. } => {}
+        | Outcome::Timeout => {}
     }
     outcome
 }
@@ -482,6 +481,7 @@ mod service_tests {
         }
         fn reset_receiver(&mut self) {}
         fn clear_eop(&mut self) {}
+        fn realign_decoder(&mut self) {}
     }
 
     fn fake(bytes: &[u8]) -> Fake {
@@ -555,14 +555,13 @@ mod service_tests {
         bytes.extend_from_slice(&data[..n]);
         let mut port = fake(&bytes);
 
-        let h = Handshakes::new();
-        let mut e = engine();
-        // Token phase, then the data packet it defers to.
-        assert_eq!(
-            service(&mut e, &mut port, &h, &mut t, &mut [0u8; 64]),
-            Outcome::AwaitingData { ep: 2 }
+        let out = service(
+            &mut engine(),
+            &mut port,
+            &Handshakes::new(),
+            &mut t,
+            &mut [0u8; 64],
         );
-        let out = service(&mut e, &mut port, &h, &mut t, &mut [0u8; 64]);
         assert_eq!(out, Outcome::Received { ep: 2, len: 3, setup: false });
 
         let s = t.slot_mut(2, false).unwrap();
@@ -614,13 +613,13 @@ mod service_tests {
         bytes.extend_from_slice(&data[..n]);
         let mut port = fake(&bytes);
 
-        let h = Handshakes::new();
-        let mut e = engine();
-        assert_eq!(
-            service(&mut e, &mut port, &h, &mut t, &mut [0u8; 64]),
-            Outcome::AwaitingData { ep: 2 }
+        let out = service(
+            &mut engine(),
+            &mut port,
+            &Handshakes::new(),
+            &mut t,
+            &mut [0u8; 64],
         );
-        let out = service(&mut e, &mut port, &h, &mut t, &mut [0u8; 64]);
         assert_eq!(out, Outcome::Corrupt);
         let s = t.slot(2, false).unwrap();
         assert!(!s.complete, "nothing was delivered");
