@@ -462,6 +462,24 @@ async fn main(_spawner: Spawner) {
                 let _ = write!(line, "\r\n");
                 emit(&mut log_class, &line).await;
 
+                // Which token types the host actually sent, by PID. This is
+                // upstream of every success/failure counter: it says whether a
+                // SETUP is even arriving.
+                use teslamic_rp2350::pio_usb::txn::trace;
+                use core::sync::atomic::Ordering::Relaxed;
+                let last = trace::LAST.load(Relaxed).to_be_bytes();
+                line.clear();
+                let _ = write!(
+                    line,
+                    "  tokens: setup {} in {} out {} data {}  last {:02x} {:02x} {:02x} {:02x}\r\n",
+                    trace::SETUP.load(Relaxed),
+                    trace::IN.load(Relaxed),
+                    trace::OUT.load(Relaxed),
+                    trace::DATA.load(Relaxed),
+                    last[0], last[1], last[2], last[3],
+                );
+                emit(&mut log_class, &line).await;
+
                 // The last packet that failed its checks, decoded. A SETUP
                 // token that fails CRC5 is 80 2d; a DATA0 that fails CRC16 is
                 // 80 c3. Which one it is says whether the token or its data

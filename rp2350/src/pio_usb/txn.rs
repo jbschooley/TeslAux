@@ -112,6 +112,37 @@ pub enum Outcome {
     Timeout,
 }
 
+/// Diagnostic counters, target-only so the engine stays pure under test.
+///
+/// They answer the question the outcome counters cannot: which token *types*
+/// the host is actually sending us, decoded and by PID, before any of the
+/// downstream success or failure. If SETUP never increments, the host is not
+/// getting far enough to send one; if it does, the fault is what we do with it.
+#[cfg(target_os = "none")]
+pub mod trace {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    pub static SETUP: AtomicU32 = AtomicU32::new(0);
+    pub static IN: AtomicU32 = AtomicU32::new(0);
+    pub static OUT: AtomicU32 = AtomicU32::new(0);
+    pub static DATA: AtomicU32 = AtomicU32::new(0);
+    /// The four bytes of the last non-SOF packet the engine looked at, latched.
+    pub static LAST: AtomicU32 = AtomicU32::new(0);
+
+    pub(super) fn token(pid: super::Pid) {
+        let c = match pid {
+            super::Pid::Setup => &SETUP,
+            super::Pid::In => &IN,
+            super::Pid::Out => &OUT,
+            super::Pid::Data0 | super::Pid::Data1 => &DATA,
+            _ => return,
+        };
+        c.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(super) fn last(b: [u8; 4]) {
+        LAST.store(u32::from_be_bytes(b), Ordering::Relaxed);
+    }
+}
+
 /// Spins to wait for one byte before giving up.
 ///
 /// This runs with interrupts disabled, so the arithmetic matters. A byte is
@@ -231,6 +262,14 @@ impl Engine {
         let Some(pid) = Pid::from_byte(pid_byte) else {
             return Outcome::BadToken { bytes: seen };
         };
+
+        #[cfg(target_os = "none")]
+        {
+            if pid != Pid::Sof {
+                trace::token(pid);
+                trace::last(seen);
+            }
+        }
 
         if pid == Pid::Sof {
             return match decode_sof(b0, b1) {
