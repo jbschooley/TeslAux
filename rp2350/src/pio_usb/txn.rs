@@ -426,8 +426,23 @@ impl Engine {
     /// Read a data packet's body — everything after its PID, including the two
     /// CRC bytes — until the receiver reports the end of the packet.
     fn receive<P: Port>(port: &mut P, buf: &mut [u8]) -> Option<usize> {
-        // Skip the data packet's own SYNC and PID.
-        let _sync = Self::byte(port)?;
+        // Find the data packet's SYNC, then skip it and the PID.
+        //
+        // Scanning rather than assuming the first byte is the SYNC, because the
+        // realign that precedes a data read leaves the decoder one bit early and
+        // emits a stray byte before the real SYNC — 01 where 80 belongs, seen
+        // consistently on hardware. The SYNC is the packet delimiter, so
+        // skipping to it discards that stray byte and any gap bits with it. A
+        // data byte that happens to be 0x80 cannot be mistaken for it: the scan
+        // only runs at the head, before the packet, and stops at the first SYNC.
+        let mut scan = 0;
+        loop {
+            match Self::byte(port) {
+                Some(super::packet::SYNC) => break,
+                Some(_) if scan < 4 => scan += 1,
+                _ => return None,
+            }
+        }
         let _pid = Self::byte(port)?;
 
         let mut n = 0;
