@@ -60,9 +60,22 @@
 //!
 //! # Status
 //!
-//! **The core-1 receive path has not yet been confirmed to fix enumeration on
-//! hardware.** It builds, the split is in place, and it is the next thing to
-//! test. Earlier single-core status below still holds for what has run.
+//! **Core 1 does what it was for: it removed the timing jitter.** On hardware,
+//! against a real host, the SETUP-data misalignment that used to vary run to
+//! run (01, then 05, then 27, then zeros) is now the *same* value every time —
+//! 01 4b f9 6e. That determinism is the whole reason for the second core, and
+//! it is the difference between an unfixable moving target and a bug that can
+//! be read off a single capture.
+//!
+//! It has **not** carried enumeration through yet. `setup` and `addr` stay at
+//! zero. The residual is now a specific, repeatable thing rather than a timing
+//! mystery: the deterministic bad token 01 4b f9 6e is a DATA1 packet whose PID
+//! (4b) decodes correctly but which arrives with a spurious 01 where its SYNC
+//! belongs, and is serviced as its own token rather than as a data stage. The
+//! control-transfer sequencing — which packet is the setup data, which is a
+//! status stage, when a data packet should be consumed inline versus serviced
+//! fresh — is the work left, and it is now debuggable because the hardware
+//! timing underneath it is finally steady.
 //!
 //! **None of this has run.** It is the largest piece of the port that no host
 //! test can reach and no single-board harness exercises: it only comes alive
