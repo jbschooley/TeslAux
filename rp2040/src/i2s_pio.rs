@@ -247,13 +247,21 @@ pub fn slave_tx_ext<'d, P: Instance, const SM: usize>(
         "    wait 0 pin 2", // falling BCK: next bit out
         "    out pins, 1",
         "    jmp x-- left",
-        "    set x, 31",
+        "    set x, 30", // 31 of the right slot's 32 bits; the last goes out on the LRCK edge
         "right:",
         "    wait 1 pin 2",
         "    wait 0 pin 2",
         "    out pins, 1",
         "    jmp x-- right",
-        "    wait 0 pin 0", // steady state: LRCK has just fallen; a slipped frame waits for it
+        // Resync every frame on the LRCK falling edge, which is the falling BCK edge the right
+        // slot's last (padding) bit belongs to.  In step, LRCK is still high here and this
+        // waits for exactly that edge; after a slip (clock glitches while the master
+        // restarts, a stall on an empty FIFO) it waits out the frame and is back in step on
+        // the next one.  Waiting only for LRCK low, as before, passed anywhere in the left
+        // half, so a slip stayed for good.
+        "    wait 1 pin 0",
+        "    wait 0 pin 0",
+        "    out pins, 1",
         ".wrap",
     );
     let data = common.make_pio_pin(data);
