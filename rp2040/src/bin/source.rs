@@ -450,7 +450,7 @@ async fn main(spawner: Spawner) {
     // the clock-locked fallback is unnecessary. Reviving it means proving
     // `i2s_pio::slave_tx` on hardware first, the way `slave_rx` was proven with
     // `i2srx`.
-    #[cfg(feature = "clock-locked")]
+    #[cfg(all(feature = "clock-locked", not(feature = "rack-slave")))]
     compile_error!(
         "source --features clock-locked is disabled: it would drive BCK/LRCK \
          against the car board's outputs. See the comment here."
@@ -490,9 +490,20 @@ async fn main(spawner: Spawner) {
     // layout in `pins` therefore only applies to the `clock-steered` build —
     // build the source with that feature, or this binary will expect the old
     // jumpers.
-    #[cfg(not(feature = "clock-steered"))]
+    #[cfg(all(feature = "rack-slave", feature = "clock-steered"))]
+    compile_error!("rack-slave and clock-steered both drive the I2S clock; pick one");
+    // `rack-slave`: the external master (a wireless rack's SAI) owns BCK and LRCK; nothing
+    // here drives them. GP10 (the shield) stays a driven-low conductor between them.
+    #[cfg(feature = "rack-slave")]
+    let i2s_sm = {
+        let (data, bck, shield, lrck) = source_i2s_pins!(p);
+        i2s_pio::slave_tx_ext(&mut common, &mut sm0, data, bck, shield, lrck);
+        sm0.set_enable(true);
+        sm0
+    };
+    #[cfg(not(any(feature = "clock-steered", feature = "rack-slave")))]
     let program = PioI2sOutProgram::new(&mut common);
-    #[cfg(not(feature = "clock-steered"))]
+    #[cfg(not(any(feature = "clock-steered", feature = "rack-slave")))]
     let mut i2s = PioI2sOut::new(
         &mut common,
         sm0,
@@ -528,10 +539,12 @@ async fn main(spawner: Spawner) {
     led.set(smart_leds::RGB8::new(8, 0, 8));
 
     spawner.spawn(usb_task(usb).unwrap());
-    #[cfg(not(feature = "clock-steered"))]
+    #[cfg(not(any(feature = "clock-steered", feature = "rack-slave")))]
     spawner.spawn(i2s_out(i2s).unwrap());
     #[cfg(feature = "clock-steered")]
     spawner.spawn(i2s_out_steered(i2s_sm, p.DMA_CH0).unwrap());
+    #[cfg(feature = "rack-slave")]
+    spawner.spawn(i2s_out_slave(i2s_sm, p.DMA_CH0).unwrap());
     spawner.spawn(status_task(led).unwrap());
     #[cfg(feature = "clock-locked")]
     spawner.spawn(feedback(feedback_ep).unwrap());
@@ -622,6 +635,66 @@ async fn sink(mut ep: impl EndpointOut) -> ! {
 /// Sign check: the pipe fills from USB and drains to I2S, so a *rising* level
 /// means our clock is too slow and we command a higher rate. That is inverted
 /// relative to the car board, where the pipe fills from I2S and drains to USB.
+/// Consumer for `rack-slave`: frames out at the external master's pace (the PIO waits on
+/// its BCK), and the rate it takes them at reported to the host as explicit feedback, so the
+/// host sends exactly that many: measured against this board's timer every ~100 ms
+/// (smoothed), less 0.002 frames/ms per frame the pipe sits above its target (the timer's
+/// own ppm error shows up as a slow level drift, which that term removes).
+#[cfg(feature = "rack-slave")]
+#[embassy_executor::task]
+async fn i2s_out_slave(
+    mut sm: embassy_rp::pio::StateMachine<'static, PIO0, 0>,
+    dma: embassy_rp::Peri<'static, embassy_rp::peripherals::DMA_CH0>,
+) -> ! {
+    let mut dma = dma;
+    let mut raw = [0u32; I2S_BLOCK * 2];
+    let mut frames = 0u32;
+    let mut ticks = 0u32;
+    let mut t0 = embassy_time::Instant::now();
+    let mut rate_ema: f32 = RATE as f32;
+    loop {
+        let live = PIPE.lock(|p| {
+            let mut pipe = p.borrow_mut();
+            if pipe.starved() {
+                pipe.reset();
+            }
+            if !pipe.primed() {
+                raw = [0u32; I2S_BLOCK * 2];
+                return false;
+            }
+            for i in 0..I2S_BLOCK {
+                let f = pipe.pop();
+                let (a, b) = if SWAP_LR { (f[1], f[0]) } else { (f[0], f[1]) };
+                raw[i * 2] = (a as u16 as u32) << 16;
+                raw[i * 2 + 1] = (b as u16 as u32) << 16;
+            }
+            true
+        });
+        CLOCK_LIVE.store(live, core::sync::atomic::Ordering::Relaxed);
+        frames += I2S_BLOCK as u32;
+        ticks += 1;
+        if ticks >= 75 {
+            ticks = 0;
+            let now = embassy_time::Instant::now();
+            let us = (now - t0).as_micros().max(1) as f32;
+            t0 = now;
+            let rate = frames as f32 * 1_000_000.0 / us;
+            frames = 0;
+            // ignore a window the output stalled in (no master clock): it would read ~0
+            if rate > RATE as f32 * 0.9 && rate < RATE as f32 * 1.1 {
+                rate_ema += (rate - rate_ema) * 0.1;
+            }
+            let (off, primed) = PIPE.lock(|p| {
+                let b = p.borrow();
+                (b.off_target() as f32, b.primed())
+            });
+            let per_ms = rate_ema / 1000.0 - if primed { off * 0.002 } else { 0.0 };
+            FEEDBACK.store((per_ms * 16384.0) as u32, core::sync::atomic::Ordering::Relaxed);
+        }
+        sm.tx().dma_push(dma.reborrow(), &raw, false).await;
+    }
+}
+
 #[cfg(feature = "clock-steered")]
 #[embassy_executor::task]
 async fn i2s_out_steered(

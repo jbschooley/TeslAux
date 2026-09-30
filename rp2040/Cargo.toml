@@ -76,6 +76,11 @@ ultra-low = ["clock-steered"]
 # packets (PaceMode::Locked). Requires the `source` board on the other end.
 # Without it, the car board is an I2S slave to a PCM2706 and paces elastically.
 clock-locked = []
+# Source board as the I2S *slave* of an external master that owns the clock (a wireless-audio
+# rack's SAI): data out on GP12, BCK in on GP11, LRCK in on GP9, GP10 held low. The host is
+# asked to follow that clock through the explicit feedback endpoint (the clock-locked USB
+# descriptors); the feedback value is the I2S rate measured here, corrected by the pipe level.
+rack-slave = ["clock-locked"]
 
 # DIAGNOSTIC (car board): substitute a generated tone for the captured I2S
 # samples, keeping the capture TIMING intact. The source board still drives the

@@ -223,6 +223,60 @@ pub fn master_rx<'d, P: Instance, const SM: usize>(
 }
 
 /// Transmit I2S as a slave: clocks in, data out.
+/// I2S slave transmitter for an external master that samples on the rising BCK edge (the
+/// I2S standard; an i.MX RT SAI in master mode, BCP = 1): data changes on the falling edge,
+/// the MSB on the first falling edge after the LRCK edge, 32 bits a slot (the 16-bit sample in
+/// the top half of each FIFO word), LRCK low = left.  IN group = LRCK (0), shield (1), BCK (2)
+/// -- the source's GP9..GP11; the shield is driven low.  Not the car board's `slave_tx`, which
+/// changes data on the rising edge for `master_rx`'s falling-edge sampling.
+pub fn slave_tx_ext<'d, P: Instance, const SM: usize>(
+    common: &mut Common<'d, P>,
+    sm: &mut StateMachine<'d, P, SM>,
+    data: Peri<'d, impl PioPin>,
+    bck: Peri<'d, impl PioPin>,
+    shield: Peri<'d, impl PioPin>,
+    lrck: Peri<'d, impl PioPin>,
+) {
+    let prg = pio::pio_asm!(
+        "    wait 1 pin 0", // once: sync on a falling LRCK (start of a left slot)
+        "    wait 0 pin 0",
+        ".wrap_target",
+        "    set x, 31",
+        "left:",
+        "    wait 1 pin 2",
+        "    wait 0 pin 2", // falling BCK: next bit out
+        "    out pins, 1",
+        "    jmp x-- left",
+        "    set x, 31",
+        "right:",
+        "    wait 1 pin 2",
+        "    wait 0 pin 2",
+        "    out pins, 1",
+        "    jmp x-- right",
+        "    wait 0 pin 0", // steady state: LRCK has just fallen; a slipped frame waits for it
+        ".wrap",
+    );
+    let data = common.make_pio_pin(data);
+    let lrck = common.make_pio_pin(lrck);
+    let shield = common.make_pio_pin(shield);
+    let bck = common.make_pio_pin(bck);
+    let mut cfg = Config::default();
+    cfg.use_program(&common.load_program(&prg.program), &[]);
+    cfg.set_in_pins(&[&lrck, &shield, &bck]);
+    cfg.set_out_pins(&[&data]);
+    cfg.shift_out = ShiftConfig {
+        auto_fill: true,
+        threshold: 32,
+        direction: ShiftDirection::Left,
+    };
+    cfg.fifo_join = FifoJoin::TxOnly;
+    cfg.clock_divider = 1u8.to_fixed();
+    sm.set_config(&cfg);
+    sm.set_pins(embassy_rp::gpio::Level::Low, &[&shield, &data]);
+    sm.set_pin_dirs(Direction::Out, &[&data, &shield]);
+    sm.set_pin_dirs(Direction::In, &[&lrck, &bck]);
+}
+
 pub fn slave_tx<'d, P: Instance, const SM: usize>(
     common: &mut Common<'d, P>,
     sm: &mut StateMachine<'d, P, SM>,
