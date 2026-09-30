@@ -394,32 +394,14 @@ async fn main(spawner: Spawner) {
             alt1.descriptor(CS_INTERFACE, &AS_GENERAL);
             alt1.descriptor(CS_INTERFACE, &AS_FORMAT_TYPE_I);
 
-            // The feedback endpoint is allocated FIRST because the data
-            // endpoint's bSynchAddress has to name it, and embassy writes each
-            // endpoint descriptor at allocation time — so its address must
-            // already exist. That puts the feedback descriptor ahead of the data
-            // descriptor, which the spec permits (it defines no ordering within
-            // an alt setting, only that a class-specific endpoint descriptor
-            // follows its own standard one, which still holds here). If a host
-            // ever refuses to enumerate, this ordering is the first suspect.
-            //
-            // 3 bytes, 10.14 format: the full-speed explicit-feedback encoding.
-            // bRefresh = 3 -> the host re-reads every 2^3 = 8 ms.
-            let fb = alt1.endpoint_isochronous_in(
-                None,
-                3,
-                1,
-                SynchronizationType::NoSynchronization,
-                UsageType::FeedbackEndpoint,
-                &[0x03, 0x00],
-            );
-            let fb_addr: u8 = fb.info().addr.into();
-
-            // Asynchronous, not Adaptive: we are telling the phone that our clock
-            // is the authority and that it must follow the rate reported on
-            // `fb_addr`. That rate is derived from the car board's I2S clock,
-            // which is itself locked to the car's SOF — so the phone ends up
-            // following the car, and no sample slips anywhere in the chain.
+            // Data endpoint first, its class-specific descriptor straight after it, then the
+            // feedback endpoint: macOS's USB audio driver did not create a device with the
+            // feedback endpoint ahead of the data endpoint (rack-slave, 2026-09-30). The
+            // data endpoint's bSynchAddress names the feedback endpoint before it exists, so
+            // its address is fixed: IN 1.
+            const FB_ADDR: u8 = 0x81;
+            // Asynchronous, not Adaptive: our clock is the authority and the host must follow
+            // the rate reported on the feedback endpoint.
             let ep = alt1.endpoint_isochronous_out(
                 None,
                 // Room for the host to send one extra frame while it tracks us.
@@ -427,9 +409,19 @@ async fn main(spawner: Spawner) {
                 1,
                 SynchronizationType::Asynchronous,
                 UsageType::DataEndpoint,
-                &[0x00, fb_addr],
+                &[0x00, FB_ADDR],
             );
             alt1.descriptor(CS_ENDPOINT, &AS_ISO_ENDPOINT);
+            // 3 bytes, 10.14 format: the full-speed explicit-feedback encoding.
+            // bRefresh = 3 -> the host re-reads every 2^3 = 8 ms.
+            let fb = alt1.endpoint_isochronous_in(
+                Some(embassy_usb::driver::EndpointAddress::from(FB_ADDR)),
+                3,
+                1,
+                SynchronizationType::NoSynchronization,
+                UsageType::FeedbackEndpoint,
+                &[0x03, 0x00],
+            );
             (ep, fb)
         };
         drop(func);
