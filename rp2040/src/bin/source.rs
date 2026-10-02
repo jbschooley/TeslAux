@@ -639,26 +639,36 @@ async fn i2s_out_slave(
     dma: embassy_rp::Peri<'static, embassy_rp::peripherals::DMA_CH0>,
 ) -> ! {
     let mut dma = dma;
-    let mut raw = [0u32; I2S_BLOCK * 2];
+    // Two blocks: the DMA plays one while the next is filled. With one, the FIFO (4 frames,
+    // 83 us) was all that covered the fill, the rate bookkeeping and the task's wake between
+    // transfers; past that the slave missed a frame and the stream slipped a sample (heard as
+    // a drop: a 1 kHz tone through the wireless rack came back one sample late at 4 of 5
+    // glitches in 5 minutes, and the rack's input step detector saw each, 2026-10-02).
+    // `dma_push` starts the transfer when called, so the fill below runs while it plays.
+    let mut bufs = [[0u32; I2S_BLOCK * 2]; 2];
+    let mut cur = 0usize;
     let mut frames = 0u32;
     let mut ticks = 0u32;
     let mut t0 = embassy_time::Instant::now();
     let mut rate_ema: f32 = RATE as f32;
     loop {
+        let (a, b) = bufs.split_at_mut(1);
+        let (play, next) = if cur == 0 { (&a[0], &mut b[0]) } else { (&b[0], &mut a[0]) };
+        let xfer = sm.tx().dma_push(dma.reborrow(), play, false);
         let live = PIPE.lock(|p| {
             let mut pipe = p.borrow_mut();
             if pipe.starved() {
                 pipe.reset();
             }
             if !pipe.primed() {
-                raw = [0u32; I2S_BLOCK * 2];
+                *next = [0u32; I2S_BLOCK * 2];
                 return false;
             }
             for i in 0..I2S_BLOCK {
                 let f = pipe.pop();
                 let (a, b) = if SWAP_LR { (f[1], f[0]) } else { (f[0], f[1]) };
-                raw[i * 2] = (a as u16 as u32) << 16;
-                raw[i * 2 + 1] = (b as u16 as u32) << 16;
+                next[i * 2] = (a as u16 as u32) << 16;
+                next[i * 2 + 1] = (b as u16 as u32) << 16;
             }
             true
         });
@@ -683,7 +693,8 @@ async fn i2s_out_slave(
             let per_ms = rate_ema / 1000.0 - if primed { off * 0.002 } else { 0.0 };
             FEEDBACK.store((per_ms * 16384.0) as u32, core::sync::atomic::Ordering::Relaxed);
         }
-        sm.tx().dma_push(dma.reborrow(), &raw, false).await;
+        xfer.await;
+        cur ^= 1;
     }
 }
 
