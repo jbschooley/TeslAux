@@ -614,8 +614,13 @@ pub fn config() -> Config<'static> {
     let mut c = Config::new(0x1209, 0x0001);
     c.manufacturer = Some("TeslaMic_V004_FW_20220217Tes");
     c.product = Some("TeslaMic");
-    c.serial_number =
-        Some("0E02070008181F0B8AFB76F93A8C1B1D472AA0AA0C2535898B4D6A4738FAD0057B6A12DB17320B75");
+    // `serial-b` (bench): a second car board on the same Mac needs its own serial, or macOS
+    // takes the two for one device and only one shows up as an audio input
+    c.serial_number = Some(if cfg!(feature = "serial-b") {
+        "0E02070008181F0B8AFB76F93A8C1B1D472AA0AA0C2535898B4D6A4738FAD0057B6A12DB17320B76"
+    } else {
+        "0E02070008181F0B8AFB76F93A8C1B1D472AA0AA0C2535898B4D6A4738FAD0057B6A12DB17320B75"
+    });
     c.bcd_usb = UsbVersion::Two;
     c.max_power = 500;
     c.self_powered = false;
